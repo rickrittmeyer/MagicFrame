@@ -1,3 +1,4 @@
+
 //
 //  MagicFrameApp.swift
 //  MagicFrame
@@ -6,6 +7,7 @@
 //
 
 import SwiftUI
+
 
 @main
 struct MagicFrameApp: App {

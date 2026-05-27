@@ -6,8 +6,19 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		1DA8A91B2FC2031000A801DB /* libsqlite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 1DA8A91A2FC2031000A801DB /* libsqlite3.tbd */; };
+		1DA8A91D2FC203BD00A801DB /* PhotoDatabase.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DA8A91C2FC203BD00A801DB /* PhotoDatabase.swift */; };
+		1DA8A91F2FC241FF00A801DB /* PhotoThumbnailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DA8A91E2FC241FF00A801DB /* PhotoThumbnailView.swift */; };
+		1DAFA8B72FC695E4005CC499 /* EventDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DAFA8B62FC695E4005CC499 /* EventDetailView.swift */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		1DA8A8FF2FBB9E7700A801DB /* MagicFrame.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MagicFrame.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		1DA8A91A2FC2031000A801DB /* libsqlite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libsqlite3.tbd; path = usr/lib/libsqlite3.tbd; sourceTree = SDKROOT; };
+		1DA8A91C2FC203BD00A801DB /* PhotoDatabase.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoDatabase.swift; sourceTree = "<group>"; };
+		1DA8A91E2FC241FF00A801DB /* PhotoThumbnailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoThumbnailView.swift; sourceTree = "<group>"; };
+		1DAFA8B62FC695E4005CC499 /* EventDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EventDetailView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -23,6 +34,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				1DA8A91B2FC2031000A801DB /* libsqlite3.tbd in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -32,7 +44,11 @@
 		1DA8A8F62FBB9E7600A801DB = {
 			isa = PBXGroup;
 			children = (
+				1DAFA8B62FC695E4005CC499 /* EventDetailView.swift */,
+				1DA8A91C2FC203BD00A801DB /* PhotoDatabase.swift */,
+				1DA8A91E2FC241FF00A801DB /* PhotoThumbnailView.swift */,
 				1DA8A9012FBB9E7700A801DB /* MagicFrame */,
+				1DA8A9192FC2030F00A801DB /* Frameworks */,
 				1DA8A9002FBB9E7700A801DB /* Products */,
 			);
 			sourceTree = "<group>";
@@ -43,6 +59,14 @@
 				1DA8A8FF2FBB9E7700A801DB /* MagicFrame.app */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		1DA8A9192FC2030F00A801DB /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				1DA8A91A2FC2031000A801DB /* libsqlite3.tbd */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -119,6 +143,9 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				1DA8A91F2FC241FF00A801DB /* PhotoThumbnailView.swift in Sources */,
+				1DAFA8B72FC695E4005CC499 /* EventDetailView.swift in Sources */,
+				1DA8A91D2FC203BD00A801DB /* PhotoDatabase.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -251,8 +278,10 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 8SH6HLKMS5;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Magic Frame needs access to your photo library to index photo metadata and choose meaningful memories.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -282,8 +311,10 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 8SH6HLKMS5;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Magic Frame needs access to your photo library to index photo metadata and choose meaningful memories.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
