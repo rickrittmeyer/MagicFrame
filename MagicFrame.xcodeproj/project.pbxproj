@@ -9,16 +9,18 @@
 /* Begin PBXBuildFile section */
 		1DA8A91B2FC2031000A801DB /* libsqlite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 1DA8A91A2FC2031000A801DB /* libsqlite3.tbd */; };
 		1DA8A91D2FC203BD00A801DB /* PhotoDatabase.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DA8A91C2FC203BD00A801DB /* PhotoDatabase.swift */; };
+		1DC4A0012FC9000100A801DB /* PeopleRepository.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DC4A0002FC9000100A801DB /* PeopleRepository.swift */; };
 		1DA8A91F2FC241FF00A801DB /* PhotoThumbnailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DA8A91E2FC241FF00A801DB /* PhotoThumbnailView.swift */; };
-		1DAFA8B72FC695E4005CC499 /* EventDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DAFA8B62FC695E4005CC499 /* EventDetailView.swift */; };
+		1DBFA9022FC7A1000A801DB /* EventAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DBFA9012FC7A1000A801DB /* EventAttributes.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		1DA8A8FF2FBB9E7700A801DB /* MagicFrame.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MagicFrame.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		1DA8A91A2FC2031000A801DB /* libsqlite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libsqlite3.tbd; path = usr/lib/libsqlite3.tbd; sourceTree = SDKROOT; };
 		1DA8A91C2FC203BD00A801DB /* PhotoDatabase.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoDatabase.swift; sourceTree = "<group>"; };
+		1DC4A0002FC9000100A801DB /* PeopleRepository.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeopleRepository.swift; sourceTree = "<group>"; };
 		1DA8A91E2FC241FF00A801DB /* PhotoThumbnailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoThumbnailView.swift; sourceTree = "<group>"; };
-		1DAFA8B62FC695E4005CC499 /* EventDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EventDetailView.swift; sourceTree = "<group>"; };
+		1DBFA9012FC7A1000A801DB /* EventAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EventAttributes.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -44,8 +46,9 @@
 		1DA8A8F62FBB9E7600A801DB = {
 			isa = PBXGroup;
 			children = (
-				1DAFA8B62FC695E4005CC499 /* EventDetailView.swift */,
+				1DBFA9012FC7A1000A801DB /* EventAttributes.swift */,
 				1DA8A91C2FC203BD00A801DB /* PhotoDatabase.swift */,
+				1DC4A0002FC9000100A801DB /* PeopleRepository.swift */,
 				1DA8A91E2FC241FF00A801DB /* PhotoThumbnailView.swift */,
 				1DA8A9012FBB9E7700A801DB /* MagicFrame */,
 				1DA8A9192FC2030F00A801DB /* Frameworks */,
@@ -143,9 +146,10 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				1DBFA9022FC7A1000A801DB /* EventAttributes.swift in Sources */,
 				1DA8A91F2FC241FF00A801DB /* PhotoThumbnailView.swift in Sources */,
-				1DAFA8B72FC695E4005CC499 /* EventDetailView.swift in Sources */,
 				1DA8A91D2FC203BD00A801DB /* PhotoDatabase.swift in Sources */,
+				1DC4A0012FC9000100A801DB /* PeopleRepository.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -281,6 +285,7 @@
 				DEVELOPMENT_TEAM = 8SH6HLKMS5;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Magic Frame uses your location to center the home map during setup.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Magic Frame needs access to your photo library to index photo metadata and choose meaningful memories.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -298,7 +303,7 @@
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
-				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = NO;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -314,6 +319,7 @@
 				DEVELOPMENT_TEAM = 8SH6HLKMS5;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Magic Frame uses your location to center the home map during setup.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Magic Frame needs access to your photo library to index photo metadata and choose meaningful memories.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -331,7 +337,7 @@
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
-				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = NO;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
