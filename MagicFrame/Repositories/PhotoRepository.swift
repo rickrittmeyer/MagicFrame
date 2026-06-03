@@ -13,11 +13,20 @@ struct PhotoCropFocusRecord {
 final class PhotoRepository {
 
     static let shared = PhotoRepository()
+    static let faceMetricsAlgorithmVersionKey = "faceMetricsAlgorithmVersion"
+    static let cropAlgorithmVersionKey = "cropAlgorithmVersion"
 
     private let database: DatabaseManager
+    private let metadata: AppMetadataStore
+    private var locations: LocationRepository?
 
-    init(database: DatabaseManager = .shared) {
+    init(database: DatabaseManager = .shared, metadata: AppMetadataStore? = nil) {
         self.database = database
+        self.metadata = metadata ?? AppMetadataStore(database: database)
+    }
+
+    func bindLocations(_ locations: LocationRepository) {
+        self.locations = locations
     }
 
     private var db: OpaquePointer? {
@@ -248,6 +257,71 @@ final class PhotoRepository {
         updateCropFocuses(photoId: photoId, list: nil, frame: nil)
     }
 
+    func faceMetricsAlgorithmVersion() -> Int {
+        Int(metadata.get(key: Self.faceMetricsAlgorithmVersionKey) ?? "") ?? 0
+    }
+
+    func setFaceMetricsAlgorithmVersion(_ version: Int) {
+        metadata.set(key: Self.faceMetricsAlgorithmVersionKey, value: String(version))
+    }
+
+    func cropAlgorithmVersion() -> Int {
+        Int(metadata.get(key: Self.cropAlgorithmVersionKey) ?? "") ?? 0
+    }
+
+    func setCropAlgorithmVersion(_ version: Int) {
+        metadata.set(key: Self.cropAlgorithmVersionKey, value: String(version))
+    }
+
+    func countPhotosMissingLocation() -> Int {
+        queue.sync {
+            countRowsUnsafe(
+                """
+                photos
+                WHERE isDeleted = 0
+                  AND isScreenshot = 0
+                  AND COALESCE(userLatitude, latitude) IS NULL
+                """
+            )
+        }
+    }
+
+    func countActivePhotos() -> Int {
+        queue.sync {
+            countRowsUnsafe("photos WHERE isDeleted = 0")
+        }
+    }
+
+    func getLikelyUploadBatches(
+        gapSeconds: TimeInterval,
+        minPhotos: Int,
+        locationMatchMiles: Double
+    ) -> [PhotoUploadBatch] {
+        queue.sync {
+            getLikelyUploadBatchesUnsafe(
+                gapSeconds: gapSeconds,
+                minPhotos: minPhotos,
+                locationMatchMiles: locationMatchMiles
+            )
+        }
+    }
+
+    func applyArchiveBatchMetadata(
+        photoIds: [String],
+        captureDate: Date,
+        latitude: Double,
+        longitude: Double
+    ) {
+        queue.sync {
+            applyArchiveBatchMetadataUnsafe(
+                photoIds: photoIds,
+                captureDate: captureDate,
+                latitude: latitude,
+                longitude: longitude
+            )
+        }
+    }
+
     func readIndexedPhotoRow(from statement: OpaquePointer?) -> IndexedPhoto {
         let id = String(cString: sqlite3_column_text(statement, 0))
         let creationDate = String(cString: sqlite3_column_text(statement, 1))
@@ -292,6 +366,205 @@ final class PhotoRepository {
     }
 
     // MARK: - Private
+
+    private func countRowsUnsafe(_ tableOrQuery: String) -> Int {
+        guard let db else { return 0 }
+
+        let sql = "SELECT COUNT(*) FROM \(tableOrQuery);"
+        var statement: OpaquePointer?
+        var count = 0
+
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            if sqlite3_step(statement) == SQLITE_ROW {
+                count = Int(sqlite3_column_int(statement, 0))
+            }
+        } else {
+            print("Count failed for \(tableOrQuery): \(String(cString: sqlite3_errmsg(db)))")
+        }
+
+        sqlite3_finalize(statement)
+        return count
+    }
+
+    private func getLikelyUploadBatchesUnsafe(
+        gapSeconds: TimeInterval,
+        minPhotos: Int,
+        locationMatchMiles: Double
+    ) -> [PhotoUploadBatch] {
+        guard let db else { return [] }
+
+        let sql = """
+        SELECT id, creationDate, captureDateOverride, userLatitude, userLongitude
+        FROM photos
+        WHERE isDeleted = 0
+          AND isScreenshot = 0
+          AND COALESCE(userLatitude, latitude) IS NULL
+        ORDER BY creationDate ASC;
+        """
+
+        var statement: OpaquePointer?
+        struct Row {
+            let id: String
+            let importDate: Date
+            let captureOverride: Date?
+            let userLatitude: Double?
+            let userLongitude: Double?
+        }
+
+        let iso8601 = ISO8601DateFormatter()
+        var rows: [Row] = []
+
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let id = String(cString: sqlite3_column_text(statement, 0))
+                let creationString = String(cString: sqlite3_column_text(statement, 1))
+
+                guard let importDate = iso8601.date(from: creationString) else {
+                    continue
+                }
+
+                let captureOverride: Date?
+                if sqlite3_column_type(statement, 2) != SQLITE_NULL {
+                    let overrideString = String(cString: sqlite3_column_text(statement, 2))
+                    captureOverride = iso8601.date(from: overrideString)
+                } else {
+                    captureOverride = nil
+                }
+
+                let userLatitude: Double? =
+                    sqlite3_column_type(statement, 3) == SQLITE_NULL
+                    ? nil
+                    : sqlite3_column_double(statement, 3)
+
+                let userLongitude: Double? =
+                    sqlite3_column_type(statement, 4) == SQLITE_NULL
+                    ? nil
+                    : sqlite3_column_double(statement, 4)
+
+                rows.append(
+                    Row(
+                        id: id,
+                        importDate: importDate,
+                        captureOverride: captureOverride,
+                        userLatitude: userLatitude,
+                        userLongitude: userLongitude
+                    )
+                )
+            }
+        }
+
+        sqlite3_finalize(statement)
+
+        guard !rows.isEmpty else { return [] }
+
+        var batches: [[Row]] = []
+        var currentBatch: [Row] = [rows[0]]
+
+        for row in rows.dropFirst() {
+            let gap = row.importDate.timeIntervalSince(currentBatch.last!.importDate)
+            if gap > gapSeconds {
+                batches.append(currentBatch)
+                currentBatch = [row]
+            } else {
+                currentBatch.append(row)
+            }
+        }
+
+        batches.append(currentBatch)
+
+        return batches
+            .filter { $0.count >= minPhotos }
+            .map { batchRows in
+                let importStart = batchRows.first!.importDate
+                let importEnd = batchRows.last!.importDate
+                let photoIds = batchRows.map(\.id)
+                let samplePhotoIds = Array(photoIds.prefix(24))
+
+                let overrides = batchRows.compactMap(\.captureOverride)
+                let assignedCaptureDate =
+                    overrides.count == batchRows.count ? overrides.first : nil
+
+                let hasAssignedLocation = batchRows.allSatisfy {
+                    $0.userLatitude != nil && $0.userLongitude != nil
+                }
+
+                let assignedLocationId: Int?
+                if hasAssignedLocation,
+                   let latitude = batchRows.first?.userLatitude,
+                   let longitude = batchRows.first?.userLongitude,
+                   let locations {
+                    assignedLocationId = locations.findLocationWithinMiles(
+                        latitude: latitude,
+                        longitude: longitude,
+                        maxMiles: locationMatchMiles
+                    )
+                } else {
+                    assignedLocationId = nil
+                }
+
+                let id = iso8601.string(from: importStart)
+
+                return PhotoUploadBatch(
+                    id: id,
+                    importStart: importStart,
+                    importEnd: importEnd,
+                    photoIds: photoIds,
+                    samplePhotoIds: samplePhotoIds,
+                    assignedCaptureDate: assignedCaptureDate,
+                    assignedLocationId: assignedLocationId,
+                    hasAssignedLocation: hasAssignedLocation
+                )
+            }
+            .sorted { $0.importStart > $1.importStart }
+    }
+
+    private func applyArchiveBatchMetadataUnsafe(
+        photoIds: [String],
+        captureDate: Date,
+        latitude: Double,
+        longitude: Double
+    ) {
+        guard let db else { return }
+
+        let iso8601 = ISO8601DateFormatter()
+        let captureISO = iso8601.string(from: captureDate)
+        let now = iso8601.string(from: Date())
+
+        let sql = """
+        UPDATE photos
+        SET captureDateOverride = ?,
+            userLatitude = ?,
+            userLongitude = ?,
+            eventAssignedAt = NULL,
+            eventNeedsReview = 0,
+            indexedAt = ?
+        WHERE id = ?;
+        """
+
+        var statement: OpaquePointer?
+
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) != SQLITE_OK {
+            print("Failed to prepare archive batch update: \(String(cString: sqlite3_errmsg(db)))")
+            return
+        }
+
+        for photoId in photoIds {
+            sqlite3_bind_text(statement, 1, (captureISO as NSString).utf8String, -1, nil)
+            sqlite3_bind_double(statement, 2, latitude)
+            sqlite3_bind_double(statement, 3, longitude)
+            sqlite3_bind_text(statement, 4, (now as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, 5, (photoId as NSString).utf8String, -1, nil)
+
+            if sqlite3_step(statement) != SQLITE_DONE {
+                print("Failed archive batch update for \(photoId): \(String(cString: sqlite3_errmsg(db)))")
+            }
+
+            sqlite3_reset(statement)
+        }
+
+        sqlite3_finalize(statement)
+        print("Applied archive metadata to \(photoIds.count) photos")
+    }
 
     private func upsertPhotoUnsafe(
         id: String,

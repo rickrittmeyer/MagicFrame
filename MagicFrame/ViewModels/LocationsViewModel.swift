@@ -4,6 +4,8 @@ import Combine
 @MainActor
 final class LocationsViewModel: ObservableObject {
 
+    private let database: any MagicFrameDatabase
+
     @Published var locations: [ManagedLocation] = []
     @Published var typeOptions: [String] = []
     @Published var statusText: String = "Ready"
@@ -34,7 +36,8 @@ final class LocationsViewModel: ObservableObject {
     private var isShowingGeocodeProgress = false
     private var cancellables = Set<AnyCancellable>()
 
-    init() {
+    init(database: any MagicFrameDatabase = AppDependencies.database) {
+        self.database = database
         NotificationCenter.default.publisher(for: .locationGeocodeProgressChanged)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] notification in
@@ -53,8 +56,8 @@ final class LocationsViewModel: ObservableObject {
     }
 
     func loadLocations() {
-        locations = PhotoDatabase.shared.getLocationsRankedByEventCount()
-        typeOptions = PhotoDatabase.shared.getLocationTypeOptions()
+        locations = database.getLocationsRankedByEventCount()
+        typeOptions = database.getLocationTypeOptions()
         setBaseStatus("\(locations.count) locations")
     }
 
@@ -64,7 +67,7 @@ final class LocationsViewModel: ObservableObject {
             statusText = "Geocoding \(progress.displayRemaining) remaining…"
         } else if isShowingGeocodeProgress {
             isShowingGeocodeProgress = false
-            locations = PhotoDatabase.shared.getLocationsRankedByEventCount()
+            locations = database.getLocationsRankedByEventCount()
             setBaseStatus("\(locations.count) locations")
         }
     }
@@ -77,15 +80,15 @@ final class LocationsViewModel: ObservableObject {
     }
 
     private func scheduleBackgroundGeocodeIfNeeded() {
-        let pendingCount = PhotoDatabase.shared.locationsNeedingGeocodeCount()
+        let pendingCount = database.locationsNeedingGeocodeCount()
         guard pendingCount > 0 else { return }
 
         // Geocode in small batches on demand — avoids locking up the app after import.
-        PhotoDatabase.shared.startGeocodingEventLocations(limit: 40)
+        database.startGeocodingEventLocations(limit: 40)
     }
 
     func setLocationType(locationId: Int, type: String?) {
-        PhotoDatabase.shared.updateLocationType(locationId: locationId, locationType: type)
+        database.updateLocationType(locationId: locationId, locationType: type)
 
         guard let index = locations.firstIndex(where: { $0.locationId == locationId }) else {
             return
@@ -117,7 +120,7 @@ final class LocationsViewModel: ObservableObject {
         let location = locations[index]
         let newValue = !location.isFavorite
 
-        PhotoDatabase.shared.setLocationFavorite(locationId: locationId, isFavorite: newValue)
+        database.setLocationFavorite(locationId: locationId, isFavorite: newValue)
 
         locations[index] = ManagedLocation(
             locationId: location.locationId,
@@ -148,7 +151,7 @@ final class LocationsViewModel: ObservableObject {
             return
         }
 
-        PhotoDatabase.shared.updateLocationNickname(
+        database.updateLocationNickname(
             locationId: locationId,
             nickname: renameText
         )
@@ -192,8 +195,8 @@ final class LocationsViewModel: ObservableObject {
             return
         }
 
-        PhotoDatabase.shared.addCustomLocationType(trimmed)
-        typeOptions = PhotoDatabase.shared.getLocationTypeOptions()
+        database.addCustomLocationType(trimmed)
+        typeOptions = database.getLocationTypeOptions()
         newTypeName = ""
         isAddingType = false
     }

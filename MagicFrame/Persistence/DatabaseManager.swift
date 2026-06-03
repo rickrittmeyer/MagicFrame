@@ -45,4 +45,27 @@ final class DatabaseManager {
     func sync<T>(_ work: () throws -> T) rethrows -> T {
         try queue.sync { try work() }
     }
+
+    func bootstrapSchema(legacyHooks: LegacyDataMigrationHooks = LegacyDataMigrationHooks()) {
+        guard let connection else { return }
+        SQLiteMigrations.createTablesIfNeeded(on: connection)
+        SQLiteMigrations.migrateTablesIfNeeded(on: connection, legacyHooks: legacyHooks)
+    }
+
+    func columnExists(table: String, column: String) -> Bool {
+        guard let connection else { return false }
+        return SQLiteMigrations.columnExists(table: table, column: column, on: connection)
+    }
+
+    @discardableResult
+    func resetDevelopmentTables(legacyHooks: LegacyDataMigrationHooks) -> Bool {
+        guard let connection else { return false }
+        guard SQLiteMigrations.dropDevelopmentTables(on: connection) else {
+            print("Unable to reset tables: \(String(cString: sqlite3_errmsg(connection)))")
+            return false
+        }
+        print("DEV reset complete")
+        bootstrapSchema(legacyHooks: legacyHooks)
+        return true
+    }
 }

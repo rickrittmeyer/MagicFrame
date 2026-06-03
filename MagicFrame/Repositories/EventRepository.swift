@@ -1905,6 +1905,54 @@ final class EventRepository {
     sqlite3_finalize(statement)
     }
 
+    func setEventLocationId(eventId: Int, locationId: Int) {
+        let sql = """
+        UPDATE events
+        SET locationId = ?
+        WHERE eventId = ?;
+        """
+        var statement: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            sqlite3_bind_int(statement, 1, Int32(locationId))
+            sqlite3_bind_int(statement, 2, Int32(eventId))
+            sqlite3_step(statement)
+        }
+        sqlite3_finalize(statement)
+    }
+
+    func clearEventLocationFields(eventId: Int) {
+        let sql = """
+        UPDATE events
+        SET city = NULL,
+            state = NULL,
+            placeName = NULL
+        WHERE eventId = ?;
+        """
+        var statement: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            sqlite3_bind_int(statement, 1, Int32(eventId))
+            sqlite3_step(statement)
+        }
+        sqlite3_finalize(statement)
+    }
+
+    func reassignEvents(fromLocationId: Int, toLocationId: Int) {
+        guard fromLocationId != toLocationId else { return }
+        let sql = """
+        UPDATE events
+        SET locationId = ?
+        WHERE locationId = ?
+          AND isDeleted = 0;
+        """
+        var statement: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            sqlite3_bind_int(statement, 1, Int32(toLocationId))
+            sqlite3_bind_int(statement, 2, Int32(fromLocationId))
+            sqlite3_step(statement)
+        }
+        sqlite3_finalize(statement)
+    }
+
 
     private static let iso8601Formatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()

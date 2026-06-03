@@ -81,7 +81,7 @@ struct DeveloperView: View {
                     vm.recentPhotos = []
                     vm.statusText = "Resetting database (dev)..."
 
-                    PhotoDatabase.shared.resetDatabaseForDevelopmentOnly()
+                    AppDependencies.database.resetDatabaseForDevelopmentOnly()
                     vm.refreshLibraryCounts()
 
                     vm.statusText = "Dev reset complete"
@@ -222,13 +222,13 @@ private struct EventTuningDeveloperView: View {
 
             Section {
                 Button("Save") {
-                    PhotoDatabase.shared.saveEventTuningSettings(settings)
+                    AppDependencies.database.saveEventTuningSettings(settings)
                     statusMessage = "Saved. Rebuild events to apply."
                 }
 
                 Button("Reset to defaults") {
                     settings = .defaults
-                    PhotoDatabase.shared.resetEventTuningSettings()
+                    AppDependencies.database.resetEventTuningSettings()
                     statusMessage = "Reset to defaults."
                 }
             }
@@ -236,7 +236,7 @@ private struct EventTuningDeveloperView: View {
         .navigationTitle("Event Tuning")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
-            settings = PhotoDatabase.shared.getEventTuningSettings()
+            settings = AppDependencies.database.getEventTuningSettings()
         }
     }
 

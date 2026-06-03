@@ -9,18 +9,18 @@
 /* Begin PBXBuildFile section */
 		1DA8A91B2FC2031000A801DB /* libsqlite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 1DA8A91A2FC2031000A801DB /* libsqlite3.tbd */; };
 		1DA8A91D2FC203BD00A801DB /* PhotoDatabase.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DA8A91C2FC203BD00A801DB /* PhotoDatabase.swift */; };
-		1DC4A0012FC9000100A801DB /* PeopleRepository.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DC4A0002FC9000100A801DB /* PeopleRepository.swift */; };
 		1DA8A91F2FC241FF00A801DB /* PhotoThumbnailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DA8A91E2FC241FF00A801DB /* PhotoThumbnailView.swift */; };
 		1DBFA9022FC7A1000A801DB /* EventAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DBFA9012FC7A1000A801DB /* EventAttributes.swift */; };
+		1DC4A0012FC9000100A801DB /* PeopleRepository.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DC4A0002FC9000100A801DB /* PeopleRepository.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		1DA8A8FF2FBB9E7700A801DB /* MagicFrame.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MagicFrame.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		1DA8A91A2FC2031000A801DB /* libsqlite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libsqlite3.tbd; path = usr/lib/libsqlite3.tbd; sourceTree = SDKROOT; };
 		1DA8A91C2FC203BD00A801DB /* PhotoDatabase.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoDatabase.swift; sourceTree = "<group>"; };
-		1DC4A0002FC9000100A801DB /* PeopleRepository.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeopleRepository.swift; sourceTree = "<group>"; };
 		1DA8A91E2FC241FF00A801DB /* PhotoThumbnailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoThumbnailView.swift; sourceTree = "<group>"; };
 		1DBFA9012FC7A1000A801DB /* EventAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EventAttributes.swift; sourceTree = "<group>"; };
+		1DC4A0002FC9000100A801DB /* PeopleRepository.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeopleRepository.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */

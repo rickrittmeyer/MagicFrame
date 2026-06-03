@@ -35,6 +35,8 @@ struct EventListScrollTarget: Equatable {
 @MainActor
 final class LibraryViewModel: ObservableObject {
 
+    let database: any MagicFrameDatabase
+
     @Published var statusText: String = "Ready"
     @Published var events: [IndexedEvent] = []
     @Published var eventSections: [EventYearSection] = []
@@ -93,7 +95,8 @@ final class LibraryViewModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var pipelineTask: Task<Void, Never>?
 
-    init() {
+    init(database: any MagicFrameDatabase = AppDependencies.database) {
+        self.database = database
         NotificationCenter.default.publisher(for: .locationGeocodeProgressChanged)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] notification in
@@ -140,8 +143,9 @@ final class LibraryViewModel: ObservableObject {
     func onAppear() {
         guard pipelineTask == nil else { return }
 
+        let db = database
         pipelineTask = Task.detached(priority: .utility) { [weak self] in
-            PhotoDatabase.shared.stopGeocoding()
+            db.stopGeocoding()
             await self?.runStartupPipeline()
         }
     }
@@ -155,8 +159,9 @@ final class LibraryViewModel: ObservableObject {
             isShowingGeocodeProgress = false
         }
 
+        let db = database
         let hasHome = await Task.detached(priority: .utility) {
-            PhotoDatabase.shared.hasCurrentHome()
+            db.hasCurrentHome()
         }.value
 
         guard hasHome else {
@@ -171,7 +176,7 @@ final class LibraryViewModel: ObservableObject {
 
         if photoCount > 0 {
             let eventCount = await Task.detached(priority: .utility) {
-                PhotoDatabase.shared.getEvents().count
+                db.getEvents(includeHidden: false).count
             }.value
 
             if eventCount > 0 {
@@ -220,9 +225,10 @@ final class LibraryViewModel: ObservableObject {
 
         await reloadEventsAsync()
 
+        let db = database
         Task.detached(priority: .utility) { [weak self] in
-            PhotoDatabase.shared.restoreDeletedTripContainersOnQueue()
-            PhotoDatabase.shared.repairHomeLocations()
+            db.restoreDeletedTripContainersOnQueue()
+            db.repairHomeLocations()
             await self?.reloadEventsAsync()
             await MainActor.run {
                 self?.refreshLibraryCounts()
@@ -237,11 +243,15 @@ final class LibraryViewModel: ObservableObject {
 
         let includeHidden = await MainActor.run { showHiddenEvents }
 
+        let db = database
         let loaded = await Task.detached(priority: .utility) {
-            PhotoDatabase.shared.getEvents(includeHidden: includeHidden)
+            db.getEvents(includeHidden: includeHidden)
         }.value
 
-        let sections = Self.buildEventSections(from: loaded)
+        let slideshowIdsByEvent = await Task.detached(priority: .utility) {
+            db.getSlideshowPhotoIds(for: loaded)
+        }.value
+        let sections = Self.buildEventSections(from: loaded, slideshowIdsByEvent: slideshowIdsByEvent)
 
         await MainActor.run {
             events = loaded
@@ -251,8 +261,10 @@ final class LibraryViewModel: ObservableObject {
         }
     }
 
-    nonisolated private static func buildEventSections(from events: [IndexedEvent]) -> [EventYearSection] {
-        let slideshowIdsByEvent = PhotoDatabase.shared.getSlideshowPhotoIds(for: events)
+    nonisolated private static func buildEventSections(
+        from events: [IndexedEvent],
+        slideshowIdsByEvent: [Int: [String]]
+    ) -> [EventYearSection] {
         let items = events.map { event in
             EventListDisplayItem(
                 event: event,
@@ -281,7 +293,7 @@ final class LibraryViewModel: ObservableObject {
     func stopAllBackgroundWork() {
         pipelineTask?.cancel()
         pipelineTask = nil
-        PhotoDatabase.shared.stopGeocoding()
+        database.stopGeocoding()
         isSyncingEvents = false
         isMaintainingEvents = false
         isIndexingPhotos = false
@@ -290,11 +302,11 @@ final class LibraryViewModel: ObservableObject {
     }
 
     func refreshArchivePhotoCount() {
-        archivePhotoCount = PhotoDatabase.shared.countPhotosMissingLocation()
+        archivePhotoCount = database.countPhotosMissingLocation()
     }
 
     func refreshLibraryCounts() {
-        indexedPhotoCount = PhotoDatabase.shared.countActivePhotos()
+        indexedPhotoCount = database.countActivePhotos()
         refreshArchivePhotoCount()
     }
 
@@ -327,8 +339,9 @@ final class LibraryViewModel: ObservableObject {
         recentPhotos = []
         statusText = "Indexing photos…"
 
+        let db = database
         let indexedCount = await Task.detached(priority: .utility) { [weak self] in
-            Self.enumeratePhotoLibrary { count in
+            Self.enumeratePhotoLibrary(database: db) { count in
                 guard count == 1 || count % 1000 == 0 else { return }
                 Task { @MainActor in
                     self?.publishStatusThrottled("Indexed \(count.formatted()) photos…")
@@ -337,14 +350,15 @@ final class LibraryViewModel: ObservableObject {
         }.value
 
         await Task.detached(priority: .utility) {
-            PhotoDatabase.shared.importPeopleFromAlbums()
-            PhotoDatabase.shared.rebuildEventPeople()
+            db.importPeopleFromAlbums()
+            db.rebuildEventPeople()
         }.value
 
         setBaseStatus("Indexed \(indexedCount.formatted()) photos — building events…")
     }
 
     private nonisolated static func enumeratePhotoLibrary(
+        database: any MagicFrameDatabase,
         onProgress: @escaping @Sendable (Int) -> Void
     ) -> Int {
         let startDate = Calendar.current.date(byAdding: .year, value: -100, to: Date())
@@ -390,7 +404,7 @@ final class LibraryViewModel: ObservableObject {
             }
             qualityScore = max(0, min(100, qualityScore))
 
-            PhotoDatabase.shared.upsertPhoto(
+            database.upsertPhoto(
                 id: asset.localIdentifier,
                 creationDate: dateFormatter.string(from: asset.creationDate ?? Date()),
                 modificationDate: dateFormatter.string(from: asset.modificationDate ?? Date()),
@@ -423,8 +437,9 @@ final class LibraryViewModel: ObservableObject {
     }
 
     private func performEventSyncIfNeeded() async {
+        let db = database
         let remaining = await Task.detached(priority: .utility) {
-            PhotoDatabase.shared.countUnassignedPhotosForEvents()
+            db.countUnassignedPhotosForEvents()
         }.value
 
         guard remaining > 0 else { return }
@@ -471,13 +486,14 @@ final class LibraryViewModel: ObservableObject {
             isSyncingEvents = true
         }
 
+        let db = database
         var didAssignPhotos = false
         var batchCount = 0
         var lastEventsReload = Date.distantPast
 
         while !Task.isCancelled {
             let remaining = await Task.detached(priority: .background) {
-                PhotoDatabase.shared.countUnassignedPhotosForEvents()
+                db.countUnassignedPhotosForEvents()
             }.value
 
             guard remaining > 0 else { break }
@@ -493,7 +509,7 @@ final class LibraryViewModel: ObservableObject {
             }
 
             let hasMore = await Task.detached(priority: .background) {
-                PhotoDatabase.shared.syncEventsAssignmentBatch()
+                db.syncEventsAssignmentBatch()
             }.value
 
             didAssignPhotos = true
@@ -531,8 +547,9 @@ final class LibraryViewModel: ObservableObject {
             publishStatusThrottled("Finishing event grouping…", force: true)
         }
 
+        let db = database
         await Task.detached(priority: .background) {
-            PhotoDatabase.shared.finishEventSyncMaintenance()
+            db.finishEventSyncMaintenance()
         }.value
 
         await MainActor.run {
@@ -569,15 +586,16 @@ final class LibraryViewModel: ObservableObject {
             isSyncingEvents = true
         }
 
+        let db = database
         let total = await Task.detached(priority: .background) {
-            PhotoDatabase.shared.prepareEventRebuild()
+            db.prepareEventRebuild()
         }.value
 
         await reloadEventsAsync()
 
         guard total > 0 else {
             await Task.detached(priority: .background) {
-                PhotoDatabase.shared.finishEventRebuild()
+                db.finishEventRebuild()
             }.value
             await MainActor.run { isSyncingEvents = false }
             return
@@ -588,7 +606,7 @@ final class LibraryViewModel: ObservableObject {
 
         while !Task.isCancelled {
             let remaining = await Task.detached(priority: .background) {
-                PhotoDatabase.shared.countUnassignedPhotosForEvents()
+                db.countUnassignedPhotosForEvents()
             }.value
 
             guard remaining > 0 else { break }
@@ -605,7 +623,7 @@ final class LibraryViewModel: ObservableObject {
             }
 
             await Task.detached(priority: .background) {
-                PhotoDatabase.shared.syncEventsAssignmentBatch()
+                db.syncEventsAssignmentBatch()
             }.value
 
             batchCount += 1
@@ -616,7 +634,7 @@ final class LibraryViewModel: ObservableObject {
             }
 
             let stillRemaining = await Task.detached(priority: .background) {
-                PhotoDatabase.shared.countUnassignedPhotosForEvents()
+                db.countUnassignedPhotosForEvents()
             }.value
 
             if stillRemaining == 0 {
@@ -637,7 +655,7 @@ final class LibraryViewModel: ObservableObject {
         }
 
         await Task.detached(priority: .background) {
-            PhotoDatabase.shared.finishEventRebuild()
+            db.finishEventRebuild()
         }.value
     }
 
@@ -646,8 +664,9 @@ final class LibraryViewModel: ObservableObject {
             isBuildingCovers = true
             defer { isBuildingCovers = false }
 
+            let db = database
             await Task.detached(priority: .utility) {
-                PhotoDatabase.shared.updateAllEventCoverPhotos()
+                db.updateAllEventCoverPhotos()
             }.value
 
             await reloadEventsAsync()
@@ -656,7 +675,7 @@ final class LibraryViewModel: ObservableObject {
     }
 
     func geocodeNextLocationsBatch() {
-        PhotoDatabase.shared.startGeocodingEventLocations(limit: 40)
+        database.startGeocodingEventLocations(limit: 40)
         publishStatusThrottled("Geocoding 40 recent locations…", force: true)
     }
 
@@ -665,8 +684,9 @@ final class LibraryViewModel: ObservableObject {
             isMaintainingEvents = true
             defer { isMaintainingEvents = false }
 
+            let db = database
             let merged = await Task.detached(priority: .utility) {
-                PhotoDatabase.shared.deduplicateLocationsByAddress()
+                db.deduplicateLocationsByAddress(maxDistanceMiles: nil)
             }.value
 
             publishStatusThrottled(
@@ -687,10 +707,11 @@ final class LibraryViewModel: ObservableObject {
             events = []
             eventSections = []
 
+            let db = database
             await Task.detached(priority: .utility) {
-                PhotoDatabase.shared.debugEventPipeline()
-                PhotoDatabase.shared.debugLocationCounts()
-                PhotoDatabase.shared.debugSchema()
+                db.debugEventPipeline()
+                db.debugLocationCounts()
+                db.debugSchema()
             }.value
 
             await reloadEventsAsync()
@@ -701,7 +722,7 @@ final class LibraryViewModel: ObservableObject {
         isLoadingRecentPhotos = true
         defer { isLoadingRecentPhotos = false }
 
-        recentPhotos = PhotoDatabase.shared.getRecentPhotos(limit: limit)
+        recentPhotos = database.getRecentPhotos(limit: limit)
         setBaseStatus("Showing \(recentPhotos.count) photos")
     }
 
@@ -713,7 +734,7 @@ final class LibraryViewModel: ObservableObject {
         let event = events[index]
         let newValue = !event.showOnFrame
 
-        PhotoDatabase.shared.setEventShowOnFrame(eventId: eventId, show: newValue)
+        database.setEventShowOnFrame(eventId: eventId, show: newValue)
 
         events[index] = IndexedEvent(
             eventId: event.eventId,
@@ -748,14 +769,14 @@ final class LibraryViewModel: ObservableObject {
     }
 
     func hideEvent(eventId: Int) {
-        PhotoDatabase.shared.setEventUserHidden(eventId: eventId, hidden: true)
+        database.setEventUserHidden(eventId: eventId, hidden: true)
         events.removeAll { $0.eventId == eventId }
         rebuildEventSections()
         setBaseStatus(showHiddenEvents ? "Showing \(events.count) hidden events" : "Showing \(events.count) events")
     }
 
     func unhideEvent(eventId: Int) {
-        PhotoDatabase.shared.setEventUserHidden(eventId: eventId, hidden: false)
+        database.setEventUserHidden(eventId: eventId, hidden: false)
         eventListScrollTarget = EventListScrollTarget(eventId: eventId, requestID: UUID())
 
         if showHiddenEvents {
@@ -782,7 +803,7 @@ final class LibraryViewModel: ObservableObject {
     }
 
     func refreshEvent(eventId: Int) {
-        guard let updated = PhotoDatabase.shared.getEvent(eventId: eventId) else {
+        guard let updated = database.getEvent(eventId: eventId) else {
             return
         }
 
@@ -800,7 +821,7 @@ final class LibraryViewModel: ObservableObject {
     }
 
     private func rebuildEventSections() {
-        let slideshowIdsByEvent = PhotoDatabase.shared.getSlideshowPhotoIds(for: events)
+        let slideshowIdsByEvent = database.getSlideshowPhotoIds(for: events)
         let items = events.map { event in
             EventListDisplayItem(
                 event: event,

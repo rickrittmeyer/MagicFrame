@@ -245,12 +245,12 @@ struct PhotoThumbnailView: View {
             return
         }
 
-        if PhotoDatabase.shared.cropAlgorithmVersion() < PhotoFaceCropAnalyzer.algorithmVersion {
-            PhotoDatabase.shared.clearAllCropFocuses()
-            PhotoDatabase.shared.setCropAlgorithmVersion(PhotoFaceCropAnalyzer.algorithmVersion)
+        if AppDependencies.database.cropAlgorithmVersion() < PhotoFaceCropAnalyzer.algorithmVersion {
+            AppDependencies.database.clearAllCropFocuses()
+            AppDependencies.database.setCropAlgorithmVersion(PhotoFaceCropAnalyzer.algorithmVersion)
         }
 
-        guard let cropData = PhotoDatabase.shared.getPhotoCropData(photoId: assetIdentifier) else {
+        guard let cropData = AppDependencies.database.getPhotoCropData(photoId: assetIdentifier) else {
             resolvedCropFocus = nil
             return
         }
@@ -276,7 +276,7 @@ struct PhotoThumbnailView: View {
             return
         }
 
-        PhotoDatabase.shared.updateCropFocuses(
+        AppDependencies.database.updateCropFocuses(
             photoId: assetIdentifier,
             list: analyzed.list,
             frame: analyzed.frame

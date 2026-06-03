@@ -45,14 +45,17 @@ final class EventDetailViewModel: ObservableObject {
     @Published private(set) var analyzingFaceMetricsPhotoIds: Set<String> = []
 
     private var faceAnalysisTask: Task<Void, Never>?
+    private let database: any MagicFrameDatabase
 
     init(
         event: IndexedEvent,
+        database: any MagicFrameDatabase = AppDependencies.database,
         onEventUpdated: ((Int) -> Void)? = nil,
         onEventHidden: ((Int) -> Void)? = nil,
         onEventUnhidden: ((Int) -> Void)? = nil
     ) {
-        let freshEvent = PhotoDatabase.shared.getEvent(eventId: event.eventId) ?? event
+        self.database = database
+        let freshEvent = database.getEvent(eventId: event.eventId) ?? event
         self.event = freshEvent
         self.onEventUpdated = onEventUpdated
         self.onEventHidden = onEventHidden
@@ -135,14 +138,14 @@ final class EventDetailViewModel: ObservableObject {
 
     func loadPhotos() {
         if event.isTripContainer {
-            tripSections = PhotoDatabase.shared.getTripSections(
+            tripSections = database.getTripSections(
                 for: event.eventId,
                 includeHidden: showHiddenPhotos
             )
             photos = tripSections.flatMap(\.photos)
         } else {
             tripSections = []
-            photos = PhotoDatabase.shared.getPhotosForEvent(
+            photos = database.getPhotosForEvent(
                 eventId: event.eventId,
                 includeHidden: showHiddenPhotos
             )
@@ -172,7 +175,7 @@ final class EventDetailViewModel: ObservableObject {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        let saved = PhotoDatabase.shared.updateChildEventName(
+        let saved = database.updateChildEventName(
             eventId: subEventId,
             name: trimmed,
             userEdited: true
@@ -194,13 +197,13 @@ final class EventDetailViewModel: ObservableObject {
     private func analyzeFaceMetricsForStacksIfNeeded() {
         faceAnalysisTask?.cancel()
 
-        if PhotoDatabase.shared.faceMetricsAlgorithmVersion()
+        if database.faceMetricsAlgorithmVersion()
             != PhotoFaceAnalyzer.algorithmVersion {
             let stackPhotoIds = allDisplayItems
                 .filter(\.isStack)
                 .flatMap { $0.group.photos.map(\.id) }
-            PhotoDatabase.shared.clearFaceMetrics(forPhotoIds: stackPhotoIds)
-            PhotoDatabase.shared.setFaceMetricsAlgorithmVersion(PhotoFaceAnalyzer.algorithmVersion)
+            database.clearFaceMetrics(forPhotoIds: stackPhotoIds)
+            database.setFaceMetricsAlgorithmVersion(PhotoFaceAnalyzer.algorithmVersion)
             reloadPhotosPreservingAnalysisState()
         }
 
@@ -264,7 +267,7 @@ final class EventDetailViewModel: ObservableObject {
                 guard !Task.isCancelled else { return }
 
                 if let metrics = await PhotoFaceAnalyzer.analyze(assetIdentifier: photoId) {
-                    PhotoDatabase.shared.updateFaceMetrics(
+                    database.updateFaceMetrics(
                         photoId: photoId,
                         eyesOpenScore: metrics.eyesOpenScore,
                         smileScore: metrics.smileScore
@@ -279,14 +282,14 @@ final class EventDetailViewModel: ObservableObject {
 
     private func reloadPhotosPreservingAnalysisState() {
         if event.isTripContainer {
-            tripSections = PhotoDatabase.shared.getTripSections(
+            tripSections = database.getTripSections(
                 for: event.eventId,
                 includeHidden: showHiddenPhotos
             )
             photos = tripSections.flatMap(\.photos)
         } else {
             tripSections = []
-            photos = PhotoDatabase.shared.getPhotosForEvent(
+            photos = database.getPhotosForEvent(
                 eventId: event.eventId,
                 includeHidden: showHiddenPhotos
             )
@@ -322,7 +325,7 @@ final class EventDetailViewModel: ObservableObject {
     func saveSimilarGroupPicks() {
         guard let group = activeSimilarGroup else { return }
 
-        PhotoDatabase.shared.setSimilarGroupPicks(
+        database.setSimilarGroupPicks(
             groupPhotoIds: group.photos.map(\.id),
             pickedPhotoIds: similarGroupPickerSelection
         )
@@ -343,7 +346,7 @@ final class EventDetailViewModel: ObservableObject {
 
     @discardableResult
     func hideDisplayItem(_ item: EventPhotoDisplayItem) -> Bool {
-        PhotoDatabase.shared.setPhotosHiddenInEvent(
+        database.setPhotosHiddenInEvent(
             photoIds: item.group.photos.map(\.id),
             hidden: true
         )
@@ -359,13 +362,13 @@ final class EventDetailViewModel: ObservableObject {
     }
 
     func loadClassificationOptions() {
-        eventTypeOptions = PhotoDatabase.shared.getEventAttributeOptions(for: .eventType)
-        activityTypeOptions = PhotoDatabase.shared.getEventAttributeOptions(for: .activityType)
-        tripTypeOptions = PhotoDatabase.shared.getEventAttributeOptions(for: .tripType)
-        milestoneTypeOptions = PhotoDatabase.shared.getEventAttributeOptions(for: .milestoneType)
-        holidayTypeOptions = PhotoDatabase.shared.getEventAttributeOptions(for: .holidayType)
+        eventTypeOptions = database.getEventAttributeOptions(for: .eventType)
+        activityTypeOptions = database.getEventAttributeOptions(for: .activityType)
+        tripTypeOptions = database.getEventAttributeOptions(for: .tripType)
+        milestoneTypeOptions = database.getEventAttributeOptions(for: .milestoneType)
+        holidayTypeOptions = database.getEventAttributeOptions(for: .holidayType)
 
-        var people = Set(PhotoDatabase.shared.getAllPersonNames())
+        var people = Set(database.getAllPersonNames())
         people.formUnion(event.people)
         personOptions = people.sorted {
             $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
@@ -435,7 +438,7 @@ final class EventDetailViewModel: ObservableObject {
         let trimmed = newCustomOptionName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        PhotoDatabase.shared.addCustomEventAttributeOption(trimmed, for: field)
+        database.addCustomEventAttributeOption(trimmed, for: field)
         loadClassificationOptions()
         setAttribute(field, value: trimmed)
 
@@ -451,7 +454,7 @@ final class EventDetailViewModel: ObservableObject {
     }
 
     private func setAttribute(_ field: EventAttributeField, value: String?) {
-        PhotoDatabase.shared.updateEventAttribute(
+        database.updateEventAttribute(
             eventId: event.eventId,
             field: field,
             value: value
@@ -505,7 +508,7 @@ final class EventDetailViewModel: ObservableObject {
                 setPhotoOnFrame(photoId: photoId, show: true, in: group)
             }
         } else {
-            PhotoDatabase.shared.setPhotosShowOnFrame(
+            database.setPhotosShowOnFrame(
                 photoIds: Array(selectedPhotoIds),
                 show: false
             )
@@ -522,7 +525,7 @@ final class EventDetailViewModel: ObservableObject {
             return hideDisplayItem(item)
         }
 
-        PhotoDatabase.shared.setPhotosHiddenInEvent(photoIds: [photoId], hidden: true)
+        database.setPhotosHiddenInEvent(photoIds: [photoId], hidden: true)
         loadPhotos()
         refreshEvent()
 
@@ -544,7 +547,7 @@ final class EventDetailViewModel: ObservableObject {
     func hideSelectedPhotos() -> Bool {
         guard !selectedPhotoIds.isEmpty else { return false }
 
-        PhotoDatabase.shared.setPhotosHiddenInEvent(
+        database.setPhotosHiddenInEvent(
             photoIds: Array(selectedPhotoIds),
             hidden: true
         )
@@ -561,12 +564,12 @@ final class EventDetailViewModel: ObservableObject {
     }
 
     func hideEvent() {
-        PhotoDatabase.shared.setEventUserHidden(eventId: event.eventId, hidden: true)
+        database.setEventUserHidden(eventId: event.eventId, hidden: true)
         onEventHidden?(event.eventId)
     }
 
     func unhideEvent() {
-        PhotoDatabase.shared.setEventUserHidden(eventId: event.eventId, hidden: false)
+        database.setEventUserHidden(eventId: event.eventId, hidden: false)
         refreshEvent()
         onEventUnhidden?(event.eventId)
     }
@@ -576,7 +579,7 @@ final class EventDetailViewModel: ObservableObject {
     }
 
     func refreshEvent() {
-        guard let updated = PhotoDatabase.shared.getEvent(eventId: event.eventId) else {
+        guard let updated = database.getEvent(eventId: event.eventId) else {
             return
         }
 
@@ -601,7 +604,7 @@ final class EventDetailViewModel: ObservableObject {
             return false
         }
 
-        let saved = PhotoDatabase.shared.updateEventName(
+        let saved = database.updateEventName(
             eventId: event.eventId,
             name: trimmed,
             userEdited: userEditedName
@@ -640,31 +643,31 @@ final class EventDetailViewModel: ObservableObject {
     func setPhotoOnFrame(photoId: String, show: Bool, in group: SimilarPhotoGroup? = nil) {
         guard photos.contains(where: { $0.id == photoId }) else { return }
 
-        let owningEventId = PhotoDatabase.shared.getEventIdForPhoto(photoId: photoId) ?? event.eventId
+        let owningEventId = database.getEventIdForPhoto(photoId: photoId) ?? event.eventId
 
         if show, let group, group.isStack {
             for sibling in group.photos where sibling.id != photoId {
-                let siblingEventId = PhotoDatabase.shared.getEventIdForPhoto(photoId: sibling.id) ?? owningEventId
-                PhotoDatabase.shared.setPhotoShowOnFrame(
+                let siblingEventId = database.getEventIdForPhoto(photoId: sibling.id) ?? owningEventId
+                database.setPhotoShowOnFrame(
                     photoId: sibling.id,
                     eventId: siblingEventId,
                     show: false
                 )
             }
 
-            PhotoDatabase.shared.setSimilarGroupPicks(
+            database.setSimilarGroupPicks(
                 groupPhotoIds: group.photos.map(\.id),
                 pickedPhotoIds: [photoId]
             )
         }
 
-        PhotoDatabase.shared.setPhotoShowOnFrame(
+        database.setPhotoShowOnFrame(
             photoId: photoId,
             eventId: owningEventId,
             show: show
         )
 
-        PhotoDatabase.shared.clearCropFocus(photoId: photoId)
+        database.clearCropFocus(photoId: photoId)
 
         loadPhotos()
         notifyEventUpdated()

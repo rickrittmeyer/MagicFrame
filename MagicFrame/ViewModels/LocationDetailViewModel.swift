@@ -5,6 +5,7 @@ import Combine
 final class LocationDetailViewModel: ObservableObject {
 
     let locationId: Int
+    private let database: any MagicFrameDatabase
 
     @Published var location: ManagedLocation?
     @Published var userName: String = ""
@@ -16,12 +17,16 @@ final class LocationDetailViewModel: ObservableObject {
     @Published var homeStartDate = Date()
     @Published var homeEndDate = Date()
 
-    init(locationId: Int) {
+    init(
+        locationId: Int,
+        database: any MagicFrameDatabase = AppDependencies.database
+    ) {
         self.locationId = locationId
+        self.database = database
     }
 
     func load() {
-        location = PhotoDatabase.shared.getLocation(locationId: locationId)
+        location = database.getLocation(locationId: locationId)
         userName = location?.nickname ?? ""
         homeRole = location?.homeRole ?? .none
 
@@ -36,12 +41,12 @@ final class LocationDetailViewModel: ObservableObject {
         }
 
         rebuildEventItems()
-        typeOptions = PhotoDatabase.shared.getLocationTypeOptions()
+        typeOptions = database.getLocationTypeOptions()
     }
 
     private func rebuildEventItems() {
-        let events = PhotoDatabase.shared.getEventsForLocation(locationId: locationId)
-        let slideshowIdsByEvent = PhotoDatabase.shared.getSlideshowPhotoIds(for: events)
+        let events = database.getEventsForLocation(locationId: locationId)
+        let slideshowIdsByEvent = database.getSlideshowPhotoIds(for: events)
         eventItems = events.map { event in
             EventListDisplayItem(
                 event: event,
@@ -51,11 +56,11 @@ final class LocationDetailViewModel: ObservableObject {
     }
 
     func saveNickname() {
-        PhotoDatabase.shared.updateLocationNickname(
+        database.updateLocationNickname(
             locationId: locationId,
             nickname: userName
         )
-        location = PhotoDatabase.shared.getLocation(locationId: locationId)
+        location = database.getLocation(locationId: locationId)
     }
 
     func saveHomeDesignation() {
@@ -74,7 +79,7 @@ final class LocationDetailViewModel: ObservableObject {
             endDate = homeEndDate
         }
 
-        PhotoDatabase.shared.updateLocationHomeDesignation(
+        database.updateLocationHomeDesignation(
             locationId: locationId,
             role: homeRole,
             homeStartDate: startDate,
@@ -84,27 +89,27 @@ final class LocationDetailViewModel: ObservableObject {
     }
 
     func setLocationType(_ type: String?) {
-        PhotoDatabase.shared.updateLocationType(locationId: locationId, locationType: type)
-        location = PhotoDatabase.shared.getLocation(locationId: locationId)
+        database.updateLocationType(locationId: locationId, locationType: type)
+        location = database.getLocation(locationId: locationId)
     }
 
     func toggleFavorite() {
         guard let location else { return }
 
-        PhotoDatabase.shared.setLocationFavorite(
+        database.setLocationFavorite(
             locationId: locationId,
             isFavorite: !location.isFavorite
         )
-        self.location = PhotoDatabase.shared.getLocation(locationId: locationId)
+        self.location = database.getLocation(locationId: locationId)
     }
 
     func refreshEvent(eventId: Int) {
         guard let index = eventItems.firstIndex(where: { $0.event.eventId == eventId }),
-              let updated = PhotoDatabase.shared.getEvent(eventId: eventId) else {
+              let updated = database.getEvent(eventId: eventId) else {
             return
         }
 
-        let slideshowIds = PhotoDatabase.shared.getSlideshowPhotoIds(for: [updated])
+        let slideshowIds = database.getSlideshowPhotoIds(for: [updated])
         eventItems[index] = EventListDisplayItem(
             event: updated,
             slideshowPhotoIds: slideshowIds[updated.eventId] ?? []
@@ -112,12 +117,12 @@ final class LocationDetailViewModel: ObservableObject {
     }
 
     func hideEvent(eventId: Int) {
-        PhotoDatabase.shared.setEventUserHidden(eventId: eventId, hidden: true)
+        database.setEventUserHidden(eventId: eventId, hidden: true)
         eventItems.removeAll { $0.event.eventId == eventId }
     }
 
     func unhideEvent(eventId: Int) {
-        PhotoDatabase.shared.setEventUserHidden(eventId: eventId, hidden: false)
+        database.setEventUserHidden(eventId: eventId, hidden: false)
         refreshEvent(eventId: eventId)
     }
 
@@ -133,8 +138,8 @@ final class LocationDetailViewModel: ObservableObject {
             return
         }
 
-        PhotoDatabase.shared.addCustomLocationType(trimmed)
-        typeOptions = PhotoDatabase.shared.getLocationTypeOptions()
+        database.addCustomLocationType(trimmed)
+        typeOptions = database.getLocationTypeOptions()
         setLocationType(trimmed)
         newTypeName = ""
         isAddingType = false

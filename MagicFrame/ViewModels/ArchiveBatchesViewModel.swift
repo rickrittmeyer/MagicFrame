@@ -9,14 +9,19 @@ final class ArchiveBatchesViewModel: ObservableObject {
     @Published var statusText: String = ""
 
     private let libraryViewModel: LibraryViewModel
+    private let database: any MagicFrameDatabase
 
     init(libraryViewModel: LibraryViewModel) {
         self.libraryViewModel = libraryViewModel
+        self.database = libraryViewModel.database
     }
 
     func load() {
-        batches = PhotoDatabase.shared.getLikelyUploadBatches()
-        locations = PhotoDatabase.shared.getLocationsRankedByEventCount()
+        batches = database.getLikelyUploadBatches(
+            gapSeconds: 6 * 60 * 60,
+            minPhotos: 1
+        )
+        locations = database.getLocationsRankedByEventCount()
             .filter { $0.latitude != nil && $0.longitude != nil }
 
         let photoCount = batches.reduce(0) { $0 + $1.photoCount }
@@ -37,7 +42,7 @@ final class ArchiveBatchesViewModel: ObservableObject {
             return
         }
 
-        PhotoDatabase.shared.applyArchiveBatchMetadata(
+        database.applyArchiveBatchMetadata(
             photoIds: batch.photoIds,
             captureDate: captureDate,
             latitude: latitude,

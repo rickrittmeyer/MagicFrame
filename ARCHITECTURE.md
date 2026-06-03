@@ -127,7 +127,8 @@ This is the intended end state. Existing files should not be moved until a dedic
 - `MagicFrame/Repositories/Protocols/PhotoRepository.swift`
 - `MagicFrame/Repositories/Protocols/EventRepository.swift`
 - `MagicFrame/Repositories/Protocols/PeopleRepository.swift`
-- `MagicFrame/Repositories/Protocols/LocationRepository.swift`
+- `MagicFrame/Repositories/LocationRepository.swift`
+- `MagicFrame/Repositories/Protocols/LocationRepository.swift` (future protocol)
 - `MagicFrame/Repositories/Protocols/RepositoryTypes.swift`
 
 ### Persistence (SQLite)
@@ -149,14 +150,16 @@ This is the intended end state. Existing files should not be moved until a dedic
 
 ### Services
 
+- `MagicFrame/Services/Photos/PeopleImportService.swift`
 - `MagicFrame/Services/Photos/PhotosAuthorizationService.swift`
 - `MagicFrame/Services/Photos/PhotosLibraryService.swift`
 - `MagicFrame/Services/Photos/PhotoMetadataBuilder.swift`
-- `MagicFrame/Services/Geocoding/GeocodingService.swift`
+- `MagicFrame/Services/Geocoding/ReverseGeocodeParser.swift`
 - `MagicFrame/Services/Geocoding/LocationGeocodeCoordinator.swift`
+- `MagicFrame/Services/Geocoding/GeocodingService.swift` (optional future facade)
 - `MagicFrame/Services/Events/EventMatchingService.swift`
 - `MagicFrame/Services/Events/EventSyncService.swift`
-- Event clustering: nested `PhotoDatabase.EventClusteringService` in `PhotoDatabase.swift` (no separate file)
+- `MagicFrame/Services/Events/EventClusteringService.swift`
 - `MagicFrame/Services/Events/EventPeopleService.swift`
 - `MagicFrame/Services/Events/EventCoverService.swift` (optional)
 - `MagicFrame/Services/Imaging/PhotoImageService.swift` (optional)

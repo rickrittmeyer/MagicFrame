@@ -27,12 +27,14 @@ final class HomeOnboardingViewModel: NSObject, ObservableObject, CLLocationManag
     private var inFlightGeocodeRequest: MKGeocodingRequest?
     private var inFlightReverseGeocodeRequest: MKReverseGeocodingRequest?
     private let locationManager = CLLocationManager()
+    private let database: any MagicFrameDatabase
 
     var canContinue: Bool {
         !isSaving && !isSearching && !isLocating && hasConfirmedHomePin && pinCoordinate != nil
     }
 
-    override init() {
+    init(database: any MagicFrameDatabase = AppDependencies.database) {
+        self.database = database
         super.init()
         locationManager.delegate = self
         locationManager.desiredAccuracy = kCLLocationAccuracyHundredMeters
@@ -116,7 +118,7 @@ final class HomeOnboardingViewModel: NSObject, ObservableObject, CLLocationManag
         let trimmedNickname = nickname.trimmingCharacters(in: .whitespacesAndNewlines)
         let nicknameValue = trimmedNickname.isEmpty ? nil : trimmedNickname
 
-        let locationId = PhotoDatabase.shared.createDesignatedCurrentHome(
+        let locationId = database.createDesignatedCurrentHome(
             latitude: pinCoordinate.latitude,
             longitude: pinCoordinate.longitude,
             nickname: nicknameValue,
