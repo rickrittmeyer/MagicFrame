@@ -18,6 +18,82 @@ enum DevDatabaseTools {
         print("photo_people rows: \(countRows("photo_people", database: database))")
         print("event_people rows: \(countRows("event_people", database: database))")
         print("events with city rows: \(countRows("events WHERE city IS NOT NULL AND city != ''", database: database))")
+        debugMetadataCounts(database: database)
+        debugMetadataAssignmentCounts(database: database)
+    }
+
+    static func debugMetadataAssignmentCounts(database: DatabaseManager) {
+        database.queue.sync {
+            let repo = EventRepository(database: database)
+            let counts = MetadataAssignmentCounts(
+                unassignedNoGPS: repo.countUnassignedMetadataPhotosForEvents(),
+                attachedViaMetadata: repo.countMetadataAttachedPhotos(),
+                attachedNeedingReview: repo.countMetadataAttachedPhotosNeedingReview()
+            )
+            print("---- METADATA ASSIGNMENT (PHASE B) ----")
+            print(counts.summaryLine)
+            print(counts.detailLine)
+            print("-------------------------------------")
+        }
+    }
+
+    static func metadataEnrichmentCounts(database: DatabaseManager) -> MetadataEnrichmentCounts {
+        let photosWithAlbumMembership = """
+        photo_albums pa
+        JOIN photos p ON p.id = pa.photoId
+        WHERE p.isDeleted = 0
+        """
+        let photosWithTextMetadata = """
+        photo_text_metadata m
+        JOIN photos p ON p.id = m.photoId
+        WHERE p.isDeleted = 0
+        """
+
+        return MetadataEnrichmentCounts(
+            albumRows: countRows("albums", database: database),
+            photoAlbumLinkRows: countRows("photo_albums", database: database),
+            textMetadataRows: countRows("photo_text_metadata", database: database),
+            activePhotoRows: countRows("photos WHERE isDeleted = 0", database: database),
+            photosWithAlbumMembership: countRows(photosWithAlbumMembership, database: database),
+            photosWithTextMetadata: countRows(photosWithTextMetadata, database: database)
+        )
+    }
+
+    static func debugMetadataCounts(database: DatabaseManager) {
+        let counts = metadataEnrichmentCounts(database: database)
+        print("albums rows: \(counts.albumRows)")
+        print("photo_albums rows: \(counts.photoAlbumLinkRows)")
+        print("photo_text_metadata rows: \(counts.textMetadataRows)")
+        print("indexed photos with album membership: \(counts.photosWithAlbumMembership)")
+        print("indexed photos with text metadata: \(counts.photosWithTextMetadata)")
+    }
+
+    static func debugPrintTopHolidayOccasionScores(
+        database: DatabaseManager,
+        limit: Int = 25
+    ) -> [OccasionScoringTopMatch] {
+        let matches = AppContainer.shared.occasionScoring.topHolidayMatches(limit: limit)
+        print("---- TOP \(limit) HOLIDAY OCCASION SCORES ----")
+        if matches.isEmpty {
+            print("(none — run Score Holiday Occasions first)")
+        } else {
+            for match in matches {
+                print(match.consoleLine)
+            }
+        }
+        print("----------------------------------------")
+        return matches
+    }
+
+    static func debugEventDateDiagnostics(database: DatabaseManager) {
+        database.queue.sync {
+            let repo = EventRepository(database: database)
+            let counts = repo.eventDateDiagnosticCounts()
+            print("---- EVENT DATE DIAGNOSTICS ----")
+            print(counts.summaryLine)
+            print(counts.detailLine)
+            print("------------------------------")
+        }
     }
 
     static func debugEventPipeline(database: DatabaseManager) {

@@ -36,8 +36,8 @@ final class LocationsViewModel: ObservableObject {
     private var isShowingGeocodeProgress = false
     private var cancellables = Set<AnyCancellable>()
 
-    init(database: any MagicFrameDatabase = AppDependencies.database) {
-        self.database = database
+    init(database: (any MagicFrameDatabase)? = nil) {
+        self.database = database ?? AppDependencies.database
         NotificationCenter.default.publisher(for: .locationGeocodeProgressChanged)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] notification in

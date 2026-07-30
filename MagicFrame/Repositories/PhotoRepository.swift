@@ -37,6 +37,11 @@ final class PhotoRepository {
         database.queue
     }
 
+    private func sync<T>(_ work: () throws -> T) rethrows -> T {
+        if database.isOnQueue { return try work() }
+        return try queue.sync(execute: work)
+    }
+
     func upsertPhoto(
         id: String,
         creationDate: String,
@@ -54,7 +59,7 @@ final class PhotoRepository {
         orientation: String,
         qualityScore: Int
     ) {
-        queue.sync {
+        sync {
             upsertPhotoUnsafe(
                 id: id,
                 creationDate: creationDate,
@@ -73,6 +78,10 @@ final class PhotoRepository {
                 qualityScore: qualityScore
             )
         }
+    }
+
+    func fetchActivePhotoIdSet() -> Set<String> {
+        Set(fetchAllActivePhotoIds())
     }
 
     func markPhotosDeletedIfMissing(currentIds: Set<String>) {
@@ -116,7 +125,7 @@ final class PhotoRepository {
         eyesOpenScore: Double,
         smileScore: Double
     ) {
-        queue.sync {
+        sync {
             let sql = """
             UPDATE photos
             SET faceEyesOpenScore = ?, faceSmileScore = ?
@@ -142,7 +151,7 @@ final class PhotoRepository {
     func clearFaceMetrics(forPhotoIds photoIds: [String]) {
         guard !photoIds.isEmpty else { return }
 
-        queue.sync {
+        sync {
             let sql = """
             UPDATE photos
             SET faceEyesOpenScore = NULL, faceSmileScore = NULL
@@ -171,7 +180,7 @@ final class PhotoRepository {
     }
 
     func getPhotoCropData(photoId: String) -> PhotoCropFocusRecord? {
-        queue.sync {
+        sync {
             let sql = """
             SELECT listCropFocusX, listCropFocusY, frameCropFocusX, frameCropFocusY,
                    width, height, orientation
@@ -211,7 +220,7 @@ final class PhotoRepository {
         list: PhotoCropFocus?,
         frame: PhotoCropFocus?
     ) {
-        queue.sync {
+        sync {
             let sql = """
             UPDATE photos
             SET listCropFocusX = ?, listCropFocusY = ?,
@@ -238,7 +247,7 @@ final class PhotoRepository {
     }
 
     func clearAllCropFocuses() {
-        queue.sync {
+        sync {
             sqlite3_exec(
                 db,
                 """
@@ -274,7 +283,7 @@ final class PhotoRepository {
     }
 
     func countPhotosMissingLocation() -> Int {
-        queue.sync {
+        sync {
             countRowsUnsafe(
                 """
                 photos
@@ -287,7 +296,7 @@ final class PhotoRepository {
     }
 
     func countActivePhotos() -> Int {
-        queue.sync {
+        sync {
             countRowsUnsafe("photos WHERE isDeleted = 0")
         }
     }
@@ -297,7 +306,7 @@ final class PhotoRepository {
         minPhotos: Int,
         locationMatchMiles: Double
     ) -> [PhotoUploadBatch] {
-        queue.sync {
+        sync {
             getLikelyUploadBatchesUnsafe(
                 gapSeconds: gapSeconds,
                 minPhotos: minPhotos,
@@ -312,7 +321,7 @@ final class PhotoRepository {
         latitude: Double,
         longitude: Double
     ) {
-        queue.sync {
+        sync {
             applyArchiveBatchMetadataUnsafe(
                 photoIds: photoIds,
                 captureDate: captureDate,

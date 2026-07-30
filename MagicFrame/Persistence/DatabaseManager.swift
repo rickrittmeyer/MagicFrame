@@ -48,8 +48,15 @@ final class DatabaseManager {
 
     func bootstrapSchema(legacyHooks: LegacyDataMigrationHooks = LegacyDataMigrationHooks()) {
         guard let connection else { return }
-        SQLiteMigrations.createTablesIfNeeded(on: connection)
-        SQLiteMigrations.migrateTablesIfNeeded(on: connection, legacyHooks: legacyHooks)
+        queue.sync {
+            let start = CFAbsoluteTimeGetCurrent()
+            SQLiteMigrations.createTablesIfNeeded(on: connection)
+            SQLiteMigrations.migrateTablesIfNeeded(on: connection, legacyHooks: legacyHooks)
+            let elapsed = CFAbsoluteTimeGetCurrent() - start
+            if elapsed > 0.5 {
+                print(String(format: "Schema migration completed in %.1fs", elapsed))
+            }
+        }
     }
 
     func columnExists(table: String, column: String) -> Bool {

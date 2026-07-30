@@ -93,6 +93,20 @@ struct ManagedLocation: Identifiable {
         }
     }
 
+    /// Landmark or place name with city and state on one line for compact detail headers.
+    var addressDisplayLine: String? {
+        let trimmedPlace = placeName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasPlace = trimmedPlace.map { !$0.isEmpty } ?? false
+
+        if hasPlace, let cityState = cityStateLine {
+            return "\(trimmedPlace!), \(cityState)"
+        }
+        if hasPlace {
+            return trimmedPlace
+        }
+        return cityStateLine
+    }
+
     /// Subtitle under the main title in list/detail when a user nickname or geocoded place is shown.
     var detailSubtitle: String? {
         if let nickname, !nickname.isEmpty {

@@ -21,6 +21,8 @@ protocol EventClusteringHost: AnyObject {
     func updateCoverPhotoForEvent(eventId: Int)
     func rebuildEventPeople()
     func getEvent(eventId: Int) -> IndexedEvent?
+    /// Re-scores holiday occasions after event sync maintenance (caller on database queue).
+    func rescoreHolidayTagsForSyncedEventsUnsafe(eventIds: Set<Int>, scoreAllEvents: Bool)
 }
 
 final class EventClusteringService {
@@ -31,10 +33,12 @@ final class EventClusteringService {
     private unowned let host: EventClusteringHost
     private let database: DatabaseManager
     private let events: EventRepository
+    private let metadataAssignment: PhotoEventAssignmentService
 
     private var isRebuildContext = false
     private var lastProgressPost = Date.distantPast
     private var homeCandidatesCache: [CachedHomeCandidate]?
+    private var syncSessionTouchedEventIds = Set<Int>()
 
     private var db: OpaquePointer? { database.connection }
 
@@ -45,10 +49,24 @@ final class EventClusteringService {
         return f
     }()
 
-    init(host: EventClusteringHost, database: DatabaseManager, events: EventRepository) {
+    init(
+        host: EventClusteringHost,
+        database: DatabaseManager,
+        events: EventRepository,
+        metadataAssignment: PhotoEventAssignmentService
+    ) {
         self.host = host
         self.database = database
         self.events = events
+        self.metadataAssignment = metadataAssignment
+        metadataAssignment.onBatchTouchedEvents = { [weak self] eventIds in
+            self?.recordSyncTouchedEventIds(eventIds)
+        }
+    }
+
+    private func recordSyncTouchedEventIds(_ eventIds: Set<Int>) {
+        guard !eventIds.isEmpty else { return }
+        syncSessionTouchedEventIds.formUnion(eventIds)
     }
 
     private func sync<T>(_ work: () throws -> T) rethrows -> T {
@@ -198,11 +216,12 @@ final class EventClusteringService {
     }
 
     if batches == 0 {
-        print("No unassigned photos to process")
+        print("No unassigned GPS photos to process")
     } else {
-        print("Assigned photos in \(batches) batch(es)")
+        print("Assigned GPS photos in \(batches) batch(es)")
     }
 
+    syncMetadataAssignmentPasses()
     finishEventSyncMaintenance()
     print("Incremental event sync complete")
     }
@@ -216,7 +235,7 @@ final class EventClusteringService {
             ? EventClusteringService.eventSyncRebuildBatchSize
             : EventClusteringService.eventSyncPhotoBatchSize
         let remainingBefore = countUnassignedPhotosForEventsUnsafe()
-        let photos = events.getUnassignedPhotosForEvents(limit: batchLimit)
+        let photos = events.getUnassignedGPSPhotosForEvents(limit: batchLimit)
         guard !photos.isEmpty else { return false }
 
         print(
@@ -243,24 +262,120 @@ final class EventClusteringService {
 
 
     func countUnassignedPhotosForEventsUnsafe() -> Int {
-    host.countRows(
-        """
-        photos
-        WHERE isDeleted = 0
-          AND eventAssignedAt IS NULL
-          AND isScreenshot = 0
-          AND COALESCE(userLatitude, latitude) IS NOT NULL
-          AND COALESCE(userLongitude, longitude) IS NOT NULL
-        """
-    )
+        events.countUnassignedGPSPhotosForEvents()
     }
 
 
     func rebuildAllEvents() {
-    prepareEventRebuild()
-    while syncEventsAssignmentBatch() { }
-    finishEventRebuild()
-    print("Event rebuild complete")
+        prepareEventRebuild()
+        while syncEventsAssignmentBatch() { }
+        syncMetadataAssignmentPasses()
+        finishEventRebuild()
+        print("Event rebuild complete")
+    }
+
+    /// Metadata attach to GPS-backed events, then date/time-only events for remaining no-GPS orphans.
+    func syncSecondaryPhotoAssignmentPasses() {
+        sync {
+            metadataAssignment.syncMetadataAssignmentUntilComplete()
+            syncTimeOnlyNoGPSAssignmentPasses()
+        }
+    }
+
+    private func syncMetadataAssignmentPasses() {
+        syncSecondaryPhotoAssignmentPasses()
+    }
+
+    private func syncTimeOnlyNoGPSAssignmentPasses() {
+        var batches = 0
+        while syncTimeOnlyNoGPSAssignmentBatch() {
+            batches += 1
+        }
+        if batches > 0 {
+            print("Time-only no-GPS assignment finished in \(batches) batch(es)")
+        }
+    }
+
+    @discardableResult
+    private func syncTimeOnlyNoGPSAssignmentBatch() -> Bool {
+        let batchLimit = EventClusteringService.eventSyncPhotoBatchSize
+        let remainingBefore = events.countUnassignedMetadataPhotosForEvents()
+        let metadata = events.getUnassignedMetadataPhotosForEvents(
+            limit: batchLimit,
+            ascending: true
+        )
+        guard !metadata.isEmpty else { return false }
+
+        let photos = metadata.map {
+            EventCandidatePhoto(id: $0.id, date: $0.date, latitude: nil, longitude: nil)
+        }
+
+        print(
+            "Time-only no-GPS assignment batch: \(photos.count) photos"
+            + " (\(remainingBefore.formatted()) unassigned total)"
+        )
+
+        assignPhotosToEvents(photos, maxTouchedEvents: nil, tryGPSMatch: false)
+
+        let remainingAfter = events.countUnassignedMetadataPhotosForEvents()
+        print(
+            "Time-only assignment batch done:"
+            + " \(remainingAfter.formatted()) no-GPS still unassigned"
+        )
+
+        return remainingAfter > 0
+    }
+
+    @discardableResult
+    private func assignPhotoToTimeCluster(
+        _ photo: EventCandidatePhoto,
+        openEventId: Int?,
+        openLastDate: Date?,
+        maxGapSeconds: TimeInterval,
+        touchedEventIds: inout Set<Int>
+    ) -> Int? {
+        let eventId: Int?
+
+        if let existingId = events.findTimeOnlyMatchingEvent(
+            photoDate: photo.date,
+            maxGapSeconds: maxGapSeconds
+        ) {
+            eventId = existingId
+        } else if let openEventId,
+                  let openLastDate,
+                  abs(photo.date.timeIntervalSince(openLastDate)) <= maxGapSeconds {
+            eventId = openEventId
+        } else {
+            eventId = createTimeOnlyEvent(from: photo)
+        }
+
+        guard let eventId, eventId > 0 else { return nil }
+
+        events.attachPhotoToEvent(
+            photoId: photo.id,
+            eventId: eventId,
+            assignmentConfidence: 1.0,
+            assignmentMethod: .timeMatch
+        )
+        events.markPhotoEventAssigned(photoId: photo.id)
+        events.expandEventDatesAfterAttach(eventId: eventId, photoDate: photo.date)
+        touchedEventIds.insert(eventId)
+        return eventId
+    }
+
+    private func createTimeOnlyEvent(from photo: EventCandidatePhoto) -> Int {
+        let dateString = iso8601Formatter.string(from: photo.date)
+        let name = displayDateFormatter.string(from: photo.date)
+
+        return events.insertEventRow(
+            name: name,
+            startDate: dateString,
+            endDate: dateString,
+            latitude: nil,
+            longitude: nil,
+            locationId: nil,
+            clusteredByTimeOnly: true
+        )
     }
 
     @discardableResult
@@ -272,6 +387,7 @@ final class EventClusteringService {
 
         postEventSyncStatus("Clearing existing events…", isRebuild: true)
         clearAllEventDataPreservingLocations()
+        syncSessionTouchedEventIds.removeAll()
 
         let total = countUnassignedPhotosForEventsUnsafe()
         print("Reassigning \(total) photos to events")
@@ -332,33 +448,48 @@ final class EventClusteringService {
 
     func assignPhotosToEvents(
     _ photos: [EventCandidatePhoto],
-    maxTouchedEvents: Int?
+    maxTouchedEvents: Int?,
+    tryGPSMatch: Bool = true
     ) {
     let total = photos.count
     print("Event assignment starting (\(total.formatted()) photos in this batch)")
 
-    loadHomeCandidatesCache()
+    if tryGPSMatch {
+        loadHomeCandidatesCache()
+    }
     defer { homeCandidatesCache = nil }
 
     var touchedEventIds = Set<Int>()
+    var openTimeClusterEventId: Int?
+    var openTimeClusterLastDate: Date?
+    let timeClusterGap = host.eventTuningUnsafe().eventMatchMaxGapSeconds
 
     for (index, photo) in photos.enumerated() {
         if let maxTouchedEvents, touchedEventIds.count >= maxTouchedEvents {
             break
         }
 
-        if let eventId = findMatchingEvent(for: photo) {
-            events.attachPhotoToEvent(photoId: photo.id, eventId: eventId)
+        if tryGPSMatch, let eventId = findMatchingEvent(for: photo) {
+            events.attachPhotoToEvent(
+                photoId: photo.id,
+                eventId: eventId,
+                assignmentConfidence: 1.0,
+                assignmentMethod: .gpsMatch
+            )
             events.markPhotoEventAssigned(photoId: photo.id)
             events.expandEventDatesAfterAttach(eventId: eventId, photoDate: photo.date)
             touchedEventIds.insert(eventId)
-        } else {
-            let eventId = createEventFromPhoto(photo)
-            if eventId > 0 {
-                events.attachPhotoToEvent(photoId: photo.id, eventId: eventId)
-                events.markPhotoEventAssigned(photoId: photo.id)
-                touchedEventIds.insert(eventId)
-            }
+            openTimeClusterEventId = nil
+            openTimeClusterLastDate = nil
+        } else if let eventId = assignPhotoToTimeCluster(
+            photo,
+            openEventId: openTimeClusterEventId,
+            openLastDate: openTimeClusterLastDate,
+            maxGapSeconds: timeClusterGap,
+            touchedEventIds: &touchedEventIds
+        ) {
+            openTimeClusterEventId = eventId
+            openTimeClusterLastDate = photo.date
         }
 
         if index == 0 || (index + 1) % 250 == 0 || index + 1 == total {
@@ -382,6 +513,8 @@ final class EventClusteringService {
         events.updateEventSummary(eventId: eventId)
         host.updateCoverPhotoForEvent(eventId: eventId)
     }
+
+    recordSyncTouchedEventIds(touchedEventIds)
     }
 
 
@@ -529,6 +662,18 @@ final class EventClusteringService {
 
     postEventSyncStatus("Updating cover photos…")
     events.updateAllEventCoverPhotosUnsafe()
+
+    if events.eventDateDiagnosticCounts().needsRepair {
+        events.repairEventDateSummaries()
+    }
+
+    postEventSyncStatus("Scoring holiday occasions…")
+    let touchedEventIds = syncSessionTouchedEventIds
+    host.rescoreHolidayTagsForSyncedEventsUnsafe(
+        eventIds: touchedEventIds,
+        scoreAllEvents: isRebuildContext
+    )
+    syncSessionTouchedEventIds.removeAll()
     }
 
 
@@ -1110,6 +1255,11 @@ final class EventClusteringService {
     }
 
 
+    /// Future: merge contiguous day events that share the same user-set manual city/state into a trip container.
+    func mergeTripsByUserManualLocation() {
+        // Requires UI to set events.userManualCity / userManualState, then cluster by date gap + location.
+    }
+
     func mergeAwayTripEvents() {
     var candidates = fetchTripMergeCandidates()
     guard candidates.count > 1 else { return }
@@ -1410,7 +1560,7 @@ final class EventClusteringService {
         host.updateEventLocationFromRepresentativePoint(eventId: subEventId)
     }
 
-    updateTripParentSummary(parentEventId: parentEventId)
+    events.updateTripParentSummary(parentEventId: parentEventId)
     host.rebuildEventPeople()
     }
 
@@ -1509,87 +1659,6 @@ final class EventClusteringService {
     sqlite3_finalize(statement)
 
     events.attachPhotoToEvent(photoId: photoId, eventId: toEventId)
-    }
-
-
-    func updateTripParentSummary(parentEventId: Int) {
-    let sql = """
-    UPDATE events
-    SET
-        startDate = (
-            SELECT MIN(e.startDate)
-            FROM events e
-            WHERE e.parentEventId = ?
-              AND e.isDeleted = 0
-        ),
-        endDate = (
-            SELECT MAX(e.endDate)
-            FROM events e
-            WHERE e.parentEventId = ?
-              AND e.isDeleted = 0
-        ),
-        photoCount = (
-            SELECT COUNT(DISTINCT pe.photoId)
-            FROM events e
-            JOIN photo_events pe ON e.eventId = pe.eventId
-            JOIN photos p ON pe.photoId = p.id
-            WHERE e.parentEventId = ?
-              AND e.isDeleted = 0
-              AND p.isDeleted = 0
-        ),
-        latitude = (
-            SELECT AVG(e.latitude)
-            FROM events e
-            WHERE e.parentEventId = ?
-              AND e.isDeleted = 0
-              AND e.latitude IS NOT NULL
-        ),
-        longitude = (
-            SELECT AVG(e.longitude)
-            FROM events e
-            WHERE e.parentEventId = ?
-              AND e.isDeleted = 0
-              AND e.longitude IS NOT NULL
-        ),
-        city = (
-            SELECT e.city
-            FROM events e
-            WHERE e.parentEventId = ?
-              AND e.isDeleted = 0
-              AND e.city IS NOT NULL
-            GROUP BY e.city
-            ORDER BY COUNT(*) DESC
-            LIMIT 1
-        ),
-        state = (
-            SELECT e.state
-            FROM events e
-            WHERE e.parentEventId = ?
-              AND e.isDeleted = 0
-              AND e.state IS NOT NULL
-            GROUP BY e.state
-            ORDER BY COUNT(*) DESC
-            LIMIT 1
-        ),
-        isTripEvent = 1
-    WHERE eventId = ?;
-    """
-
-    var statement: OpaquePointer?
-
-    if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
-        for index in 1...8 {
-            sqlite3_bind_int(statement, Int32(index), Int32(parentEventId))
-        }
-        sqlite3_bind_int(statement, 9, Int32(parentEventId))
-
-        if sqlite3_step(statement) != SQLITE_DONE {
-            print("Failed updating trip parent summary: \(String(cString: sqlite3_errmsg(db)))")
-        }
-    }
-
-    sqlite3_finalize(statement)
-    host.updateCoverPhotoForEvent(eventId: parentEventId)
     }
 
 

@@ -4,9 +4,12 @@ struct EventLibraryRowView: View {
 
     let event: IndexedEvent
     var slideshowPhotoIds: [String] = []
+    var slideshowQuality: PhotoThumbnailView.Quality = .high
     var showsHiddenBadge: Bool = false
     var onHide: (() -> Void)? = nil
     var onUnhide: (() -> Void)? = nil
+    var onConfirmAIAttributeTag: ((EventAttributeTag) -> Void)? = nil
+    var onRemoveAIAttributeTag: ((EventAttributeTag) -> Void)? = nil
 
     @State private var isConfirmingHideEvent = false
 
@@ -34,10 +37,28 @@ struct EventLibraryRowView: View {
 
             titleLine
 
+            if !event.libraryAttributeTags.isEmpty {
+                FlowLayout(spacing: 8, lineSpacing: 8) {
+                    ForEach(event.libraryAttributeTags) { tag in
+                        EventAttributeTagChip(
+                            tag: tag,
+                            showsCategoryIcon: true,
+                            onConfirmAI: tag.isAIDerived
+                                ? { onConfirmAIAttributeTag?(tag) }
+                                : nil,
+                            onRemoveAI: tag.isAIDerived
+                                ? { onRemoveAIAttributeTag?(tag) }
+                                : nil
+                        )
+                    }
+                }
+            }
+
             EventSlideshowRotatorView(
                 photoIds: displaySlideshowPhotoIds,
                 aspectRatio: photoAspectRatio,
-                cornerRadius: cornerRadius
+                cornerRadius: cornerRadius,
+                thumbnailQuality: slideshowQuality
             )
 
             locationLine
@@ -78,21 +99,13 @@ struct EventLibraryRowView: View {
     }
 
     private var displaySlideshowPhotoIds: [String] {
-        if !slideshowPhotoIds.isEmpty {
-            return slideshowPhotoIds
-        }
-
-        if let coverPhotoId = event.coverPhotoId {
-            return [coverPhotoId]
-        }
-
-        return []
+        slideshowPhotoIds
     }
 
     @ViewBuilder
     private var titleLine: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            if let onHide {
+            if onHide != nil {
                 Button {
                     isConfirmingHideEvent = true
                 } label: {
@@ -154,27 +167,38 @@ private struct EventSlideshowRotatorView: View {
     let photoIds: [String]
     let aspectRatio: CGFloat
     let cornerRadius: CGFloat
+    var thumbnailQuality: PhotoThumbnailView.Quality = .high
 
     private let photoHold: Duration = .seconds(2)
     private let crossfadeDuration: TimeInterval = 0.5
 
     @State private var currentIndex = 0
+    @State private var previousIndex: Int?
 
     var body: some View {
         Group {
             if photoIds.isEmpty {
                 placeholder
-            } else if photoIds.count == 1 {
+            } else if photoIds.count == 1 || thumbnailQuality == .fast {
                 slideshowPhoto(photoIds[0])
             } else {
                 ZStack {
-                    ForEach(Array(photoIds.enumerated()), id: \.element) { index, photoId in
-                        slideshowPhoto(photoId)
+                    ForEach(visibleSlideIndices, id: \.self) { index in
+                        slideshowPhoto(photoIds[index])
                             .opacity(index == currentIndex ? 1 : 0)
+                            .zIndex(index == currentIndex ? 1 : 0)
                     }
                 }
                 .animation(.easeInOut(duration: crossfadeDuration), value: currentIndex)
-                .task(id: photoIds) {
+                .onChange(of: photoIds) { _, _ in
+                    currentIndex = 0
+                    previousIndex = nil
+                }
+                .onChange(of: thumbnailQuality) { _, _ in
+                    currentIndex = 0
+                    previousIndex = nil
+                }
+                .task(id: rotationTaskKey) {
                     await runRotation()
                 }
             }
@@ -184,15 +208,28 @@ private struct EventSlideshowRotatorView: View {
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
     }
 
+    private var rotationTaskKey: String {
+        let photoKey = photoIds.joined(separator: "|")
+        return "\(photoKey)|\(thumbnailQuality)"
+    }
+
+    private var visibleSlideIndices: [Int] {
+        var indices: [Int] = [currentIndex]
+        if let previousIndex, previousIndex != currentIndex {
+            indices.append(previousIndex)
+        }
+        return indices
+    }
+
     @ViewBuilder
     private func slideshowPhoto(_ photoId: String) -> some View {
         PhotoThumbnailView(
             assetIdentifier: photoId,
             cornerRadius: 0,
             enforceSquareAspect: false,
-            quality: .high,
-            cropContext: .eventList
+            quality: thumbnailQuality
         )
+        .id("\(photoId)|\(thumbnailQuality)")
     }
 
     @ViewBuilder
@@ -213,7 +250,20 @@ private struct EventSlideshowRotatorView: View {
             try? await Task.sleep(for: photoHold)
             guard !Task.isCancelled else { return }
 
-            currentIndex = (currentIndex + 1) % photoIds.count
+            let outgoing = currentIndex
+            let incoming = (currentIndex + 1) % photoIds.count
+
+            previousIndex = outgoing
+            withAnimation(.easeInOut(duration: crossfadeDuration)) {
+                currentIndex = incoming
+            }
+
+            try? await Task.sleep(for: .seconds(crossfadeDuration + 0.05))
+            guard !Task.isCancelled else { return }
+
+            if currentIndex == incoming {
+                previousIndex = nil
+            }
         }
     }
 }

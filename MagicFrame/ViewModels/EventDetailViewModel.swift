@@ -27,6 +27,8 @@ final class EventDetailViewModel: ObservableObject {
     @Published var milestoneType: String?
     @Published var holidayType: String?
     @Published var eventMainPerson: String?
+    @Published var eventMainPerson2: String?
+    @Published var weddingDate: String?
 
     @Published private(set) var eventTypeOptions: [String] = []
     @Published private(set) var activityTypeOptions: [String] = []
@@ -43,19 +45,26 @@ final class EventDetailViewModel: ObservableObject {
     @Published private(set) var selectedPhotoIds: Set<String> = []
     @Published var showHiddenPhotos = false
     @Published private(set) var analyzingFaceMetricsPhotoIds: Set<String> = []
-
+    @Published private(set) var objectRecognitionStatus: String?
+    @Published private(set) var visionLabelDebugStatus: String?
+    @Published private(set) var holidayScorecards: [AITagScoringDetail] = []
+    @Published private(set) var holidayScorecardRevision = 0
+    @Published private(set) var aiTagScoringSaveStatus: String?
     private var faceAnalysisTask: Task<Void, Never>?
+    private var objectRecognitionTask: Task<Void, Never>?
+    private var visionLabelDebugTask: Task<Void, Never>?
+    private var birthDateISOByPersonName: [String: String] = [:]
     private let database: any MagicFrameDatabase
 
     init(
         event: IndexedEvent,
-        database: any MagicFrameDatabase = AppDependencies.database,
+        database: (any MagicFrameDatabase)? = nil,
         onEventUpdated: ((Int) -> Void)? = nil,
         onEventHidden: ((Int) -> Void)? = nil,
         onEventUnhidden: ((Int) -> Void)? = nil
     ) {
-        self.database = database
-        let freshEvent = database.getEvent(eventId: event.eventId) ?? event
+        self.database = database ?? AppDependencies.database
+        let freshEvent = self.database.getEvent(eventId: event.eventId) ?? event
         self.event = freshEvent
         self.onEventUpdated = onEventUpdated
         self.onEventHidden = onEventHidden
@@ -112,7 +121,41 @@ final class EventDetailViewModel: ObservableObject {
     }
 
     var suggestedName: String? {
-        EventNameSuggester.suggest(
+        let resolvedMilestoneType = event.resolvedAttributeValue(for: .milestoneType) ?? milestoneType
+        let resolvedMainPerson = event.resolvedAttributeValue(for: .mainPerson) ?? eventMainPerson
+        let resolvedMainPerson2 = event.resolvedAttributeValue(for: .secondaryMainPerson) ?? eventMainPerson2
+
+        if MilestoneEventNaming.isCoupleMilestone(resolvedMilestoneType),
+           let person1 = resolvedMainPerson?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let person2 = resolvedMainPerson2?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !person1.isEmpty,
+           !person2.isEmpty,
+           let milestoneName = MilestoneEventNaming.suggestCoupleEventName(
+               person1: person1,
+               person2: person2,
+               milestoneType: resolvedMilestoneType,
+               weddingDateISO: weddingDate,
+               eventStartDate: event.startDate
+           ) {
+            return milestoneName
+        }
+
+        if MilestoneEventNaming.isPersonMilestone(resolvedMilestoneType),
+           !MilestoneEventNaming.isCoupleMilestone(resolvedMilestoneType),
+           let person = resolvedMainPerson?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !person.isEmpty {
+            let birthISO = birthDateISOByPersonName[person.lowercased()]
+            if let milestoneName = MilestoneEventNaming.suggestEventName(
+                personName: person,
+                milestoneType: resolvedMilestoneType,
+                birthDateISO: birthISO,
+                eventStartDate: event.startDate
+            ) {
+                return milestoneName
+            }
+        }
+
+        return EventNameSuggester.suggest(
             locationDisplayText: event.locationDisplayText,
             startDate: event.startDate,
             endDate: event.endDate,
@@ -121,14 +164,31 @@ final class EventDetailViewModel: ObservableObject {
     }
 
     var showSuggestion: Bool {
-        guard !userEditedName else { return false }
-
         guard let name = suggestedName,
               !name.isEmpty else {
             return false
         }
 
-        return eventName.trimmingCharacters(in: .whitespacesAndNewlines) != name
+        let trimmedEventName = eventName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedEventName != name else { return false }
+
+        let resolvedMilestoneType = event.resolvedAttributeValue(for: .milestoneType) ?? milestoneType
+        let resolvedMainPerson = event.resolvedAttributeValue(for: .mainPerson) ?? eventMainPerson
+        let resolvedMainPerson2 = event.resolvedAttributeValue(for: .secondaryMainPerson) ?? eventMainPerson2
+
+        if MilestoneEventNaming.isCoupleMilestone(resolvedMilestoneType),
+           resolvedMainPerson?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
+           resolvedMainPerson2?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            return true
+        }
+
+        if MilestoneEventNaming.isPersonMilestone(resolvedMilestoneType),
+           !MilestoneEventNaming.isCoupleMilestone(resolvedMilestoneType),
+           resolvedMainPerson?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            return true
+        }
+
+        return !userEditedName
     }
 
     func toggleShowHiddenPhotos() {
@@ -155,6 +215,21 @@ final class EventDetailViewModel: ObservableObject {
         selectedPhotoIds = selectedPhotoIds.intersection(Set(photos.map(\.id)))
         syncTripChildEventNameDrafts()
         analyzeFaceMetricsForStacksIfNeeded()
+        runObjectRecognitionIfNeeded()
+    }
+
+    func loadHolidayScorecards() {
+        rescoreCurrentEventHolidayScores()
+        holidayScorecards = database.fetchHolidayScorecards(
+            eventId: event.eventId,
+            includesDescendantPhotos: event.isTripContainer
+        )
+        holidayScorecardRevision += 1
+    }
+
+    private func rescoreCurrentEventHolidayScores() {
+        database.scoreHolidayEvent(eventId: event.eventId)
+        refreshEvent(notifyList: false)
     }
 
     func syncTripChildEventNameDrafts() {
@@ -191,6 +266,59 @@ final class EventDetailViewModel: ObservableObject {
             tripPhotoDisplaySections.flatMap(\.displayItems)
         } else {
             photoDisplayItems
+        }
+    }
+
+    private func runObjectRecognitionIfNeeded() {
+        objectRecognitionTask?.cancel()
+
+        let eventId = event.eventId
+        let includeHidden = showHiddenPhotos
+        let database = database
+
+        objectRecognitionTask = Task { [weak self] in
+            guard let self else { return }
+
+            let summary = database.enqueueEventObjectRecognitionJobs(
+                eventId: eventId,
+                includeHiddenPhotos: includeHidden,
+                forceRescan: false,
+                forcedOccasionKey: nil,
+                priority: 100,
+                scopeKey: nil
+            )
+
+            guard !Task.isCancelled else { return }
+
+            if summary.enqueuedCount == 0 {
+                self.objectRecognitionStatus = nil
+                _ = summary.skippedReason
+                return
+            }
+
+            while !Task.isCancelled {
+                let pending = database.visionJobPendingCount(scopeKey: nil, eventId: eventId)
+                if pending == 0 { break }
+
+                let coordinator = AppDependencies.container.visionJobCoordinator
+                if coordinator.snapshot.activeEventId == eventId,
+                   let statusText = coordinator.snapshot.statusText {
+                    self.objectRecognitionStatus = statusText
+                }
+
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+
+            guard !Task.isCancelled else { return }
+
+            self.objectRecognitionStatus = "Object scan complete."
+            self.refreshEvent()
+            self.loadHolidayScorecards()
+
+            try? await Task.sleep(for: .seconds(4))
+            if self.objectRecognitionStatus == "Object scan complete." {
+                self.objectRecognitionStatus = nil
+            }
         }
     }
 
@@ -373,6 +501,126 @@ final class EventDetailViewModel: ObservableObject {
         personOptions = people.sorted {
             $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
         }
+
+        let birthdays = database.fetchPeopleWithBirthDates()
+        birthDateISOByPersonName = Dictionary(
+            uniqueKeysWithValues: birthdays.map { ($0.name.lowercased(), $0.birthDateISO) }
+        )
+    }
+
+    func isMilestonePersonPickerTag(_ tag: EventAttributeTag) -> Bool {
+        tag.category == .milestoneType &&
+        MilestonePersonPickerKind.from(milestoneType: tag.tagValue) != nil
+    }
+
+    func milestonePersonPickerItems(for kind: MilestonePersonPickerKind) -> [MilestonePersonPickerItem] {
+        switch kind {
+        case .birthday:
+            let eventDate = EventDateParser.parseDate(event.startDate) ?? Date()
+            return BirthdayPersonPickerOrdering.items(
+                peopleWithBirthDates: database.fetchPeopleWithBirthDates(),
+                allPeople: database.fetchAllPeople(),
+                eventDate: eventDate
+            )
+        case .graduation, .baptism, .wedding, .anniversary:
+            return coupleMilestonePersonItems()
+        }
+    }
+
+    func coupleMilestonePersonItems(
+        excludingPersonId: Int? = nil
+    ) -> [MilestonePersonPickerItem] {
+        let items = EventMilestonePersonPickerOrdering.items(
+            eventPeople: database.fetchEventPeople(
+                eventId: event.eventId,
+                includeChildEvents: event.isTripContainer
+            ),
+            allPeople: database.fetchAllPeople()
+        )
+
+        guard let excludingPersonId else { return items }
+        return items.filter { $0.personId != excludingPersonId }
+    }
+
+    func defaultWeddingDate() -> Date {
+        if let weddingDate,
+           let stored = EventDateParser.parseDate(weddingDate) {
+            return stored
+        }
+        return EventDateParser.eventDayDate(from: event.startDate) ?? Date()
+    }
+
+    func assignMilestonePerson(_ person: MilestonePersonPickerItem) {
+        setEventMainPerson(person.name)
+    }
+
+    func showAITagScoringDetail(for tag: EventAttributeTag) {
+        aiTagScoringSaveStatus = nil
+        loadHolidayScorecards()
+    }
+
+    func saveOccasionDateScoringSettings(
+        occasionId: Int,
+        edit: OccasionDateScoringEdit
+    ) {
+        database.updateOccasionDateScoringSettings(
+            occasionId: occasionId,
+            edit: edit
+        )
+        rescoreCurrentEventAfterRuleChange(
+            statusMessage: "Saved. This event was re-scored with the new date window."
+        )
+    }
+
+    func saveOccasionObjectScoringRules(
+        occasionId: Int,
+        rules: [EditableObjectScoringRule]
+    ) {
+        let candidateCount = database.saveObjectScoringRules(
+            occasionId: occasionId,
+            rules: rules
+        )
+        rescoreCurrentEventAfterRuleChange(
+            statusMessage: candidateCount > 0
+                ? "Saved. \(candidateCount) \(candidateCount == 1 ? "event" : "events") queued for object re-scan (including this one)."
+                : "Saved. Object rules updated and this event was re-scored."
+        )
+        loadPhotos()
+    }
+
+    private func rescoreCurrentEventAfterRuleChange(statusMessage: String) {
+        rescoreCurrentEventHolidayScores()
+        holidayScorecards = database.fetchHolidayScorecards(
+            eventId: event.eventId,
+            includesDescendantPhotos: event.isTripContainer
+        )
+        holidayScorecardRevision += 1
+        aiTagScoringSaveStatus = statusMessage
+    }
+
+    func assignCoupleMilestone(
+        person1: MilestonePersonPickerItem,
+        person2: MilestonePersonPickerItem,
+        weddingDate selectedDate: Date
+    ) {
+        setAttribute(.mainPerson, value: person1.name)
+        setAttribute(.secondaryMainPerson, value: person2.name)
+
+        let weddingDateISO = EventDateParser.dateOnlyISO(from: selectedDate)
+        database.updateWeddingDate(eventId: event.eventId, weddingDate: weddingDateISO)
+        weddingDate = weddingDateISO
+
+        if milestoneType?.caseInsensitiveCompare("Wedding") == .orderedSame {
+            _ = database.propagateAnniversaryTagsFromWedding(
+                sourceEventId: event.eventId,
+                person1: person1.name,
+                person2: person2.name,
+                weddingDateISO: weddingDateISO
+            )
+        }
+
+        refreshEvent()
+        notifyEventUpdated()
     }
 
     func setEventType(_ value: String?) {
@@ -395,6 +643,34 @@ final class EventDetailViewModel: ObservableObject {
         setAttribute(.holidayType, value: value)
     }
 
+    func confirmAIAttributeTag(_ tag: EventAttributeTag) {
+        guard tag.isAIDerived else { return }
+        for eventId in tag.actionEventIds(displayEventId: event.eventId) {
+            database.confirmAIAttributeTag(eventId: eventId, field: tag.category)
+        }
+        refreshEvent()
+        notifyEventUpdated()
+    }
+
+    func rejectAIAttributeTag(_ tag: EventAttributeTag) {
+        guard tag.isAIDerived else { return }
+        for eventId in tag.actionEventIds(displayEventId: event.eventId) {
+            database.rejectAIAttributeTag(eventId: eventId, field: tag.category)
+        }
+        refreshEvent()
+        notifyEventUpdated()
+    }
+
+    func confirmAIHolidayTag() {
+        guard let tag = event.holidayTag else { return }
+        confirmAIAttributeTag(EventAttributeTag(holidayTag: tag))
+    }
+
+    func rejectAIHolidayTag() {
+        guard let tag = event.holidayTag else { return }
+        rejectAIAttributeTag(EventAttributeTag(holidayTag: tag))
+    }
+
     func setEventMainPerson(_ value: String?) {
         setAttribute(.mainPerson, value: value)
     }
@@ -407,6 +683,7 @@ final class EventDetailViewModel: ObservableObject {
         case .milestoneType: return milestoneType
         case .holidayType: return holidayType
         case .mainPerson: return eventMainPerson
+        case .secondaryMainPerson: return eventMainPerson2
         }
     }
 
@@ -417,7 +694,7 @@ final class EventDetailViewModel: ObservableObject {
         case .tripType: return tripTypeOptions
         case .milestoneType: return milestoneTypeOptions
         case .holidayType: return holidayTypeOptions
-        case .mainPerson: return personOptions
+        case .mainPerson, .secondaryMainPerson: return personOptions
         }
     }
 
@@ -467,6 +744,7 @@ final class EventDetailViewModel: ObservableObject {
         case .milestoneType: milestoneType = value
         case .holidayType: holidayType = value
         case .mainPerson: eventMainPerson = value
+        case .secondaryMainPerson: eventMainPerson2 = value
         }
 
         refreshEvent()
@@ -476,9 +754,11 @@ final class EventDetailViewModel: ObservableObject {
         eventType = event.eventType
         activityType = event.activityType
         tripType = event.tripType
-        milestoneType = event.milestoneType
-        holidayType = event.holidayType
-        eventMainPerson = event.eventMainPerson
+        milestoneType = event.resolvedAttributeValue(for: .milestoneType) ?? event.milestoneType
+        holidayType = event.displayHolidayLabel ?? event.holidayType
+        eventMainPerson = event.resolvedAttributeValue(for: .mainPerson) ?? event.eventMainPerson
+        eventMainPerson2 = event.resolvedAttributeValue(for: .secondaryMainPerson) ?? event.eventMainPerson2
+        weddingDate = event.weddingDate
     }
 
     func beginPhotoSelection() {
@@ -578,14 +858,16 @@ final class EventDetailViewModel: ObservableObject {
         event.isUserHidden
     }
 
-    func refreshEvent() {
+    func refreshEvent(notifyList: Bool = true) {
         guard let updated = database.getEvent(eventId: event.eventId) else {
             return
         }
 
         event = updated
         syncClassification(from: updated)
-        notifyEventUpdated()
+        if notifyList {
+            notifyEventUpdated()
+        }
     }
 
     func applySuggestedName() {
@@ -696,5 +978,21 @@ final class EventDetailViewModel: ObservableObject {
         }
 
         rebuildDisplayItems()
+    }
+
+    func logVisionLabelsForPhoto(_ photo: IndexedPhoto) {
+        visionLabelDebugTask?.cancel()
+        visionLabelDebugTask = Task {
+            visionLabelDebugStatus = "Analyzing Vision labels…"
+
+            let objectKeys = database.christmasObjectKeysForVisionDebug()
+            let result = await VisionLabelDebugService.analyze(
+                assetIdentifier: photo.id,
+                objectKeys: objectKeys
+            )
+
+            guard !Task.isCancelled else { return }
+            visionLabelDebugStatus = result.statusMessage
+        }
     }
 }

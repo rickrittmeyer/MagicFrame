@@ -33,8 +33,8 @@ final class HomeOnboardingViewModel: NSObject, ObservableObject, CLLocationManag
         !isSaving && !isSearching && !isLocating && hasConfirmedHomePin && pinCoordinate != nil
     }
 
-    init(database: any MagicFrameDatabase = AppDependencies.database) {
-        self.database = database
+    init(database: (any MagicFrameDatabase)? = nil) {
+        self.database = database ?? AppDependencies.database
         super.init()
         locationManager.delegate = self
         locationManager.desiredAccuracy = kCLLocationAccuracyHundredMeters

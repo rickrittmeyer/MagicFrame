@@ -23,11 +23,72 @@ struct IndexedEvent {
     let activityType: String?
     let milestoneType: String?
     let holidayType: String?
+    let attributeTags: [EventAttributeTag]
     let eventMainPerson: String?
+    let eventMainPerson2: String?
+    let weddingDate: String?
     let tripType: String?
     let childEventName: String?
     let userEditedChildEventName: Bool
     let isUserHidden: Bool
+
+    var holidayTag: EventHolidayTag? {
+        attributeTags.first(where: { $0.category == .holidayType })?.asHolidayTag
+    }
+
+    /// Holiday label for UI: structured tag first, then legacy column.
+    var displayHolidayLabel: String? {
+        if let holidayTag {
+            return holidayTag.tagValue
+        }
+        let trimmed = holidayType?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// Attribute chips for the events library row, in display order.
+    var libraryAttributeTags: [EventAttributeTag] {
+        var tags = attributeTags
+        if holidayTag == nil,
+           let label = displayHolidayLabel,
+           !tags.contains(where: { $0.category == .holidayType }) {
+            tags.append(
+                EventAttributeTag(
+                    category: .holidayType,
+                    tagValue: label,
+                    source: .user
+                )
+            )
+        }
+
+        return tags.sorted { lhs, rhs in
+            let left = EventAttributeField.libraryChipDisplayOrder.firstIndex(of: lhs.category) ?? 99
+            let right = EventAttributeField.libraryChipDisplayOrder.firstIndex(of: rhs.category) ?? 99
+            return left < right
+        }
+    }
+
+    func attributeColumnValue(for field: EventAttributeField) -> String? {
+        switch field {
+        case .eventType: return eventType
+        case .activityType: return activityType
+        case .tripType: return tripType
+        case .milestoneType: return milestoneType
+        case .holidayType: return holidayType
+        case .mainPerson: return eventMainPerson
+        case .secondaryMainPerson: return eventMainPerson2
+        }
+    }
+
+    /// Prefer structured `event_tags`, then legacy column values.
+    func resolvedAttributeValue(for field: EventAttributeField) -> String? {
+        if let tagValue = attributeTags.first(where: { $0.category == field })?.tagValue {
+            let trimmed = tagValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+        return attributeColumnValue(for: field)
+    }
 
     var isTripSubEvent: Bool {
         parentEventId != nil
@@ -65,7 +126,7 @@ struct IndexedEvent {
     }
 
     var eventYear: Int? {
-        EventDateParser.year(from: startDate)
+        EventDateParser.year(from: startDate) ?? EventDateParser.year(from: endDate)
     }
 
     var displayDateText: String? {

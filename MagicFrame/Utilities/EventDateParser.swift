@@ -77,7 +77,33 @@ enum EventDateParser {
 
         let fallback = DateFormatter()
         fallback.locale = Locale(identifier: "en_US_POSIX")
-        fallback.dateFormat = "yyyy-MM-dd'T'HH:mm:ssZ"
-        return fallback.date(from: value)
+
+        for format in [
+            "yyyy-MM-dd'T'HH:mm:ssZ",
+            "yyyy-MM-dd'T'HH:mm:ss",
+            "yyyy-MM-dd HH:mm:ss",
+            "yyyy-MM-dd",
+        ] {
+            fallback.dateFormat = format
+            if let date = fallback.date(from: value) {
+                return date
+            }
+        }
+
+        return nil
+    }
+
+    static func dateOnlyISO(from date: Date, calendar: Calendar = .current) -> String {
+        let components = calendar.dateComponents([.year, .month, .day], from: date)
+        let year = components.year ?? 1970
+        let month = components.month ?? 1
+        let day = components.day ?? 1
+        return String(format: "%04d-%02d-%02d", year, month, day)
+    }
+
+    static func eventDayDate(from startDateISO: String, calendar: Calendar = .current) -> Date? {
+        guard let parsed = parseDate(startDateISO) else { return nil }
+        let components = calendar.dateComponents([.year, .month, .day], from: parsed)
+        return calendar.date(from: components)
     }
 }

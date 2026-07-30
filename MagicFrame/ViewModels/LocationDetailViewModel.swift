@@ -9,7 +9,6 @@ final class LocationDetailViewModel: ObservableObject {
 
     @Published var location: ManagedLocation?
     @Published var userName: String = ""
-    @Published var eventItems: [EventListDisplayItem] = []
     @Published var typeOptions: [String] = []
     @Published var isAddingType = false
     @Published var newTypeName = ""
@@ -19,10 +18,10 @@ final class LocationDetailViewModel: ObservableObject {
 
     init(
         locationId: Int,
-        database: any MagicFrameDatabase = AppDependencies.database
+        database: (any MagicFrameDatabase)? = nil
     ) {
         self.locationId = locationId
-        self.database = database
+        self.database = database ?? AppDependencies.database
     }
 
     func load() {
@@ -40,19 +39,7 @@ final class LocationDetailViewModel: ObservableObject {
             homeEndDate = Date()
         }
 
-        rebuildEventItems()
         typeOptions = database.getLocationTypeOptions()
-    }
-
-    private func rebuildEventItems() {
-        let events = database.getEventsForLocation(locationId: locationId)
-        let slideshowIdsByEvent = database.getSlideshowPhotoIds(for: events)
-        eventItems = events.map { event in
-            EventListDisplayItem(
-                event: event,
-                slideshowPhotoIds: slideshowIdsByEvent[event.eventId] ?? []
-            )
-        }
     }
 
     func saveNickname() {
@@ -101,29 +88,6 @@ final class LocationDetailViewModel: ObservableObject {
             isFavorite: !location.isFavorite
         )
         self.location = database.getLocation(locationId: locationId)
-    }
-
-    func refreshEvent(eventId: Int) {
-        guard let index = eventItems.firstIndex(where: { $0.event.eventId == eventId }),
-              let updated = database.getEvent(eventId: eventId) else {
-            return
-        }
-
-        let slideshowIds = database.getSlideshowPhotoIds(for: [updated])
-        eventItems[index] = EventListDisplayItem(
-            event: updated,
-            slideshowPhotoIds: slideshowIds[updated.eventId] ?? []
-        )
-    }
-
-    func hideEvent(eventId: Int) {
-        database.setEventUserHidden(eventId: eventId, hidden: true)
-        eventItems.removeAll { $0.event.eventId == eventId }
-    }
-
-    func unhideEvent(eventId: Int) {
-        database.setEventUserHidden(eventId: eventId, hidden: false)
-        refreshEvent(eventId: eventId)
     }
 
     func beginAddingType() {

@@ -16,7 +16,9 @@ protocol EventRepositoryProtocol: AnyObject {
     @discardableResult
     func updateChildEventName(eventId: Int, name: String, userEdited: Bool) -> Bool
     func syncDefaultChildEventName(forSubEventId eventId: Int)
+    func countListEvents(includeHidden: Bool, filter: EventListFilter) -> Int
     func getEvents(includeHidden: Bool) -> [IndexedEvent]
+    func getEventsForList(includeHidden: Bool, limit: Int?, filter: EventListFilter) -> [IndexedEvent]
     func getEvent(eventId: Int) -> IndexedEvent?
     func getSlideshowPhotoIds(for events: [IndexedEvent]) -> [Int: [String]]
     func setPhotoShowOnFrame(photoId: String, eventId: Int, show: Bool)

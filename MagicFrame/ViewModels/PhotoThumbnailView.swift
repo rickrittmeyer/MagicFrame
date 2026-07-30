@@ -23,8 +23,12 @@ struct PhotoThumbnailView: View {
     var enforceSquareAspect: Bool = true
     var quality: Quality = .fast
     var cropContext: CropContext? = nil
+    /// When false, only applies persisted crop data (no Vision analysis). Use for scrolling lists.
+    var analyzesFacesIfMissing: Bool = false
     /// Explicit focal point (top-left normalized). Overrides `cropContext` when set.
     var normalizedCropFocus: CGPoint? = nil
+
+    @Environment(\.displayScale) private var displayScale
 
     @State private var image: UIImage?
     @State private var loadedTargetSize: CGSize = .zero
@@ -45,9 +49,28 @@ struct PhotoThumbnailView: View {
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
+        .onAppear {
+            restoreCachedImageIfNeeded()
+        }
         .task(id: cropLoadTaskKey) {
+            guard cropContext != nil else { return }
             await resolveCropFocusIfNeeded()
         }
+    }
+
+    private var thumbnailCacheKey: String {
+        PhotoThumbnailImageCache.key(
+            assetIdentifier: assetIdentifier,
+            quality: quality == .high ? "high" : "fast"
+        )
+    }
+
+    @MainActor
+    private func restoreCachedImageIfNeeded() {
+        guard image == nil, let cached = PhotoThumbnailImageCache.image(for: thumbnailCacheKey) else {
+            return
+        }
+        image = cached
     }
 
     private var usesCustomCrop: Bool {
@@ -101,25 +124,42 @@ struct PhotoThumbnailView: View {
     }
 
     private func loadTaskKey(for size: CGSize) -> String {
-        let scale = UIScreen.main.scale
-        let pixelWidth = Int(size.width * scale)
-        let pixelHeight = Int(size.height * scale)
+        let pixelWidth = Int(size.width * displayScale)
+        let pixelHeight = Int(size.height * displayScale)
         return "\(assetIdentifier)|\(quality)|\(pixelWidth)x\(pixelHeight)"
     }
 
     @MainActor
     private func loadThumbnail(for size: CGSize) async {
+        if image == nil, let cached = PhotoThumbnailImageCache.image(for: thumbnailCacheKey) {
+            image = cached
+            if size.width > 1, size.height > 1 {
+                loadedTargetSize = CGSize(
+                    width: size.width * displayScale,
+                    height: size.height * displayScale
+                )
+            }
+            return
+        }
+
+        // Ignore collapse/layout passes during navigation transitions.
         guard size.width > 1, size.height > 1 else { return }
 
         if cropContext != nil, effectiveCropFocus == nil {
             await resolveCropFocusIfNeeded()
         }
 
-        let scale = UIScreen.main.scale
         let targetSize = CGSize(
-            width: size.width * scale,
-            height: size.height * scale
+            width: size.width * displayScale,
+            height: size.height * displayScale
         )
+
+        if let image, loadedTargetSize.width > 10 {
+            let widthRatio = targetSize.width / loadedTargetSize.width
+            if image.size.width > 0, widthRatio > 0.75, widthRatio < 1.35 {
+                return
+            }
+        }
 
         if targetSize == loadedTargetSize, image != nil {
             return
@@ -168,7 +208,11 @@ struct PhotoThumbnailView: View {
         options: PHImageRequestOptions,
         waitForFinalQuality: Bool
     ) async {
-        var requestID = PHImageRequestID(PHInvalidImageRequestID)
+        final class RequestSession: @unchecked Sendable {
+            var requestID = PHImageRequestID(PHInvalidImageRequestID)
+            var deliveredImage = false
+        }
+        let session = RequestSession()
 
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
@@ -194,7 +238,7 @@ struct PhotoThumbnailView: View {
 
                 let contentMode: PHImageContentMode = usesCustomCrop ? .aspectFit : .aspectFill
 
-                requestID = PHImageManager.default().requestImage(
+                session.requestID = PHImageManager.default().requestImage(
                     for: asset,
                     targetSize: targetSize,
                     contentMode: contentMode,
@@ -202,6 +246,8 @@ struct PhotoThumbnailView: View {
                 ) { result, info in
                     Task { @MainActor in
                         if let result {
+                            session.deliveredImage = true
+                            PhotoThumbnailImageCache.store(result, for: self.thumbnailCacheKey)
                             self.image = result
                             self.loadedTargetSize = targetSize
                         }
@@ -227,6 +273,8 @@ struct PhotoThumbnailView: View {
                 }
             }
         } onCancel: {
+            guard !session.deliveredImage else { return }
+            let requestID = session.requestID
             if requestID != PHInvalidImageRequestID {
                 PHImageManager.default().cancelImageRequest(requestID)
             }
@@ -243,11 +291,6 @@ struct PhotoThumbnailView: View {
         guard let cropContext else {
             resolvedCropFocus = nil
             return
-        }
-
-        if AppDependencies.database.cropAlgorithmVersion() < PhotoFaceCropAnalyzer.algorithmVersion {
-            AppDependencies.database.clearAllCropFocuses()
-            AppDependencies.database.setCropAlgorithmVersion(PhotoFaceCropAnalyzer.algorithmVersion)
         }
 
         guard let cropData = AppDependencies.database.getPhotoCropData(photoId: assetIdentifier) else {
@@ -271,6 +314,8 @@ struct PhotoThumbnailView: View {
         }
 
         resolvedCropFocus = nil
+
+        guard analyzesFacesIfMissing else { return }
 
         guard let analyzed = await PhotoFaceCropAnalyzer.analyze(assetIdentifier: assetIdentifier) else {
             return

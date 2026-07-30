@@ -4,6 +4,27 @@ import UIKit
 
 struct EventPhotoFullscreenView: View {
 
+    private enum Layout {
+        static let belowSafeAreaCloseOffset: CGFloat = 5
+        static let closeButtonRowHeight: CGFloat = 44
+        static let eventCounterRowHeight: CGFloat = 22
+        static let belowTopChromeBuffer: CGFloat = 8
+        /// Photo vertical inset — unchanged when top chrome moves.
+        static let photoTopInset: CGFloat = 78
+        static let actionBarHeight: CGFloat = 88
+        static let belowPhotoSpacing: CGFloat = 14
+        static let metricsSpacing: CGFloat = 10
+        /// Reference portrait used to center landscapes: 3:4 width×height.
+        static let referencePortraitAspect = CGSize(width: 3, height: 4)
+    }
+
+    private struct PhotoDisplayLayout {
+        let displaySize: CGSize
+        let topY: CGFloat
+
+        var bottomY: CGFloat { topY + displaySize.height }
+    }
+
     @ObservedObject var viewModel: EventDetailViewModel
     let initialDisplayIndex: Int
     let onDismiss: () -> Void
@@ -56,36 +77,70 @@ struct EventPhotoFullscreenView: View {
 
     var body: some View {
         GeometryReader { geometry in
-            let bottomChromeHeight = bottomOverlayHeight(for: currentItem)
-            let photoHeight = max(geometry.size.height - bottomChromeHeight, 0)
+            let photoTopInset = Layout.photoTopInset
+            let photoZoneHeight = max(geometry.size.height - Layout.actionBarHeight, 0)
+            let photoFitBounds = CGSize(
+                width: geometry.size.width,
+                height: max(photoZoneHeight - photoTopInset, 0)
+            )
+            let referencePortraitHeight = referencePortraitDisplayHeight(in: photoFitBounds)
+            let imageLayout = currentPhoto.map {
+                photoDisplayLayout(
+                    for: $0,
+                    photoTopInset: photoTopInset,
+                    fitBounds: photoFitBounds,
+                    referencePortraitHeight: referencePortraitHeight
+                )
+            }
 
             ZStack {
                 Color.black.ignoresSafeArea()
 
                 VStack(spacing: 0) {
-                    if let presentation = currentPhotoPresentation {
-                        FullscreenPhotoView(
-                            assetIdentifier: presentation.assetIdentifier,
-                            reloadToken: presentation.reloadToken,
-                            groupID: presentation.groupID,
-                            zoomState: zoomBinding(for: presentation.groupID),
-                            preserveZoomOnAssetChange: presentation.preserveZoomOnChange,
-                            onClose: onDismiss
-                        )
-                        .id(presentation.groupID)
-                        .frame(height: photoHeight)
-                        .frame(maxWidth: .infinity, alignment: .top)
-                        .clipped()
-                        .simultaneousGesture(gridPageSwipeGesture(for: presentation))
-                    } else if displayItems.isEmpty {
-                        Spacer()
-                        ProgressView()
-                            .tint(.white)
-                        Spacer()
-                    }
+                    ZStack(alignment: .top) {
+                        if let presentation = currentPhotoPresentation,
+                           let photo = currentPhoto {
+                            FullscreenPhotoView(
+                                assetIdentifier: presentation.assetIdentifier,
+                                reloadToken: presentation.reloadToken,
+                                groupID: presentation.groupID,
+                                zoomState: zoomBinding(for: presentation.groupID),
+                                preserveZoomOnAssetChange: presentation.preserveZoomOnChange,
+                                photoTopInset: photoTopInset,
+                                referencePortraitDisplayHeight: referencePortraitHeight,
+                                imagePixelSize: CGSize(
+                                    width: CGFloat(photo.width),
+                                    height: CGFloat(photo.height)
+                                )
+                            )
+                            .id(presentation.groupID)
+                            .frame(height: photoZoneHeight)
+                            .frame(maxWidth: .infinity, alignment: .top)
+                            .clipped()
+                            .simultaneousGesture(gridPageSwipeGesture(for: presentation))
 
-                    bottomOverlay
-                        .frame(height: bottomChromeHeight)
+                            if let item = currentItem,
+                               item.isStack,
+                               let layout = imageLayout {
+                                stackControlsOverlay(
+                                    item: item,
+                                    photo: photo,
+                                    layout: layout,
+                                    zoneHeight: photoZoneHeight
+                                )
+                            }
+
+                            topChromeOverlay(safeAreaTop: geometry.safeAreaInsets.top)
+                        } else if displayItems.isEmpty {
+                            ProgressView()
+                                .tint(.white)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        }
+                    }
+                    .frame(height: photoZoneHeight)
+
+                    bottomActionBar
+                        .frame(height: Layout.actionBarHeight)
                 }
             }
         }
@@ -116,42 +171,120 @@ struct EventPhotoFullscreenView: View {
     }
 
     @ViewBuilder
-    private var bottomOverlay: some View {
+    private func stackControlsOverlay(
+        item: EventPhotoDisplayItem,
+        photo: IndexedPhoto,
+        layout: PhotoDisplayLayout,
+        zoneHeight: CGFloat
+    ) -> some View {
+        VStack(spacing: 0) {
+            Color.clear
+                .frame(height: layout.bottomY + Layout.belowPhotoSpacing)
+                .allowsHitTesting(false)
+
+            similarPhotoNavigation(for: item.group)
+
+            photoMetricsView(for: photo)
+                .padding(.top, Layout.metricsSpacing)
+
+            Spacer(minLength: 0)
+                .allowsHitTesting(false)
+        }
+        .frame(height: zoneHeight)
+        .frame(maxWidth: .infinity)
+    }
+
+    @ViewBuilder
+    private var bottomActionBar: some View {
         if let item = currentItem, let photo = currentPhoto {
-            if item.isStack {
-                VStack(spacing: 0) {
-                    Spacer(minLength: 0)
+            VStack(spacing: 6) {
+                Spacer(minLength: 0)
 
-                    photoMetricsView(for: photo)
-
-                    Spacer(minLength: 0)
-
-                    similarPhotoNavigation(for: item.group)
-
-                    HStack(spacing: 28) {
-                        frameActionButtons(for: photo, in: item)
-                    }
-                    .padding(.top, 12)
-                    .padding(.bottom, 20)
+                if let visionStatus = viewModel.visionLabelDebugStatus {
+                    Text(visionStatus)
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.85))
+                        .multilineTextAlignment(.center)
+                        .lineLimit(2)
+                        .padding(.horizontal, 12)
                 }
-            } else {
-                VStack(spacing: 12) {
-                    Spacer(minLength: 0)
 
-                    HStack(spacing: 28) {
-                        frameActionButtons(for: photo, in: item)
-                    }
-
-                    bottomStatusText
-                        .padding(.bottom, 28)
+                HStack(spacing: 28) {
+                    frameActionButtons(for: photo, in: item)
                 }
             }
+            .padding(.bottom, 20)
         }
     }
 
-    private func bottomOverlayHeight(for item: EventPhotoDisplayItem?) -> CGFloat {
-        guard let item else { return 0 }
-        return item.isStack ? 252 : 120
+    @ViewBuilder
+    private func topChromeOverlay(safeAreaTop: CGFloat) -> some View {
+        VStack(spacing: 4) {
+            HStack {
+                Spacer()
+
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title2)
+                        .foregroundStyle(.white)
+                        .frame(width: Layout.closeButtonRowHeight, height: Layout.closeButtonRowHeight)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close")
+            }
+            .padding(.trailing, 10)
+
+            eventGridCounterText
+                .frame(maxWidth: .infinity)
+                .frame(height: Layout.eventCounterRowHeight)
+        }
+        .padding(.top, safeAreaTop + Layout.belowSafeAreaCloseOffset)
+        .frame(maxWidth: .infinity, alignment: .top)
+    }
+
+    private var eventGridCounterText: some View {
+        Text("\(min(currentDisplayIndex + 1, max(displayItems.count, 1))) of \(displayItems.count)")
+            .font(.subheadline)
+            .foregroundStyle(.white.opacity(0.85))
+    }
+
+    private func referencePortraitDisplayHeight(in fitBounds: CGSize) -> CGFloat {
+        aspectFitDisplaySize(for: Layout.referencePortraitAspect, in: fitBounds).height
+    }
+
+    private func photoDisplayLayout(
+        for photo: IndexedPhoto,
+        photoTopInset: CGFloat,
+        fitBounds: CGSize,
+        referencePortraitHeight: CGFloat
+    ) -> PhotoDisplayLayout {
+        guard photo.width > 0, photo.height > 0, fitBounds.width > 0, fitBounds.height > 0 else {
+            return PhotoDisplayLayout(displaySize: fitBounds, topY: photoTopInset)
+        }
+
+        let imageSize = CGSize(width: CGFloat(photo.width), height: CGFloat(photo.height))
+        let displaySize = aspectFitDisplaySize(for: imageSize, in: fitBounds)
+        let isPortrait = imageSize.height > imageSize.width
+        let landscapeOffset = isPortrait
+            ? 0
+            : max((referencePortraitHeight - displaySize.height) * 0.5, 0)
+
+        return PhotoDisplayLayout(
+            displaySize: displaySize,
+            topY: photoTopInset + landscapeOffset
+        )
+    }
+
+    private func aspectFitDisplaySize(for imageSize: CGSize, in bounds: CGSize) -> CGSize {
+        let fitScale = min(
+            bounds.width / imageSize.width,
+            bounds.height / imageSize.height
+        )
+        return CGSize(
+            width: imageSize.width * fitScale,
+            height: imageSize.height * fitScale
+        )
     }
 
     @ViewBuilder
@@ -189,6 +322,18 @@ struct EventPhotoFullscreenView: View {
             }
             .foregroundStyle(.white)
         }
+
+        Button {
+            viewModel.logVisionLabelsForPhoto(photo)
+        } label: {
+            VStack(spacing: 4) {
+                Image(systemName: "viewfinder")
+                    .font(.title2)
+                Text("Vision")
+                    .font(.caption2)
+            }
+            .foregroundStyle(.white)
+        }
     }
 
     @ViewBuilder
@@ -203,41 +348,28 @@ struct EventPhotoFullscreenView: View {
         let ranked = rankedSimilarPhotos(for: group)
         let index = similarPhotoIndex(for: group, rankedPhotos: ranked)
 
-        HStack(spacing: 12) {
-            Button {
+        HStack(spacing: 8) {
+            similarPhotoArrowButton(
+                systemName: "chevron.left.circle.fill",
+                accessibilityLabel: "Previous similar photo"
+            ) {
                 showPreviousSimilarPhoto(in: group, rankedPhotos: ranked)
-            } label: {
-                Image(systemName: "chevron.left.circle.fill")
-                    .font(.title2)
-                    .symbolRenderingMode(.palette)
-                    .foregroundStyle(.white, .white.opacity(0.25))
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 14)
-                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Previous similar photo")
 
             Text("\(index + 1) of \(ranked.count) Similar Photos")
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.white)
                 .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity)
 
-            Button {
+            similarPhotoArrowButton(
+                systemName: "chevron.right.circle.fill",
+                accessibilityLabel: "Next similar photo"
+            ) {
                 showNextSimilarPhoto(in: group, rankedPhotos: ranked)
-            } label: {
-                Image(systemName: "chevron.right.circle.fill")
-                    .font(.title2)
-                    .symbolRenderingMode(.palette)
-                    .foregroundStyle(.white, .white.opacity(0.25))
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 14)
-                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Next similar photo")
         }
-        .padding(.horizontal, 16)
+        .padding(.horizontal, 12)
     }
 
     @ViewBuilder
@@ -255,6 +387,23 @@ struct EventPhotoFullscreenView: View {
             )
         }
         .padding(.horizontal, 16)
+    }
+
+    private func similarPhotoArrowButton(
+        systemName: String,
+        accessibilityLabel: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.title2)
+                .symbolRenderingMode(.palette)
+                .foregroundStyle(.white, .white.opacity(0.25))
+                .frame(width: 52, height: 52)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityLabel)
     }
 
     private func photoMetric(title: String, value: String) -> some View {
@@ -363,11 +512,12 @@ private struct FullscreenPhotoView: UIViewControllerRepresentable {
     let groupID: String
     @Binding var zoomState: PhotoZoomState
     var preserveZoomOnAssetChange: Bool
-    var onClose: () -> Void
+    var photoTopInset: CGFloat
+    var referencePortraitDisplayHeight: CGFloat
+    var imagePixelSize: CGSize
 
     func makeUIViewController(context: Context) -> PhotoZoomViewController {
         let controller = PhotoZoomViewController()
-        controller.onClose = onClose
         controller.onZoomStateChanged = { state in
             if state != zoomState {
                 zoomState = state
@@ -377,7 +527,6 @@ private struct FullscreenPhotoView: UIViewControllerRepresentable {
     }
 
     func updateUIViewController(_ controller: PhotoZoomViewController, context: Context) {
-        controller.onClose = onClose
         controller.onZoomStateChanged = { state in
             if state != zoomState {
                 zoomState = state
@@ -389,7 +538,10 @@ private struct FullscreenPhotoView: UIViewControllerRepresentable {
             reloadToken: reloadToken,
             groupID: groupID,
             preserveZoom: preserveZoomOnAssetChange,
-            fallbackZoom: zoomState
+            fallbackZoom: zoomState,
+            photoTopInset: photoTopInset,
+            referencePortraitDisplayHeight: referencePortraitDisplayHeight,
+            imagePixelSize: imagePixelSize
         )
     }
 }
@@ -398,13 +550,11 @@ private struct FullscreenPhotoView: UIViewControllerRepresentable {
 
 private final class PhotoZoomViewController: UIViewController, UIScrollViewDelegate {
 
-    var onClose: (() -> Void)?
     var onZoomStateChanged: ((PhotoZoomState) -> Void)?
 
     private let scrollView = UIScrollView()
     private let imageView = UIImageView()
     private let spinner = UIActivityIndicatorView(style: .large)
-    private let closeButton = UIButton(type: .system)
 
     private var loadedAssetIdentifier: String?
     private var loadedReloadToken = -1
@@ -414,6 +564,10 @@ private final class PhotoZoomViewController: UIViewController, UIScrollViewDeleg
     private var pendingZoomRestore: PhotoZoomState?
     private var isApplyingZoomState = false
     private var isNewAssetLoad = false
+
+    private var photoTopInset: CGFloat = 0
+    private var referencePortraitDisplayHeight: CGFloat = 0
+    private var layoutImagePixelSize = CGSize.zero
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -436,27 +590,14 @@ private final class PhotoZoomViewController: UIViewController, UIScrollViewDeleg
         spinner.hidesWhenStopped = true
         spinner.translatesAutoresizingMaskIntoConstraints = false
 
-        let closeImage = UIImage(systemName: "xmark.circle.fill")?
-            .withConfiguration(UIImage.SymbolConfiguration(textStyle: .title2))
-        closeButton.setImage(closeImage, for: .normal)
-        closeButton.tintColor = .white
-        closeButton.translatesAutoresizingMaskIntoConstraints = true
-        closeButton.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
-        closeButton.accessibilityLabel = "Close"
-
         view.addSubview(scrollView)
         scrollView.addSubview(imageView)
         view.addSubview(spinner)
-        view.addSubview(closeButton)
-
-        // Keep scroll view below the close button.
-        let scrollTop = scrollView.topAnchor.constraint(equalTo: view.topAnchor)
-        scrollTop.priority = .defaultHigh
 
         NSLayoutConstraint.activate([
             scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            scrollTop,
+            scrollView.topAnchor.constraint(equalTo: view.topAnchor),
             scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             spinner.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             spinner.centerYAnchor.constraint(equalTo: view.centerYAnchor)
@@ -467,32 +608,8 @@ private final class PhotoZoomViewController: UIViewController, UIScrollViewDeleg
         scrollView.addGestureRecognizer(doubleTap)
     }
 
-    @objc private func closeTapped() {
-        onClose?()
-    }
-
-    private func layoutCloseButton() {
-        let safeTop = view.safeAreaInsets.top > 0
-            ? view.safeAreaInsets.top
-            : (view.window?.safeAreaInsets.top ?? 47)
-        let safeTrailing = view.safeAreaInsets.right > 0
-            ? view.safeAreaInsets.right
-            : (view.window?.safeAreaInsets.right ?? 0)
-
-        let size: CGFloat = 44
-        closeButton.frame = CGRect(
-            x: view.bounds.width - safeTrailing - size - 10,
-            y: safeTop + 6,
-            width: size,
-            height: size
-        )
-        view.bringSubviewToFront(closeButton)
-    }
-
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
-
-        layoutCloseButton()
 
         guard scrollView.bounds.width > 0, scrollView.bounds.height > 0 else { return }
 
@@ -507,14 +624,48 @@ private final class PhotoZoomViewController: UIViewController, UIScrollViewDeleg
         }
     }
 
+    private func previewTargetPixelSize() -> CGSize {
+        let scale = view.traitCollection.displayScale
+        let bounds = view.bounds.size
+        if bounds.width > 1, bounds.height > 1 {
+            return CGSize(width: bounds.width * scale, height: bounds.height * scale)
+        }
+        if let screen = view.window?.windowScene?.screen {
+            return CGSize(
+                width: screen.bounds.width * screen.scale,
+                height: screen.bounds.height * screen.scale
+            )
+        }
+        return CGSize(width: bounds.width * scale, height: bounds.height * scale)
+    }
+
     func display(
         assetIdentifier: String,
         reloadToken: Int,
         groupID: String,
         preserveZoom: Bool,
-        fallbackZoom: PhotoZoomState
+        fallbackZoom: PhotoZoomState,
+        photoTopInset: CGFloat,
+        referencePortraitDisplayHeight: CGFloat,
+        imagePixelSize: CGSize
     ) {
-        guard assetIdentifier != loadedAssetIdentifier || reloadToken != loadedReloadToken else {
+        let layoutChanged =
+            self.photoTopInset != photoTopInset
+            || self.referencePortraitDisplayHeight != referencePortraitDisplayHeight
+            || self.layoutImagePixelSize != imagePixelSize
+
+        self.photoTopInset = photoTopInset
+        self.referencePortraitDisplayHeight = referencePortraitDisplayHeight
+        self.layoutImagePixelSize = imagePixelSize
+
+        let assetChanged = assetIdentifier != loadedAssetIdentifier || reloadToken != loadedReloadToken
+        guard assetChanged || layoutChanged else { return }
+
+        if !assetChanged, layoutChanged, imageView.image != nil {
+            if scrollView.zoomScale <= scrollView.minimumZoomScale + 0.001 {
+                layoutAtMinimumZoom()
+                centerZoomedContents()
+            }
             return
         }
 
@@ -546,12 +697,7 @@ private final class PhotoZoomViewController: UIViewController, UIScrollViewDeleg
             return
         }
 
-        let screenSize = UIScreen.main.bounds.size
-        let screenScale = UIScreen.main.scale
-        let previewSize = CGSize(
-            width: screenSize.width * screenScale,
-            height: screenSize.height * screenScale
-        )
+        let previewSize = previewTargetPixelSize()
 
         let fastOptions = PHImageRequestOptions()
         fastOptions.deliveryMode = .opportunistic
@@ -624,10 +770,53 @@ private final class PhotoZoomViewController: UIViewController, UIScrollViewDeleg
         }
     }
 
+    private func layoutImageSize() -> CGSize {
+        if layoutImagePixelSize.width > 0, layoutImagePixelSize.height > 0 {
+            return layoutImagePixelSize
+        }
+        if let image = imageView.image,
+           image.size.width > 0,
+           image.size.height > 0 {
+            return image.size
+        }
+        return .zero
+    }
+
     private func layoutAtMinimumZoom() {
-        imageView.frame = CGRect(origin: .zero, size: scrollView.bounds.size)
-        scrollView.contentSize = scrollView.bounds.size
-        scrollView.contentInset = .zero
+        guard scrollView.bounds.width > 0, scrollView.bounds.height > 0 else { return }
+
+        let boundsSize = scrollView.bounds.size
+        let imageSize = layoutImageSize()
+
+        guard imageSize.width > 0, imageSize.height > 0 else {
+            imageView.frame = CGRect(origin: .zero, size: boundsSize)
+            scrollView.contentSize = boundsSize
+            scrollView.contentInset = .zero
+            return
+        }
+
+        let availableHeight = max(boundsSize.height - photoTopInset, 0)
+        let fitBounds = CGSize(width: boundsSize.width, height: availableHeight)
+        let fitScale = min(
+            fitBounds.width / imageSize.width,
+            fitBounds.height / imageSize.height
+        )
+        let displaySize = CGSize(
+            width: imageSize.width * fitScale,
+            height: imageSize.height * fitScale
+        )
+        let isPortrait = imageSize.height > imageSize.width
+        let landscapeOffset = isPortrait
+            ? 0
+            : max((referencePortraitDisplayHeight - displaySize.height) * 0.5, 0)
+
+        imageView.frame = CGRect(
+            x: (boundsSize.width - displaySize.width) * 0.5,
+            y: photoTopInset + landscapeOffset,
+            width: displaySize.width,
+            height: displaySize.height
+        )
+        scrollView.contentSize = boundsSize
     }
 
     private func resetToMinimumZoom(animated: Bool) {
@@ -681,10 +870,25 @@ private final class PhotoZoomViewController: UIViewController, UIScrollViewDeleg
     private func centerZoomedContents() {
         let boundsSize = scrollView.bounds.size
         let frame = imageView.frame
-
         let insetX = max((boundsSize.width - frame.width) * 0.5, 0)
-        let insetY = max((boundsSize.height - frame.height) * 0.5, 0)
-        scrollView.contentInset = UIEdgeInsets(top: insetY, left: insetX, bottom: insetY, right: insetX)
+        let atMinimumZoom = scrollView.zoomScale <= scrollView.minimumZoomScale + 0.001
+
+        if atMinimumZoom {
+            scrollView.contentInset = UIEdgeInsets(
+                top: 0,
+                left: insetX,
+                bottom: 0,
+                right: insetX
+            )
+        } else {
+            let insetY = max((boundsSize.height - frame.height) * 0.5, 0)
+            scrollView.contentInset = UIEdgeInsets(
+                top: insetY,
+                left: insetX,
+                bottom: insetY,
+                right: insetX
+            )
+        }
     }
 
     private func maxHorizontalOffset() -> CGFloat {

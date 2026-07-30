@@ -8,6 +8,8 @@ struct EventDetailView: View {
     @State private var isConfirmingHideEvent = false
     @State private var isShowingAttributePicker = false
     @State private var attributePickerField: EventAttributeField?
+    @State private var activeMilestonePersonPicker: MilestonePersonPickerKind?
+    @State private var pendingMilestonePersonPicker: MilestonePersonPickerKind?
     @FocusState private var isNameFieldFocused: Bool
     @Environment(\.dismiss) private var dismiss
 
@@ -48,6 +50,16 @@ struct EventDetailView: View {
                 photoGridHeader
 
                 photoGrid
+
+                if let objectStatus = vm.objectRecognitionStatus {
+                    Text(objectStatus)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 16)
+                        .padding(.top, 8)
+                }
+
+                holidayScorecardsSection
             }
         }
         .background(Color(.systemBackground))
@@ -108,9 +120,10 @@ struct EventDetailView: View {
                 photoSelectionBar
             }
         }
-        .onAppear {
+        .task(id: vm.event.eventId) {
             vm.loadPhotos()
             vm.loadClassificationOptions()
+            vm.loadHolidayScorecards()
         }
         .confirmationDialog(
             "Hide Event",
@@ -165,8 +178,42 @@ struct EventDetailView: View {
                     isShowingAttributePicker = false
                     attributePickerField = nil
                     vm.beginAddingCustomOption(for: field)
+                },
+                onMilestonePersonPickerRequested: { kind in
+                    attributePickerField = nil
+                    pendingMilestonePersonPicker = kind
+                    isShowingAttributePicker = false
                 }
             )
+        }
+        .onChange(of: isShowingAttributePicker) { _, isShowing in
+            guard !isShowing, let kind = pendingMilestonePersonPicker else { return }
+            pendingMilestonePersonPicker = nil
+            activeMilestonePersonPicker = kind
+        }
+        .sheet(item: $activeMilestonePersonPicker) { kind in
+            if kind.isCoupleMilestone {
+                CoupleMilestonePickerSheet(
+                    kind: kind,
+                    items: vm.milestonePersonPickerItems(for: kind),
+                    defaultWeddingDate: vm.defaultWeddingDate(),
+                    onComplete: { person1, person2, weddingDate in
+                        vm.assignCoupleMilestone(
+                            person1: person1,
+                            person2: person2,
+                            weddingDate: weddingDate
+                        )
+                    }
+                )
+            } else {
+                MilestonePersonPickerSheet(
+                    kind: kind,
+                    items: vm.milestonePersonPickerItems(for: kind),
+                    onSelect: { person in
+                        vm.assignMilestonePerson(person)
+                    }
+                )
+            }
         }
     }
 
@@ -211,42 +258,75 @@ struct EventDetailView: View {
     }
 
     @ViewBuilder
-    private var selectedAttributeChips: some View {
-        let selections = EventAttributeField.allCases.compactMap { field -> (EventAttributeField, String)? in
-            guard let value = vm.selection(for: field)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !value.isEmpty else {
-                return nil
+    private var holidayScorecardsSection: some View {
+        ForEach(vm.holidayScorecards) { scoringDetail in
+            if let occasionId = scoringDetail.occasionId {
+                AITagScoringDetailPanel(
+                    detail: scoringDetail,
+                    editorRevision: vm.holidayScorecardRevision,
+                    onSaveDateScoring: scoringDetail.supportsDateScoringEdits
+                        ? { edit in
+                            vm.saveOccasionDateScoringSettings(
+                                occasionId: occasionId,
+                                edit: edit
+                            )
+                        }
+                        : nil,
+                    onSaveObjectScoring: scoringDetail.supportsObjectScoringEdits
+                        ? { rules in
+                            vm.saveOccasionObjectScoringRules(
+                                occasionId: occasionId,
+                                rules: rules
+                            )
+                        }
+                        : nil
+                )
+            } else {
+                AITagScoringDetailPanel(
+                    detail: scoringDetail,
+                    editorRevision: vm.holidayScorecardRevision
+                )
             }
-            return (field, value)
         }
 
-        if !selections.isEmpty {
-            FlowLayout(spacing: 8, lineSpacing: 8) {
-                ForEach(selections, id: \.0.id) { field, value in
-                    selectedAttributeChip(field: field, value: value)
-                }
-            }
+        if let saveStatus = vm.aiTagScoringSaveStatus {
+            Text(saveStatus)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 16)
+                .padding(.top, 4)
         }
     }
 
-    private func selectedAttributeChip(field: EventAttributeField, value: String) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: field.iconName)
-                .font(.caption.weight(.medium))
-                .frame(width: 24, height: 24)
-                .background(Color.accentColor.opacity(0.15))
-                .clipShape(Circle())
-
-            Text(value)
-                .font(.subheadline)
-                .lineLimit(1)
+    @ViewBuilder
+    private var selectedAttributeChips: some View {
+        if !vm.event.libraryAttributeTags.isEmpty {
+            FlowLayout(spacing: 8, lineSpacing: 8) {
+                ForEach(vm.event.libraryAttributeTags) { tag in
+                    EventAttributeTagChip(
+                        tag: tag,
+                        showsCategoryIcon: true,
+                        showsScore: true,
+                        onConfirmAI: tag.isAIDerived
+                            ? { vm.confirmAIAttributeTag(tag) }
+                            : nil,
+                        onRemoveAI: tag.isAIDerived
+                            ? { vm.rejectAIAttributeTag(tag) }
+                            : nil,
+                        onShowScoreDetails: tag.isAIDerived
+                            ? { vm.showAITagScoringDetail(for: tag) }
+                            : nil,
+                        onTap: vm.isMilestonePersonPickerTag(tag) && !tag.isAIDerived
+                            ? {
+                                if let kind = MilestonePersonPickerKind.from(milestoneType: tag.tagValue) {
+                                    activeMilestonePersonPicker = kind
+                                }
+                            }
+                            : nil
+                    )
+                }
+            }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(Color(.secondarySystemBackground))
-        .clipShape(Capsule())
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(field.menuTitle): \(value)")
     }
 
     private var eventMetaSection: some View {
@@ -349,18 +429,24 @@ struct EventDetailView: View {
 
             if let suggestedName = vm.suggestedName,
                vm.showSuggestion {
-                HStack(alignment: .center, spacing: 12) {
-                    Text("Suggested: \(suggestedName)")
-                        .font(.subheadline)
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Suggested name")
+                        .font(.caption)
                         .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
 
-                    Button("Use suggestion") {
-                        vm.applySuggestedName()
+                    HStack(alignment: .center, spacing: 12) {
+                        Text(suggestedName)
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(.primary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                        Button("Use suggested name") {
+                            vm.applySuggestedName()
+                        }
+                        .font(.subheadline)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
                     }
-                    .font(.subheadline)
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
                 }
                 .padding(.vertical, 8)
                 .padding(.horizontal, 10)
@@ -482,6 +568,7 @@ struct EventDetailView: View {
                         cornerRadius: 0,
                         quality: .high
                     )
+                    .id(photo.id)
                     .aspectRatio(1, contentMode: .fill)
                     .clipped()
                 }
@@ -563,63 +650,13 @@ struct EventDetailView: View {
     }
 }
 
-private struct FlowLayout: Layout {
-    var spacing: CGFloat = 8
-    var lineSpacing: CGFloat = 8
-
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let maxWidth = proposal.width ?? .infinity
-        var x: CGFloat = 0
-        var y: CGFloat = 0
-        var lineHeight: CGFloat = 0
-
-        for subview in subviews {
-            let size = subview.sizeThatFits(.unspecified)
-
-            if x > 0, x + size.width > maxWidth {
-                x = 0
-                y += lineHeight + lineSpacing
-                lineHeight = 0
-            }
-
-            lineHeight = max(lineHeight, size.height)
-            x += size.width + spacing
-        }
-
-        return CGSize(width: maxWidth, height: y + lineHeight)
-    }
-
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        var x = bounds.minX
-        var y = bounds.minY
-        var lineHeight: CGFloat = 0
-
-        for subview in subviews {
-            let size = subview.sizeThatFits(.unspecified)
-
-            if x > bounds.minX, x + size.width > bounds.maxX {
-                x = bounds.minX
-                y += lineHeight + lineSpacing
-                lineHeight = 0
-            }
-
-            subview.place(
-                at: CGPoint(x: x, y: y),
-                proposal: ProposedViewSize(width: size.width, height: size.height)
-            )
-
-            x += size.width + spacing
-            lineHeight = max(lineHeight, size.height)
-        }
-    }
-}
-
 private struct EventAttributePickerSheet: View {
 
     @ObservedObject var viewModel: EventDetailViewModel
     @Binding var selectedField: EventAttributeField?
     let onDismiss: () -> Void
     let onAddCustom: (EventAttributeField) -> Void
+    let onMilestonePersonPickerRequested: (MilestonePersonPickerKind) -> Void
 
     var body: some View {
         NavigationStack {
@@ -648,7 +685,7 @@ private struct EventAttributePickerSheet: View {
     }
 
     private var attributeCategoryList: some View {
-        List(EventAttributeField.allCases) { field in
+        List(EventAttributeField.tagMenuCases) { field in
             Button {
                 if field == .tripType {
                     viewModel.setSelection("Trip", for: .tripType)
@@ -695,7 +732,12 @@ private struct EventAttributePickerSheet: View {
                     ForEach(viewModel.options(for: field), id: \.self) { option in
                         Button(option) {
                             viewModel.setSelection(option, for: field)
-                            onDismiss()
+                            if field == .milestoneType,
+                               let kind = MilestonePersonPickerKind.from(milestoneType: option) {
+                                onMilestonePersonPickerRequested(kind)
+                            } else {
+                                onDismiss()
+                            }
                         }
                     }
                 }
