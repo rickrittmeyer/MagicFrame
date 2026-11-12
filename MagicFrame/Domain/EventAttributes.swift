@@ -21,16 +21,40 @@ enum EventAttributeField: String, CaseIterable, Identifiable {
         .mainPerson,
     ]
 
-    /// Event columns mirrored into `event_tags` for library chips.
-    static let columnBackedTagFields: [EventAttributeField] = [
-        .eventType,
-        .activityType,
-        .tripType,
-        .milestoneType,
+    /// Categories selectable in Picture Search (tagCategory → tagValue).
+    static let pictureSearchCategoryCases: [EventAttributeField] = [
         .holidayType,
-        .mainPerson,
-        .secondaryMainPerson,
+        .milestoneType,
+        .activityType,
+        .eventType,
+        .tripType,
     ]
+
+    /// Infer category from a stored target value (legacy picture searches).
+    static func pictureSearchCategory(forTargetValue value: String) -> EventAttributeField {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if holidayType.builtInOptions.contains(where: {
+            $0.compare(trimmed, options: .caseInsensitive) == .orderedSame
+        }) {
+            return .holidayType
+        }
+        if milestoneType.builtInOptions.contains(where: {
+            $0.compare(trimmed, options: .caseInsensitive) == .orderedSame
+        }) {
+            return .milestoneType
+        }
+        if activityType.builtInOptions.contains(where: {
+            $0.compare(trimmed, options: .caseInsensitive) == .orderedSame
+        }) {
+            return .activityType
+        }
+        if eventType.builtInOptions.contains(where: {
+            $0.compare(trimmed, options: .caseInsensitive) == .orderedSame
+        }) {
+            return .eventType
+        }
+        return .milestoneType
+    }
 
     var menuTitle: String {
         switch self {
@@ -54,7 +78,8 @@ enum EventAttributeField: String, CaseIterable, Identifiable {
         }
     }
 
-    var sqlColumn: String {
+    /// Former `events` column name (archived as `X{name}` after tag cutover).
+    var legacyColumnName: String {
         switch self {
         case .eventType: return "eventType"
         case .activityType: return "activityType"
@@ -70,7 +95,17 @@ enum EventAttributeField: String, CaseIterable, Identifiable {
     var tagCategory: String {
         switch self {
         case .holidayType: return "holiday"
-        default: return sqlColumn
+        default: return legacyColumnName
+        }
+    }
+
+    /// `eventMainPerson` may hold multiple people (e.g. groom + bride). Other categories stay singular.
+    var allowsMultipleTagValues: Bool {
+        switch self {
+        case .mainPerson, .secondaryMainPerson:
+            return true
+        default:
+            return false
         }
     }
 
@@ -85,16 +120,25 @@ enum EventAttributeField: String, CaseIterable, Identifiable {
     ]
 
     static func fromTagCategory(_ category: String) -> EventAttributeField? {
-        if category == "holiday" {
+        let trimmed = category.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.compare("holiday", options: .caseInsensitive) == .orderedSame {
             return .holidayType
         }
-        if category == "eventMainPerson" {
+        if trimmed.compare("eventMainPerson", options: .caseInsensitive) == .orderedSame {
             return .mainPerson
         }
-        if category == "eventMainPerson2" {
+        if trimmed.compare("eventMainPerson2", options: .caseInsensitive) == .orderedSame {
             return .secondaryMainPerson
         }
-        return allCases.first { $0.tagCategory == category }
+        // Accept "MilestoneType" / "milestoneType" / menu titles, etc.
+        if let match = allCases.first(where: {
+            $0.tagCategory.compare(trimmed, options: .caseInsensitive) == .orderedSame
+                || $0.rawValue.compare(trimmed, options: .caseInsensitive) == .orderedSame
+                || $0.menuTitle.compare(trimmed, options: .caseInsensitive) == .orderedSame
+        }) {
+            return match
+        }
+        return nil
     }
 
     var customOptionsMetadataKey: String? {
@@ -132,7 +176,19 @@ enum EventAttributeField: String, CaseIterable, Identifiable {
         case .tripType:
             return []
         case .milestoneType:
-            return ["Birthday", "Wedding", "Anniversary", "Graduation", "Baptism"]
+            return [
+                "Birthday",
+                "Wedding",
+                "Anniversary",
+                "Graduation",
+                "Baptism",
+                "Senior Prom",
+                "Junior Prom",
+                "Engagement Party",
+                "Christening",
+                "Confirmation",
+                "Celebration of Life",
+            ]
         case .holidayType:
             return [
                 "Christmas",

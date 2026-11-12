@@ -8,8 +8,6 @@ protocol MagicFrameDatabase: AnyObject {
     func saveEventTuningSettings(_ settings: EventTuningSettings)
     func resetEventTuningSettings()
     func resetDatabaseForDevelopmentOnly()
-    func fetchEditableOccasions() -> [EditableOccasion]
-    func saveEditableOccasions(_ occasions: [EditableOccasion])
 
     // MARK: - Photos
 
@@ -28,9 +26,117 @@ protocol MagicFrameDatabase: AnyObject {
         isScreenshot: Bool,
         aspectRatio: Double,
         orientation: String,
-        qualityScore: Int
+        qualityScore: Int,
+        duration: Double?
     )
     func getRecentPhotos(limit: Int) -> [IndexedPhoto]
+    func fetchUnanalyzedPhotoIdsMatchingMonthDayRange(
+        start: String,
+        end: String
+    ) -> PhotoVisionTagMonthDaySelection
+    func scanPhotosWithVisionTags(
+        photoIds: [String],
+        progress: (@Sendable (Int, Int) -> Void)?
+    ) async -> PhotoVisionTagScanReport
+    /// Event-open full classify: skip `visionAnalyzed=1`, write `photo_object_tags`, rebuild `event_object_tags`.
+    func scanEventPhotosWithVisionTags(
+        eventId: Int,
+        includeHiddenPhotos: Bool,
+        progress: (@Sendable (Int, Int) -> Void)?
+    ) async -> PhotoVisionTagScanReport
+    func searchPhotosByVisionTag(_ query: String, limit: Int) -> [VisionTagPhotoMatch]
+    func searchPhotosByExactVisionTag(_ objectKey: String, limit: Int) -> [VisionTagPhotoMatch]
+    func fetchDistinctVisionTagNames() -> [VisionTagName]
+    func savePictureSearch(_ definition: PictureSearchDefinition) -> Int
+    func fetchPictureSearch(pictureSearchId: Int) -> PictureSearchDefinition?
+    func fetchAllPictureSearches() -> [PictureSearchDefinition]
+    func fetchFloatingHolidays() -> [FloatingHolidayDefinition]
+    func upsertFloatingHoliday(_ holiday: FloatingHolidayDefinition) -> Int
+    func fetchAllEnabledHolidays() -> [HolidayDefinition]
+    func upsertHoliday(_ holiday: HolidayDefinition) -> Int
+    func runPictureSearch(_ definition: PictureSearchDefinition) -> PictureSearchRunReport
+    func runPictureSearch(pictureSearchId: Int) -> PictureSearchRunReport?
+    func fetchLatestPictureSearchRun(pictureSearchId: Int) -> PictureSearchRunReport?
+    func ensureWeddingPictureSearch() -> PictureSearchDefinition
+    func runWeddingPictureSearch() -> (definition: PictureSearchDefinition, report: PictureSearchRunReport)
+    func ensureChristmasPictureSearch() -> PictureSearchDefinition
+    func runChristmasPictureSearch() -> (definition: PictureSearchDefinition, report: PictureSearchRunReport)
+    func ensureHolidayPictureSearch(tagValue: String) -> PictureSearchDefinition?
+    func runHolidayPictureSearch(
+        tagValue: String
+    ) -> (definition: PictureSearchDefinition, report: PictureSearchRunReport)?
+    func fetchUnanalyzedPhotoIdsMatchingDateSearch(
+        dateSearch: DateSearchDefinition,
+        floatingHoliday: FloatingHolidayDefinition?,
+        catalogHoliday: HolidayDefinition?
+    ) -> PhotoVisionTagMonthDaySelection
+    func prepareHolidayVisionTagsIfNeeded(
+        definition: PictureSearchDefinition,
+        visionDateSearch: DateSearchDefinition?,
+        catalogHoliday: HolidayDefinition?,
+        progress: (@Sendable (Int, Int) -> Void)?
+    ) async -> PhotoVisionTagScanReport?
+    func runHolidayPhotosPipeline(
+        tagValue: String,
+        status: (@Sendable (String) -> Void)?
+    ) async -> HolidayPhotosPipelineResult?
+    func runHolidayEventsPipeline(
+        tagValue: String,
+        status: (@Sendable (String) -> Void)?
+    ) async -> HolidayEventsPipelineResult?
+    func ensureMilestonePictureSearch(topicId: String) -> PictureSearchDefinition?
+    func runMilestonePictureSearch(
+        topicId: String
+    ) -> (definition: PictureSearchDefinition, report: PictureSearchRunReport)?
+    func runMilestonePhotosPipeline(
+        topicId: String,
+        status: (@Sendable (String) -> Void)?
+    ) async -> HolidayPhotosPipelineResult?
+    func runMilestoneEventsPipeline(
+        topicId: String,
+        status: (@Sendable (String) -> Void)?
+    ) async -> HolidayEventsPipelineResult?
+    func ensureOutingPictureSearch(topicId: String) -> PictureSearchDefinition?
+    func runOutingPictureSearch(
+        topicId: String
+    ) -> (definition: PictureSearchDefinition, report: PictureSearchRunReport)?
+    func runOutingPhotosPipeline(
+        topicId: String,
+        status: (@Sendable (String) -> Void)?
+    ) async -> HolidayPhotosPipelineResult?
+    func runOutingEventsPipeline(
+        topicId: String,
+        status: (@Sendable (String) -> Void)?
+    ) async -> HolidayEventsPipelineResult?
+    func ensurePersonBirthdayPictureSearch(
+        person: PeopleRepository.PersonBirthdayRecord
+    ) -> PictureSearchDefinition?
+    func runPersonBirthdayPictureSearch(
+        person: PeopleRepository.PersonBirthdayRecord
+    ) -> (definition: PictureSearchDefinition, report: PictureSearchRunReport)?
+    func fetchPersonBirthdayRecord(personId: Int) -> PeopleRepository.PersonBirthdayRecord?
+    func runPersonBirthdayPhotosPipeline(
+        personId: Int,
+        status: (@Sendable (String) -> Void)?
+    ) async -> HolidayPhotosPipelineResult?
+    func runPersonBirthdayEventsPipeline(
+        personId: Int,
+        status: (@Sendable (String) -> Void)?
+    ) async -> HolidayEventsPipelineResult?
+    func ensureEventScoreCardSettings(
+        for definition: PictureSearchDefinition,
+        personNamesById: [Int: String]
+    ) -> PictureSearchEventScoreCardSettings
+    @discardableResult
+    func saveEventScoreCardSettings(
+        _ settings: PictureSearchEventScoreCardSettings
+    ) -> PictureSearchEventScoreCardSettings
+    func checkPictureSearchEventTypes(
+        runReport: PictureSearchRunReport,
+        definition: PictureSearchDefinition,
+        scoreCard: PictureSearchEventScoreCardSettings,
+        progress: (@Sendable (Int, Int) -> Void)?
+    ) -> PictureSearchEventTypeCheckReport
     func christmasObjectKeysForVisionDebug() -> [String]
     func countPhotosMissingLocation() -> Int
     func countActivePhotos() -> Int
@@ -57,9 +163,10 @@ protocol MagicFrameDatabase: AnyObject {
 
     // MARK: - People
 
-    func importPeopleFromAlbums()
-    func rebuildEventPeople()
     func getAllPersonNames() -> [String]
+    func fetchAllPeople() -> [PeopleRepository.PersonRecord]
+    func fetchPeopleWithBirthDates() -> [PeopleRepository.PersonBirthdayRecord]
+    func fetchEventPeople(eventId: Int, includeChildEvents: Bool) -> [EventRepository.EventPersonRecord]
 
     // MARK: - Events
 
@@ -77,6 +184,8 @@ protocol MagicFrameDatabase: AnyObject {
     func getTripSections(for parentEventId: Int, includeHidden: Bool) -> [TripEventSection]
     func getPhotosForEvent(eventId: Int, includeHidden: Bool) -> [IndexedPhoto]
     func setEventShowOnFrame(eventId: Int, show: Bool)
+    func setEventFavorite(eventId: Int, isFavorite: Bool)
+    func listEventIdsWithOnFramePhotos(among eventIds: [Int]) -> Set<Int>
     func setEventUserHidden(eventId: Int, hidden: Bool)
     @discardableResult
     func updateEventName(eventId: Int, name: String, userEdited: Bool) -> Bool
@@ -86,39 +195,56 @@ protocol MagicFrameDatabase: AnyObject {
     func setPhotosHiddenInEvent(photoIds: [String], hidden: Bool)
     func setPhotosShowOnFrame(photoIds: [String], show: Bool)
     func setPhotoShowOnFrame(photoId: String, eventId: Int, show: Bool)
+    func fetchPhotosForBrowser(photoIds: [String]) -> [(photo: IndexedPhoto, mediaType: Int)]
+    func fetchAllPhotosForBrowser() -> [(photo: IndexedPhoto, mediaType: Int, indexedAt: String)]
+    func fetchPhotosForBrowserYear(_ year: Int) -> [(photo: IndexedPhoto, mediaType: Int, indexedAt: String)]
+    func fetchDistinctPhotoYearsForBrowser() -> [Int]
+    func countActivePhotosForBrowser() -> Int
+    func setPhotosFavorite(photoIds: [String], isFavorite: Bool)
+    func persistPhotoOnFrameChanges(
+        defaultEventId: Int,
+        writes: [(photoId: String, show: Bool)],
+        similarGroupPicks: [(groupPhotoIds: [String], pickedPhotoIds: [String])],
+        clearCropFocusPhotoIds: [String]
+    )
     func getEventIdForPhoto(photoId: String) -> Int?
     func getEventAttributeOptions(for field: EventAttributeField) -> [String]
     func addCustomEventAttributeOption(_ value: String, for field: EventAttributeField)
     func updateEventAttribute(eventId: Int, field: EventAttributeField, value: String?)
+    func replaceUserEventMainPeople(eventId: Int, names: [String])
     func updateWeddingDate(eventId: Int, weddingDate: String?)
+    func updateWeddingCoverPhotoForEvent(eventId: Int)
     func propagateAnniversaryTagsFromWedding(
         sourceEventId: Int,
         person1: String,
         person2: String,
         weddingDateISO: String
     ) -> Int
-    func fetchAITagScoringDetail(
-        eventId: Int,
-        field: EventAttributeField,
-        includesDescendantPhotos: Bool
-    ) -> AITagScoringDetail?
-    func fetchHolidayScorecards(
-        eventId: Int,
-        includesDescendantPhotos: Bool
-    ) -> [AITagScoringDetail]
-    func updateOccasionDateScoringSettings(
-        occasionId: Int,
-        edit: OccasionDateScoringEdit
-    )
-    func fetchObjectScoringRules(occasionId: Int) -> [EditableObjectScoringRule]
-    @discardableResult
-    func saveObjectScoringRules(occasionId: Int, rules: [EditableObjectScoringRule]) -> Int
-    func scoreHolidayEvent(eventId: Int)
     func runEventObjectRecognitionIfNeeded(
         eventId: Int,
         includeHiddenPhotos: Bool,
         progress: (@Sendable (EventObjectRecognitionProgress) -> Void)?
     ) async -> EventObjectRecognitionResult
+    func enqueueFaceRecognitionForPhotoIds(_ photoIds: [String]) -> VisionJobEnqueueSummary
+    func enqueueFaceRecognitionForEvent(
+        eventId: Int,
+        includeHidden: Bool
+    ) -> VisionJobEnqueueSummary
+    func fetchFaceAnnotations(forPhotoId photoId: String) -> [PhotoFaceAnnotation]
+    func ensurePhotoFaceScanned(photoId: String) async -> [PhotoFaceAnnotation]
+    func nameFaceInstance(
+        faceInstanceId: Int,
+        displayName: String,
+        firstName: String?,
+        lastName: String?,
+        maidenName: String?
+    ) -> Int
+    /// Copy a newly named face onto matching faces in sibling similar-stack photos.
+    @discardableResult
+    func propagateNamedFaceToSimilarPhotos(
+        sourceFaceInstanceId: Int,
+        siblingPhotoIds: [String]
+    ) async -> Int
     func enqueueEventObjectRecognitionJobs(
         eventId: Int,
         includeHiddenPhotos: Bool,
@@ -144,61 +270,46 @@ protocol MagicFrameDatabase: AnyObject {
         includeHiddenPhotos: Bool,
         priority: Int
     ) -> VisionJobRescanEnqueueResult
+    func holidayVisionLandingConfig(tagValue: String) -> HolidayVisionLandingConfig?
+    func fetchAllHolidayVisionLandingConfigs() -> [HolidayVisionLandingConfig]
     func confirmAIAttributeTag(eventId: Int, field: EventAttributeField)
     func rejectAIAttributeTag(eventId: Int, field: EventAttributeField)
+    func removeEventAttributeTag(eventId: Int, tag: EventAttributeTag)
     func confirmAIHolidayTag(eventId: Int)
     func rejectAIHolidayTag(eventId: Int)
-    func fetchOccasionLandingItems() -> [OccasionLandingItem]
-    func fetchOccasionLandingCatalogItems() -> [OccasionLandingItem]
-    func applyCachedOccasionLandingMetrics(
-        to items: [OccasionLandingItem]
-    ) -> (items: [OccasionLandingItem], staleTagValues: [String])
-    func countOccasionLandingItemMetrics(
-        occasionKey: String,
-        tagValue: String,
-        occasionType: String,
-        displayName: String
-    ) -> (collections: Int, onFramePhotos: Int)
-    func countOccasionLandingMetricsBatch(
-        requests: [OccasionLandingMetricsRequest]
-    ) -> [String: (collections: Int, onFramePhotos: Int)]
-    func fetchOccasionFrameLandingSnapshot(
-        occasionKey: String,
-        tagValue: String,
-        name: String,
-        nextOccurrence: Date,
-        occasionType: String
-    ) -> OccasionFrameLandingSnapshot
-    func fetchAllPeople() -> [PeopleRepository.PersonRecord]
-    func fetchPeopleWithBirthDates() -> [PeopleRepository.PersonBirthdayRecord]
-    func fetchEventPeople(eventId: Int, includeChildEvents: Bool) -> [EventRepository.EventPersonRecord]
-
-    // MARK: - Photo ↔ occasion (per-occasion on-frame)
-
-    func linkPhotoToOccasion(
-        photoId: String,
-        occasionKey: String,
-        source: PhotoOccasionSource,
-        personId: Int?,
-        isOnFrame: Bool
+    func fetchSimilarEventAlternatives(
+        tagCategory: String,
+        tagValue: String
+    ) -> [SimilarEventTagAlternative]
+    func applySimilarEventUserTag(
+        eventId: Int,
+        tagCategory: String,
+        tagValue: String
     )
-    func setPhotoOccasionOnFrame(photoId: String, occasionKey: String, isOnFrame: Bool)
-    func setPhotosOccasionOnFrame(photoIds: [String], occasionKey: String, isOnFrame: Bool)
-    func fetchOnFramePhotoIds(occasionKey: String) -> [String]
-    func countOnFramePhotos(occasionKey: String) -> Int
-    func fetchPhotoOccasions(photoId: String) -> [PhotoOccasionLink]
-    func saveOccasionSubjects(
-        occasionKey: String,
-        subjects: [(personId: Int, role: OccasionSubjectRole)]
-    )
-    func fetchOccasionSubjects(occasionKey: String) -> [OccasionSubject]
-    func searchPhotosWithPeople(
-        requiredPersonId: Int,
-        includingAnyOfPersonIds childPersonIds: [Int],
-        exactPeopleOnly: Bool
-    ) -> [String]
-    func searchPhotosWithPerson(personId: Int, exactPeopleOnly: Bool) -> [String]
-    func fetchOccasionPersonId(occasionKey: String) -> Int?
+    func fetchEventNameTemplate(
+        tagCategory: String,
+        tagValue: String
+    ) -> EventNameTemplate?
+    func fetchAllEventNameTemplates() -> [EventNameTemplate]
+    func upsertEventNameTemplate(
+        tagCategory: String,
+        tagValue: String,
+        nameTemplate: String,
+        personCount: Int
+    ) -> EventNameTemplate?
+    func fetchAllSimilarEventTags() -> [SimilarEventTagAlternative]
+    @discardableResult
+    func insertSimilarEventTag(
+        tagCategory: String,
+        tagValue: String,
+        possibleTagCategory: String,
+        possibleTagValue: String,
+        possibleNumberOfEventMainPeople: Int
+    ) -> SimilarEventTagAlternative?
+
+    // MARK: - Holidays landing
+
+    func fetchHolidayLandingCatalogItems() -> [HolidayLandingItem]
 
     // MARK: - Event pipeline
 
@@ -211,8 +322,49 @@ protocol MagicFrameDatabase: AnyObject {
     func finishEventSyncMaintenance()
     func prepareEventRebuild() -> Int
     func finishEventRebuild()
+    func relinkEventLocationsFromPhotos()
     func updateAllEventCoverPhotos()
     func restoreDeletedTripContainersOnQueue()
+
+    // MARK: - Stadiums / game scores
+
+    func fetchAllStadiums() -> [Stadium]
+    func fetchStadium(stadiumId: Int) -> Stadium?
+    @discardableResult
+    func upsertStadium(
+        stadiumId: Int?,
+        name: String,
+        city: String?,
+        state: String?,
+        latitude: Double?,
+        longitude: Double?
+    ) -> Int?
+    func deleteStadium(stadiumId: Int)
+    func addStadiumAlias(stadiumId: Int, alias: String)
+    func deleteStadiumAlias(stadiumId: Int, alias: String)
+    @discardableResult
+    func upsertStadiumTeam(
+        stadiumTeamId: Int?,
+        stadiumId: Int,
+        league: SportsLeague,
+        teamName: String,
+        displayName: String?,
+        teamAbbreviation: String?,
+        isPrimaryHome: Bool
+    ) -> Int?
+    func deleteStadiumTeam(stadiumTeamId: Int)
+    func fetchEventGameResult(eventId: Int) -> EventGameResult?
+    func fetchEventGameResults(eventIds: [Int]) -> [Int: EventGameResult]
+    func saveEventGameResult(_ result: EventGameResult)
+    func clearEventGameResult(eventId: Int)
+    func lookupSportsGameCandidates(
+        eventDateISO: String,
+        placeName: String?,
+        city: String?,
+        state: String?,
+        latitude: Double?,
+        longitude: Double?
+    ) async throws -> (stadiums: [Stadium], candidates: [SportsGameCandidate])
 
     // MARK: - Locations
 
@@ -222,6 +374,9 @@ protocol MagicFrameDatabase: AnyObject {
     func getLocationTypeOptions() -> [String]
     func locationsNeedingGeocodeCount() -> Int
     func startGeocodingEventLocations(limit: Int?)
+    /// Ensures the event has a location row and reverse-geocodes it when incomplete.
+    /// Returns `true` when location fields were newly filled (caller should refresh the event).
+    func ensureEventLocationGeocoded(eventId: Int) async -> Bool
     func stopGeocoding()
     func updateLocationType(locationId: Int, locationType: String?)
     func setLocationFavorite(locationId: Int, isFavorite: Bool)

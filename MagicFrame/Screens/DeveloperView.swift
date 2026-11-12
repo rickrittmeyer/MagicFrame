@@ -10,9 +10,22 @@ struct DeveloperView: View {
     @ObservedObject var vm: LibraryViewModel
     @State private var isConfirmingRebuild = false
     @State private var visionResetHolidays: [HolidayVisionLandingConfig] = []
+    @State private var visionTagRangeStart = "12/1"
+    @State private var visionTagRangeEnd = "12/31"
+    @State private var isPreparingDatabaseExport = false
+    @State private var databaseExportURL: URL?
+    @State private var showDatabaseExportShare = false
 
     var body: some View {
-        List {
+        VStack(spacing: 0) {
+            Text(vm.statusText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 8)
+
+            List {
             Section("Library") {
                 Button("Index Photos") {
                     Task {
@@ -31,6 +44,33 @@ struct DeveloperView: View {
                 }
                 .disabled(vm.isSyncingEvents || vm.isIndexingPhotos)
 
+                Button {
+                    Task {
+                        isPreparingDatabaseExport = true
+                        defer { isPreparingDatabaseExport = false }
+                        if let url = await vm.exportDatabaseForSharing() {
+                            databaseExportURL = url
+                            showDatabaseExportShare = true
+                        }
+                    }
+                } label: {
+                    if isPreparingDatabaseExport {
+                        HStack {
+                            ProgressView()
+                            Text("Preparing Export…")
+                        }
+                    } else {
+                        Text("Export Database")
+                    }
+                }
+                .disabled(isPreparingDatabaseExport || vm.isIndexingPhotos || vm.isSyncingEvents)
+
+                Text(
+                    "Creates a consistent MagicFrame-*.sqlite snapshot and opens Share. AirDrop to your Mac (works over wireless), then save to Desktop."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
                 Button("Build Covers") {
                     vm.buildCoversTapped()
                 }
@@ -43,6 +83,17 @@ struct DeveloperView: View {
                     vm.deduplicateLocationsTapped()
                 }
                 .disabled(vm.isMaintainingEvents || vm.isSyncingEvents)
+
+                Button("Relink Event Locations") {
+                    vm.relinkEventLocationsTapped()
+                }
+                .disabled(vm.isMaintainingEvents || vm.isSyncingEvents)
+
+                Text(
+                    "Assigns locationId from GPS photos without rebuilding events. Then run Geocode Recent Locations so city/state names fill in."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
                 Button("Stop Background Work", role: .destructive) {
                     vm.stopAllBackgroundWork()
@@ -83,18 +134,84 @@ struct DeveloperView: View {
                 .foregroundStyle(.secondary)
             }
 
-            Section("Occasion scoring (holidays)") {
-                NavigationLink("Edit occasions") {
-                    OccasionsDeveloperView()
+            Section("Face recognition") {
+                NavigationLink("People (rebuild / name / merge)") {
+                    PeopleLandingView(vm: vm)
                 }
 
-                Button("Score Holiday Occasions (all events)") {
-                    vm.scoreHolidayOccasionsTapped()
+                NavigationLink("Picture Search (face-detect flag)") {
+                    IdentifyEventTypesView()
                 }
-                .disabled(vm.isMaintainingEvents || vm.isSyncingEvents)
 
+                Text(
+                    "Face detect+embed is seeded from Picture Search results (when “Detect faces on search results” is on) and when opening events. Rebuild clusters and name/merge on the People page."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            Section("Vision tags") {
+                HStack {
+                    TextField("12/1", text: $visionTagRangeStart)
+                        .keyboardType(.numbersAndPunctuation)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Text("–")
+                        .foregroundStyle(.secondary)
+                    TextField("12/31", text: $visionTagRangeEnd)
+                        .keyboardType(.numbersAndPunctuation)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                }
+
+                Button("Tag Photos with Vision Tag") {
+                    vm.tagPhotosWithVisionTagTapped(
+                        startMonthDay: visionTagRangeStart,
+                        endMonthDay: visionTagRangeEnd
+                    )
+                }
+                .disabled(vm.isMaintainingEvents || vm.isSyncingEvents || vm.isIndexingPhotos)
+
+                NavigationLink("Search Vision Tag") {
+                    VisionTagSearchResultsView()
+                }
+
+                NavigationLink("Picture Search") {
+                    IdentifyEventTypesView()
+                }
+
+                NavigationLink("Event Tag Rules") {
+                    EventTagRulesDeveloperView()
+                }
+
+                Text(
+                    "Queries indexed photos in that month-day range for every year (e.g. 8/1–8/31 → all Augusts), newest first. Runs Apple Vision scene labels (not faces), writes every label to photo_object_tags, and sets photos.visionAnalyzed. Already analyzed photos are skipped. Stop Background Work cancels."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                Text(
+                    "Search Vision Tag type-ahead uses stored Vision labels. Pick a tag to see matching photos in a grid."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                Text(
+                    "Picture Search saves a named search (tags, date, location, people) and runs it against indexed photos. Matching pictures show in a grid; candidate event IDs are collected for later likely-event scoring."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                Text(
+                    "Event Tag Rules edits similar_event_tags (remove-AI alternatives) and event_name_templates (suggested names)."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            Section("Holiday Vision") {
                 if visionResetHolidays.isEmpty {
-                    Text("No holidays with object scoring rules yet.")
+                    Text("No holidays with Vision object keys configured.")
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(visionResetHolidays, id: \.tagValue) { holiday in
@@ -110,38 +227,13 @@ struct DeveloperView: View {
                     }
                 }
 
-                Button("Show Occasion Scoring Counts") {
-                    vm.showOccasionScoringCountsTapped()
-                }
-
-                Button("Show Top 25 Holiday Scores") {
-                    vm.showTopHolidayOccasionScoresTapped()
-                }
-
                 NavigationLink("Vision label inspector") {
                     VisionClassificationDebugView(vm: vm)
                 }
 
                 Text(
-                    "Edit date windows per occasion (e.g. Christmas ±10 days). Then re-score. Trip parents and day events are both included."
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-                Text(
-                    "Reset clears scan completion, per-photo scan records, and object detections for holiday-tagged events, then re-scores tags — without running Vision. Works for holidays with object scoring rules (Christmas, Halloween, …). Expand a year in that holiday collection to trigger landing scans."
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-                Text(
-                    "Re-scan Christmas clears object-scan completion on every Holiday: Christmas event, runs Vision on all photos, re-scores, and reports elapsed seconds. Use after changing Christmas object rules or thresholds."
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-                Text(
-                    "Vision label inspector logs the top Apple Vision classifications for a photo to the Xcode console and shows which Christmas object rules would match."
+                    "Reset clears scan completion and object detections for holiday-tagged events without running Vision. "
+                        + "Re-scan runs Vision on tagged events. Expand a year in a holiday collection to trigger landing scans."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -204,6 +296,7 @@ struct DeveloperView: View {
                     vm.statusText = "Dev reset complete"
                 }
             }
+            }
         }
         .navigationTitle("Developer")
         .navigationBarTitleDisplayMode(.inline)
@@ -222,210 +315,16 @@ struct DeveloperView: View {
         } message: {
             Text("Re-groups all photos using current home and trip rules. Location nicknames and home dates are kept. Custom event names will be lost.")
         }
-    }
-}
-
-private struct OccasionsDeveloperView: View {
-
-    @State private var occasions: [EditableOccasion] = []
-    @State private var objectRulesByOccasionId: [Int: [EditableObjectScoringRule]] = [:]
-    @State private var statusMessage: String?
-
-    var body: some View {
-        Form {
-            Section {
-                Text(
-                    "Date scoring uses each occasion’s anchor day from occasion_dates, "
-                    + "plus days before/after. Christmas can instead start N days after US Thanksgiving and end N days after Christmas. Re-run holiday scoring after saving."
-                )
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+        .sheet(isPresented: $showDatabaseExportShare, onDismiss: {
+            if let databaseExportURL {
+                try? FileManager.default.removeItem(at: databaseExportURL)
             }
-
-            if occasions.isEmpty {
-                Section {
-                    Text("No occasions in the database.")
-                        .foregroundStyle(.secondary)
-                }
-            } else {
-                ForEach($occasions) { $occasion in
-                    Section(occasion.occasionKey) {
-                        TextField("Display name", text: $occasion.name)
-
-                        Text(occasion.occasionType)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-
-                        if occasion.occasionKey == "christmas" {
-                            Toggle(
-                                "Window starts after Thanksgiving",
-                                isOn: $occasion.usesThanksgivingRelativeStart
-                            )
-
-                            if occasion.usesThanksgivingRelativeStart {
-                                Stepper(
-                                    "Days after Thanksgiving: \(occasion.windowDaysAfterThanksgiving)",
-                                    value: $occasion.windowDaysAfterThanksgiving,
-                                    in: 0...30
-                                )
-                                Stepper(
-                                    "Days after Christmas (end): \(occasion.windowDaysAfter)",
-                                    value: $occasion.windowDaysAfter,
-                                    in: 0...60
-                                )
-                            } else {
-                                Stepper(
-                                    "Days before anchor: \(occasion.windowDaysBefore)",
-                                    value: $occasion.windowDaysBefore,
-                                    in: 0...60
-                                )
-                                Stepper(
-                                    "Days after anchor: \(occasion.windowDaysAfter)",
-                                    value: $occasion.windowDaysAfter,
-                                    in: 0...60
-                                )
-                            }
-                        } else {
-                            Stepper(
-                                "Days before: \(occasion.windowDaysBefore)",
-                                value: $occasion.windowDaysBefore,
-                                in: 0...60
-                            )
-                            Stepper(
-                                "Days after: \(occasion.windowDaysAfter)",
-                                value: $occasion.windowDaysAfter,
-                                in: 0...60
-                            )
-                        }
-
-                        VStack(alignment: .leading, spacing: 4) {
-                            TextField(
-                                "Weekend boost (0–0.5)",
-                                value: $occasion.weekendBoost,
-                                format: .number.precision(.fractionLength(2))
-                            )
-                            .keyboardType(.decimalPad)
-                            Text("Fri / Sat / Sun in the event date range adds this to total score.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-
-                        Toggle("Enabled", isOn: $occasion.isEnabled)
-
-                        if occasion.occasionType == "holiday" {
-                            Divider()
-
-                            Text("Object scoring")
-                                .font(.caption.weight(.semibold))
-
-                            OccasionObjectRulesEditor(
-                                occasionId: occasion.id,
-                                rules: bindingForObjectRules(occasionId: occasion.id),
-                                onSave: { rules in
-                                    objectRulesByOccasionId[occasion.id] = rules
-                                    saveObjectRules(for: occasion.id)
-                                }
-                            )
-                        }
-                    }
-                }
-            }
-
-            if let statusMessage {
-                Section {
-                    Text(statusMessage)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            Section {
-                Button("Save") {
-                    AppDependencies.database.saveEditableOccasions(occasions)
-                    statusMessage = "Saved. Run Score Holiday Occasions to apply new windows."
-                    reload()
-                }
-
-                Button("Reload") {
-                    reload()
-                    statusMessage = "Reloaded from database."
-                }
-
-                Button("Apply Christmas defaults (−35 / +10 days)") {
-                    applyChristmasAnchorRelativeDefaults()
-                }
-
-                Button("Apply Thanksgiving-relative Christmas window") {
-                    applyChristmasThanksgivingDefaults()
-                }
+            databaseExportURL = nil
+        }) {
+            if let databaseExportURL {
+                ActivityShareSheet(items: [databaseExportURL])
             }
         }
-        .navigationTitle("Occasions")
-        .navigationBarTitleDisplayMode(.inline)
-        .onAppear {
-            reload()
-        }
-    }
-
-    private func reload() {
-        occasions = AppDependencies.database.fetchEditableOccasions()
-        var objectRules: [Int: [EditableObjectScoringRule]] = [:]
-        for occasion in occasions where occasion.occasionType == "holiday" {
-            objectRules[occasion.id] = AppDependencies.database.fetchObjectScoringRules(
-                occasionId: occasion.id
-            )
-        }
-        objectRulesByOccasionId = objectRules
-    }
-
-    private func bindingForObjectRules(occasionId: Int) -> Binding<[EditableObjectScoringRule]> {
-        Binding(
-            get: { objectRulesByOccasionId[occasionId] ?? [] },
-            set: { objectRulesByOccasionId[occasionId] = $0 }
-        )
-    }
-
-    private func saveObjectRules(for occasionId: Int) {
-        let rules = objectRulesByOccasionId[occasionId] ?? []
-        let candidateCount = AppDependencies.database.saveObjectScoringRules(
-            occasionId: occasionId,
-            rules: rules
-        )
-        if candidateCount > 0 {
-            statusMessage =
-                "Saved object rules. \(candidateCount) candidate "
-                + "\(candidateCount == 1 ? "event" : "events") will re-scan on next open."
-        } else {
-            statusMessage = "Saved object rules for occasion \(occasionId)."
-        }
-        reload()
-    }
-
-    private func applyChristmasAnchorRelativeDefaults() {
-        guard let index = occasions.firstIndex(where: { $0.occasionKey == "christmas" }) else {
-            statusMessage = "No christmas occasion row found."
-            return
-        }
-        occasions[index].usesThanksgivingRelativeStart = false
-        occasions[index].windowDaysBefore = OccasionRepository.christmasWindowDaysBefore
-        occasions[index].windowDaysAfter = OccasionRepository.christmasWindowDaysAfter
-        occasions[index].windowDaysAfterThanksgiving = OccasionRepository.christmasDefaultDaysAfterThanksgiving
-        occasions[index].weekendBoost = OccasionRepository.defaultHolidayWeekendBoost
-        statusMessage = "Christmas set to −35 / +10 days and 0.10 weekend boost. Tap Save to persist."
-    }
-
-    private func applyChristmasThanksgivingDefaults() {
-        guard let index = occasions.firstIndex(where: { $0.occasionKey == "christmas" }) else {
-            statusMessage = "No christmas occasion row found."
-            return
-        }
-        occasions[index].usesThanksgivingRelativeStart = true
-        occasions[index].windowDaysAfterThanksgiving = OccasionRepository.christmasDefaultDaysAfterThanksgiving
-        occasions[index].windowDaysAfter = OccasionRepository.christmasWindowDaysAfter
-        occasions[index].weekendBoost = OccasionRepository.defaultHolidayWeekendBoost
-        statusMessage =
-            "Christmas set to Thanksgiving +\(OccasionRepository.christmasDefaultDaysAfterThanksgiving) "
-            + "/ Christmas +\(OccasionRepository.christmasWindowDaysAfter) days. Tap Save to persist."
     }
 }
 
@@ -470,27 +369,6 @@ private struct EventTuningDeveloperView: View {
                 )
             }
 
-            Section("Holiday AI tags") {
-                tuningField(
-                    "Pre-object min total score",
-                    value: $settings.holidayTagPreObjectMinTotalScore,
-                    hint: "Before object recognition on the event"
-                )
-                tuningField(
-                    "Post-object min total score",
-                    value: $settings.holidayTagPostObjectMinTotalScore,
-                    hint: "After object scan; requires scorable object detections"
-                )
-                Text(
-                    "Pre-object (metadata/date): total ≥ \(String(format: "%.2f", settings.holidayTagPreObjectMinTotalScore)), "
-                        + "confidence ≥ \(settings.holidayTagPreObjectMinConfidence). "
-                        + "Post-object: scan must find objects, then total ≥ \(String(format: "%.2f", settings.holidayTagPostObjectMinTotalScore)), "
-                        + "confidence ≥ \(settings.holidayTagPostObjectMinConfidence). "
-                        + "No objects after scan removes the AI tag. Re-run Score Holiday Occasions after changing."
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
 
             Section("No-GPS attachment (Phase B)") {
                 tuningField(

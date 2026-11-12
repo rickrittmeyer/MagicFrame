@@ -4,8 +4,9 @@ protocol EventRepositoryProtocol: AnyObject {
     func updateCoverPhotoForEvent(eventId: Int)
     func updateAllEventCoverPhotos()
     func backfillEventAssignedAt()
-    func rebuildEventPeople()
     func setEventShowOnFrame(eventId: Int, show: Bool)
+    func setEventFavorite(eventId: Int, isFavorite: Bool)
+    func listEventIdsWithOnFramePhotos(among eventIds: [Int]) -> Set<Int>
     func setEventUserHidden(eventId: Int, hidden: Bool)
     func getEventAttributeOptions(for field: EventAttributeField) -> [String]
     func addCustomEventAttributeOption(_ value: String, for field: EventAttributeField)

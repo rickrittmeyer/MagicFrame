@@ -22,6 +22,10 @@ final class VisionJobRepository {
         dedupeKey: String,
         createdAt: String
     ) -> Bool {
+        // Finished rows with the same dedupeKey permanently block INSERT OR IGNORE —
+        // clear them so force-rescan / repaired version stamps can queue work again.
+        deleteFinishedJobsWithDedupeKeyUnsafe(dedupeKey: dedupeKey)
+
         let payloadJSON = encodePayload(payload)
         let sql = """
         INSERT OR IGNORE INTO vision_jobs (
@@ -48,6 +52,19 @@ final class VisionJobRepository {
 
         guard sqlite3_step(statement) == SQLITE_DONE else { return false }
         return sqlite3_changes(db) > 0
+    }
+
+    func deleteFinishedJobsWithDedupeKeyUnsafe(dedupeKey: String) {
+        let sql = """
+        DELETE FROM vision_jobs
+        WHERE dedupeKey = ?
+          AND status IN ('completed', 'cancelled', 'failed');
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, (dedupeKey as NSString).utf8String, -1, nil)
+        sqlite3_step(statement)
     }
 
     func claimPendingJobsUnsafe(limit: Int, algorithmVersion: Int) -> [VisionJob] {
@@ -164,6 +181,15 @@ final class VisionJobRepository {
         for (index, eventId) in eventIds.enumerated() {
             sqlite3_bind_int(statement, Int32(index + 1), Int32(eventId))
         }
+        sqlite3_step(statement)
+    }
+
+    func purgeJobsOfTypeUnsafe(jobType: VisionJobType) {
+        let sql = "DELETE FROM vision_jobs WHERE jobType = ?;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, (jobType.rawValue as NSString).utf8String, -1, nil)
         sqlite3_step(statement)
     }
 

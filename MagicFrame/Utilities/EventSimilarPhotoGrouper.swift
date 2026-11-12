@@ -94,7 +94,7 @@ enum EventSimilarPhotoGrouper {
 
         for photo in photos.dropFirst() {
             if let previous = currentMembers.last,
-               areSimilar(previous, photo) {
+               areSimilarByMetadata(previous, photo) {
                 currentMembers.append(photo)
             } else {
                 groups.append(makeGroup(from: currentMembers))
@@ -107,7 +107,31 @@ enum EventSimilarPhotoGrouper {
     }
 
     static func displayItems(from photos: [IndexedPhoto]) -> [EventPhotoDisplayItem] {
-        group(photos).map { group in
+        displayItems(fromGroups: group(photos))
+    }
+
+    /// Metadata burst groups, then split members that are not visually alike (Vision feature print).
+    /// Fixes imported libraries where many unrelated photos share the same timestamp.
+    static func refinedDisplayItems(from photos: [IndexedPhoto]) async -> [EventPhotoDisplayItem] {
+        let metadataGroups = group(photos)
+        var refined: [SimilarPhotoGroup] = []
+        refined.reserveCapacity(metadataGroups.count)
+
+        for metadataGroup in metadataGroups {
+            if Task.isCancelled { break }
+            if !metadataGroup.isStack {
+                refined.append(metadataGroup)
+                continue
+            }
+            let split = await splitByVisualSimilarity(metadataGroup.photos)
+            refined.append(contentsOf: split)
+        }
+
+        return displayItems(fromGroups: refined)
+    }
+
+    private static func displayItems(fromGroups groups: [SimilarPhotoGroup]) -> [EventPhotoDisplayItem] {
+        groups.map { group in
             let picks = group.pickedPhotoIds(from: group.photos)
             return EventPhotoDisplayItem(
                 group: group,
@@ -116,12 +140,42 @@ enum EventSimilarPhotoGrouper {
         }
     }
 
+    /// Walk a metadata-similar run and break wherever consecutive frames look different.
+    private static func splitByVisualSimilarity(_ photos: [IndexedPhoto]) async -> [SimilarPhotoGroup] {
+        guard let first = photos.first else { return [] }
+        guard photos.count > 1 else { return [makeGroup(from: photos)] }
+
+        var groups: [SimilarPhotoGroup] = []
+        var currentMembers: [IndexedPhoto] = [first]
+
+        for photo in photos.dropFirst() {
+            if Task.isCancelled {
+                groups.append(makeGroup(from: currentMembers))
+                return groups
+            }
+            let previous = currentMembers[currentMembers.count - 1]
+            let visuallyAlike = await PhotoVisualSimilarity.areVisuallySimilar(
+                photoIdA: previous.id,
+                photoIdB: photo.id
+            )
+            if visuallyAlike {
+                currentMembers.append(photo)
+            } else {
+                groups.append(makeGroup(from: currentMembers))
+                currentMembers = [photo]
+            }
+        }
+
+        groups.append(makeGroup(from: currentMembers))
+        return groups
+    }
+
     private static func makeGroup(from photos: [IndexedPhoto]) -> SimilarPhotoGroup {
         let leaderId = photos[0].id
         return SimilarPhotoGroup(id: leaderId, photos: photos)
     }
 
-    private static func areSimilar(_ left: IndexedPhoto, _ right: IndexedPhoto) -> Bool {
+    private static func areSimilarByMetadata(_ left: IndexedPhoto, _ right: IndexedPhoto) -> Bool {
         guard left.orientation == right.orientation else { return false }
 
         if abs(left.aspectRatio - right.aspectRatio) > aspectRatioTolerance {

@@ -4,6 +4,7 @@ import CoreLocation
 import MapKit
 
 @MainActor
+@available(iOS 26.0, *)
 final class HomeOnboardingViewModel: NSObject, ObservableObject, CLLocationManagerDelegate {
 
     @Published var addressQuery = ""

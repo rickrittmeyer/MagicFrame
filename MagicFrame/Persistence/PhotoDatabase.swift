@@ -24,9 +24,7 @@ final class PhotoDatabase: @unchecked Sendable {
     private var appMetadata: AppMetadataStore { container.metadata }
     private var photoRepository: PhotoRepository { container.photos }
     private var peopleRepository: PeopleRepository { container.people }
-    private var peopleImportService: PeopleImportService { container.peopleImport }
     private var eventRepository: EventRepository { container.events }
-    private var occasionRepository: OccasionRepository { container.occasions }
     private var locationRepository: LocationRepository { container.locations }
     private var geocodePendingQueue: LocationGeocodePendingQueue { container.geocodePendingQueue }
     private var eventLocationCoordinator: EventLocationCoordinator { container.eventLocations }
@@ -106,7 +104,8 @@ final class PhotoDatabase: @unchecked Sendable {
         isScreenshot: Bool,
         aspectRatio: Double,
         orientation: String,
-        qualityScore: Int
+        qualityScore: Int,
+        duration: Double?
     ) {
         photoRepository.upsertPhoto(
             id: id,
@@ -123,7 +122,8 @@ final class PhotoDatabase: @unchecked Sendable {
             isScreenshot: isScreenshot,
             aspectRatio: aspectRatio,
             orientation: orientation,
-            qualityScore: qualityScore
+            qualityScore: qualityScore,
+            duration: duration
         )
     }
 
@@ -133,17 +133,748 @@ final class PhotoDatabase: @unchecked Sendable {
 
     
     func christmasObjectKeysForVisionDebug() -> [String] {
-        dbQueue.sync {
-            guard let occasionId = occasionRepository.fetchOccasionIdForKeyUnsafe(occasionKey: "christmas") else {
-                return []
-            }
-            return occasionRepository.fetchObjectScoringRulesUnsafe(occasionId: occasionId)
-                .map(\.objectKey)
-        }
+        ObjectDetectionCategory.christmas.objectKeys
     }
 
     func getRecentPhotos(limit: Int = 100) -> [IndexedPhoto] {
         photoRepository.getRecentPhotos(limit: limit)
+    }
+
+    func fetchUnanalyzedPhotoIdsMatchingMonthDayRange(
+        start: String,
+        end: String
+    ) -> PhotoVisionTagMonthDaySelection {
+        photoRepository.fetchUnanalyzedPhotoIdsMatchingMonthDayRange(start: start, end: end)
+    }
+
+    func scanPhotosWithVisionTags(
+        photoIds: [String],
+        progress: (@Sendable (Int, Int) -> Void)? = nil
+    ) async -> PhotoVisionTagScanReport {
+        let service = PhotoVisionTagScanService(
+            database: databaseManager,
+            photos: photoRepository,
+            objectTags: container.objectTags
+        )
+        return await service.scan(photoIds: photoIds, progress: progress)
+    }
+
+    /// Full `VNClassifyImageRequest` for unanalyzed event photos (incl. trip children).
+    /// Skips `visionAnalyzed = 1`, upserts `photo_object_tags`, then rebuilds `event_object_tags`.
+    func scanEventPhotosWithVisionTags(
+        eventId: Int,
+        includeHiddenPhotos: Bool,
+        progress: (@Sendable (Int, Int) -> Void)? = nil
+    ) async -> PhotoVisionTagScanReport {
+        let allPhotoIds = getPhotosForEvent(
+            eventId: eventId,
+            includeHidden: includeHiddenPhotos
+        ).map(\.id)
+
+        let unanalyzedPhotoIds = dbQueue.sync {
+            allPhotoIds.filter { !photoRepository.isVisionAnalyzedUnsafe(photoId: $0) }
+        }
+
+        let report: PhotoVisionTagScanReport
+        if unanalyzedPhotoIds.isEmpty {
+            report = PhotoVisionTagScanReport(
+                photoCount: allPhotoIds.count,
+                photosScanned: 0,
+                photosSkippedAnalyzed: allPhotoIds.count,
+                photosFailed: 0,
+                tagsWritten: 0,
+                stoppedEarly: false
+            )
+        } else {
+            report = await scanPhotosWithVisionTags(
+                photoIds: unanalyzedPhotoIds,
+                progress: progress
+            )
+        }
+
+        // Refresh event-level aggregates for holiday/milestone scoring even when nothing new scanned.
+        if !report.stoppedEarly {
+            let completedAt = ISO8601DateFormatter().string(from: Date())
+            dbQueue.sync {
+                container.objectTags.rebuildEventObjectTagsUnsafe(
+                    eventId: eventId,
+                    updatedAt: completedAt
+                )
+                // Only mark complete when every photo was analyzed or skipped (no pending retries).
+                if report.photosFailed == 0 {
+                    container.eventTags.markObjectRecognitionCompletedUnsafe(
+                        eventId: eventId,
+                        completedAt: completedAt,
+                        algorithmVersion: PhotoObjectVisionAnalyzer.algorithmVersion
+                    )
+                }
+            }
+        }
+
+        return report
+    }
+
+    func searchPhotosByVisionTag(_ query: String, limit: Int = 500) -> [VisionTagPhotoMatch] {
+        dbQueue.sync {
+            container.objectTags.searchPhotosByVisionTagUnsafe(query: query, limit: limit)
+        }
+    }
+
+    func searchPhotosByExactVisionTag(_ objectKey: String, limit: Int = 500) -> [VisionTagPhotoMatch] {
+        dbQueue.sync {
+            container.objectTags.searchPhotosByExactVisionTagUnsafe(objectKey: objectKey, limit: limit)
+        }
+    }
+
+    func fetchDistinctVisionTagNames() -> [VisionTagName] {
+        dbQueue.sync {
+            container.objectTags.fetchDistinctVisionTagNamesUnsafe()
+        }
+    }
+
+    func savePictureSearch(_ definition: PictureSearchDefinition) -> Int {
+        container.pictureSearches.savePictureSearch(definition)
+    }
+
+    func fetchPictureSearch(pictureSearchId: Int) -> PictureSearchDefinition? {
+        container.pictureSearches.fetchPictureSearch(pictureSearchId: pictureSearchId)
+    }
+
+    func fetchAllPictureSearches() -> [PictureSearchDefinition] {
+        container.pictureSearches.fetchAllPictureSearches()
+    }
+
+    func fetchFloatingHolidays() -> [FloatingHolidayDefinition] {
+        container.holidays.fetchFloatingHolidays()
+    }
+
+    func upsertFloatingHoliday(_ holiday: FloatingHolidayDefinition) -> Int {
+        container.holidays.upsertFloatingHoliday(holiday)
+    }
+
+    func fetchAllEnabledHolidays() -> [HolidayDefinition] {
+        container.holidays.fetchAllEnabledHolidays()
+    }
+
+    func upsertHoliday(_ holiday: HolidayDefinition) -> Int {
+        container.holidays.upsertHoliday(holiday)
+    }
+
+    func runPictureSearch(_ definition: PictureSearchDefinition) -> PictureSearchRunReport {
+        let report = container.pictureSearches.runPictureSearch(definition)
+        maybeEnqueueFaceDetectAfterPictureSearch(definition: definition, report: report)
+        return report
+    }
+
+    func runPictureSearch(pictureSearchId: Int) -> PictureSearchRunReport? {
+        guard let report = container.pictureSearches.runPictureSearch(pictureSearchId: pictureSearchId) else {
+            return nil
+        }
+        if let definition = container.pictureSearches.fetchPictureSearch(pictureSearchId: report.pictureSearchId) {
+            maybeEnqueueFaceDetectAfterPictureSearch(definition: definition, report: report)
+        }
+        return report
+    }
+
+    func fetchLatestPictureSearchRun(pictureSearchId: Int) -> PictureSearchRunReport? {
+        container.pictureSearches.fetchLatestRunMatches(pictureSearchId: pictureSearchId)
+    }
+
+    func ensureWeddingPictureSearch() -> PictureSearchDefinition {
+        container.pictureSearches.ensureWeddingPictureSearch()
+    }
+
+    func runWeddingPictureSearch() -> (definition: PictureSearchDefinition, report: PictureSearchRunReport) {
+        let result = container.pictureSearches.runWeddingPictureSearch()
+        maybeEnqueueFaceDetectAfterPictureSearch(definition: result.definition, report: result.report)
+        return result
+    }
+
+    func ensureChristmasPictureSearch() -> PictureSearchDefinition {
+        container.pictureSearches.ensureChristmasPictureSearch()
+    }
+
+    func runChristmasPictureSearch() -> (definition: PictureSearchDefinition, report: PictureSearchRunReport) {
+        let result = container.pictureSearches.runChristmasPictureSearch()
+        maybeEnqueueFaceDetectAfterPictureSearch(definition: result.definition, report: result.report)
+        return result
+    }
+
+    func ensureHolidayPictureSearch(tagValue: String) -> PictureSearchDefinition? {
+        container.pictureSearches.ensureHolidayPictureSearch(tagValue: tagValue)
+    }
+
+    func runHolidayPictureSearch(
+        tagValue: String
+    ) -> (definition: PictureSearchDefinition, report: PictureSearchRunReport)? {
+        guard let result = container.pictureSearches.runHolidayPictureSearch(tagValue: tagValue) else {
+            return nil
+        }
+        maybeEnqueueFaceDetectAfterPictureSearch(definition: result.definition, report: result.report)
+        return result
+    }
+
+    func ensureMilestonePictureSearch(topicId: String) -> PictureSearchDefinition? {
+        container.pictureSearches.ensureMilestonePictureSearch(topicId: topicId)
+    }
+
+    func runMilestonePictureSearch(
+        topicId: String
+    ) -> (definition: PictureSearchDefinition, report: PictureSearchRunReport)? {
+        guard let result = container.pictureSearches.runMilestonePictureSearch(topicId: topicId) else {
+            return nil
+        }
+        maybeEnqueueFaceDetectAfterPictureSearch(definition: result.definition, report: result.report)
+        return result
+    }
+
+    func ensureOutingPictureSearch(topicId: String) -> PictureSearchDefinition? {
+        container.pictureSearches.ensureOutingPictureSearch(topicId: topicId)
+    }
+
+    func runOutingPictureSearch(
+        topicId: String
+    ) -> (definition: PictureSearchDefinition, report: PictureSearchRunReport)? {
+        guard let result = container.pictureSearches.runOutingPictureSearch(topicId: topicId) else {
+            return nil
+        }
+        maybeEnqueueFaceDetectAfterPictureSearch(definition: result.definition, report: result.report)
+        return result
+    }
+
+    func ensurePersonBirthdayPictureSearch(
+        person: PeopleRepository.PersonBirthdayRecord
+    ) -> PictureSearchDefinition? {
+        container.pictureSearches.ensurePersonBirthdayPictureSearch(person: person)
+    }
+
+    func runPersonBirthdayPictureSearch(
+        person: PeopleRepository.PersonBirthdayRecord
+    ) -> (definition: PictureSearchDefinition, report: PictureSearchRunReport)? {
+        guard let result = container.pictureSearches.runPersonBirthdayPictureSearch(person: person) else {
+            return nil
+        }
+        maybeEnqueueFaceDetectAfterPictureSearch(definition: result.definition, report: result.report)
+        return result
+    }
+
+    func fetchPersonBirthdayRecord(personId: Int) -> PeopleRepository.PersonBirthdayRecord? {
+        fetchPeopleWithBirthDates().first { $0.personId == personId }
+    }
+
+    func fetchUnanalyzedPhotoIdsMatchingDateSearch(
+        dateSearch: DateSearchDefinition,
+        floatingHoliday: FloatingHolidayDefinition?,
+        catalogHoliday: HolidayDefinition? = nil
+    ) -> PhotoVisionTagMonthDaySelection {
+        photoRepository.fetchUnanalyzedPhotoIdsMatchingDateSearch(
+            dateSearch: dateSearch,
+            floatingHoliday: floatingHoliday,
+            catalogHoliday: catalogHoliday
+        )
+    }
+
+    func prepareHolidayVisionTagsIfNeeded(
+        definition: PictureSearchDefinition,
+        /// Prefer catalog holiday date window (anchor ± weekends) over a legacy wide range
+        /// saved on an older Picture Search (e.g. Christmas Dec 1–31).
+        visionDateSearch: DateSearchDefinition? = nil,
+        catalogHoliday: HolidayDefinition? = nil,
+        progress: (@Sendable (Int, Int) -> Void)? = nil
+    ) async -> PhotoVisionTagScanReport? {
+        guard definition.hasUsableVisionTags else { return nil }
+
+        let resolvedCatalog = catalogHoliday ?? {
+            if let holidayId = (visionDateSearch ?? definition.dateSearch).holidayId {
+                return container.holidays.fetchHoliday(holidayId: holidayId)
+            }
+            return nil
+        }()
+
+        let dateSearch = visionDateSearch ?? definition.dateSearch
+
+        let floating: FloatingHolidayDefinition?
+        if resolvedCatalog == nil, let floatingId = dateSearch.floatingHolidayId {
+            floating = container.pictureSearches.fetchFloatingHolidays()
+                .first { $0.floatingHolidayId == floatingId }
+        } else {
+            floating = nil
+        }
+
+        let selection = fetchUnanalyzedPhotoIdsMatchingDateSearch(
+            dateSearch: dateSearch,
+            floatingHoliday: floating,
+            catalogHoliday: resolvedCatalog
+        )
+        print(
+            "Holiday vision selection: \(selection.summaryLine) · "
+                + "\(dateSearch.dateSearchType.rawValue)"
+        )
+        guard !selection.photoIds.isEmpty else {
+            return PhotoVisionTagScanReport(
+                photoCount: 0,
+                photosScanned: 0,
+                photosSkippedAnalyzed: selection.alreadyAnalyzed,
+                photosFailed: 0,
+                tagsWritten: 0,
+                stoppedEarly: false
+            )
+        }
+        return await scanPhotosWithVisionTags(photoIds: selection.photoIds, progress: progress)
+    }
+
+    /// Photos path: Vision prep (if needed) → always Picture Search. No event scoring.
+    func runHolidayPhotosPipeline(
+        tagValue: String,
+        status: (@Sendable (String) -> Void)? = nil
+    ) async -> HolidayPhotosPipelineResult? {
+        guard let definition = ensureHolidayPictureSearch(tagValue: tagValue) else {
+            return nil
+        }
+
+        let catalogHoliday = container.holidays.fetchHoliday(named: tagValue)
+        let visionDateSearch = catalogHoliday.map {
+            HolidayPictureSearchDefaults.dateSearch(for: $0)
+        }
+
+        var visionReport: PhotoVisionTagScanReport?
+        if definition.hasUsableVisionTags {
+            status?("Tagging \(tagValue) photos…")
+            visionReport = await prepareHolidayVisionTagsIfNeeded(
+                definition: definition,
+                visionDateSearch: visionDateSearch,
+                catalogHoliday: catalogHoliday
+            ) { current, total in
+                status?("Tagging \(tagValue) photos… \(current.formatted())/\(total.formatted())")
+            }
+            if let visionReport {
+                print("\(tagValue) vision prep: \(visionReport.summaryLine)")
+            }
+        }
+
+        status?("Searching \(tagValue) pictures…")
+        guard let result = runHolidayPictureSearch(tagValue: tagValue) else {
+            return nil
+        }
+        return HolidayPhotosPipelineResult(
+            definition: result.definition,
+            report: result.report,
+            visionReport: visionReport
+        )
+    }
+
+    /// Events path: reuse latest Picture Search when present, then score candidates.
+    func runHolidayEventsPipeline(
+        tagValue: String,
+        status: (@Sendable (String) -> Void)? = nil
+    ) async -> HolidayEventsPipelineResult? {
+        guard let definition = ensureHolidayPictureSearch(tagValue: tagValue) else {
+            return nil
+        }
+
+        let catalogHoliday = container.holidays.fetchHoliday(named: tagValue)
+        let visionDateSearch = catalogHoliday.map {
+            HolidayPictureSearchDefaults.dateSearch(for: $0)
+        }
+
+        if definition.hasUsableVisionTags {
+            status?("Tagging \(tagValue) photos…")
+            _ = await prepareHolidayVisionTagsIfNeeded(
+                definition: definition,
+                visionDateSearch: visionDateSearch,
+                catalogHoliday: catalogHoliday
+            ) { current, total in
+                status?("Tagging \(tagValue) photos… \(current.formatted())/\(total.formatted())")
+            }
+        }
+
+        status?("Finding \(tagValue) pictures…")
+        let report: PictureSearchRunReport
+        let resolvedDefinition: PictureSearchDefinition
+        if let pictureSearchId = definition.pictureSearchId,
+           let latest = fetchLatestPictureSearchRun(pictureSearchId: pictureSearchId),
+           !latest.photoMatches.isEmpty {
+            report = latest
+            resolvedDefinition = definition
+        } else if let result = runHolidayPictureSearch(tagValue: tagValue) {
+            report = result.report
+            resolvedDefinition = result.definition
+        } else {
+            return nil
+        }
+
+        let candidateCount = report.candidateEventIds.count
+        guard candidateCount > 0 else {
+            return HolidayEventsPipelineResult(
+                definition: resolvedDefinition,
+                report: report,
+                checkReport: nil,
+                summaryLine: "No candidate events from \(tagValue) pictures."
+            )
+        }
+
+        status?(
+            "Scoring \(candidateCount) possible \(tagValue) event"
+                + (candidateCount == 1 ? "…" : "s…")
+        )
+        let scoreCard = ensureEventScoreCardSettings(for: resolvedDefinition)
+        let checkReport = checkPictureSearchEventTypes(
+            runReport: report,
+            definition: resolvedDefinition,
+            scoreCard: scoreCard,
+            progress: nil
+        )
+        return HolidayEventsPipelineResult(
+            definition: resolvedDefinition,
+            report: report,
+            checkReport: checkReport,
+            summaryLine: checkReport.summaryLine
+        )
+    }
+
+    /// Photos path for a milestone topic: Vision prep (if date-scoped) → Picture Search.
+    func runMilestonePhotosPipeline(
+        topicId: String,
+        status: (@Sendable (String) -> Void)? = nil
+    ) async -> HolidayPhotosPipelineResult? {
+        guard let topic = MilestoneTopicCatalog.topic(id: topicId),
+              let definition = ensureMilestonePictureSearch(topicId: topicId) else {
+            return nil
+        }
+
+        var visionReport: PhotoVisionTagScanReport?
+        if definition.hasUsableVisionTags {
+            status?("Tagging \(topic.title) photos…")
+            visionReport = await prepareHolidayVisionTagsIfNeeded(definition: definition) {
+                current,
+                total in
+                status?(
+                    "Tagging \(topic.title) photos… \(current.formatted())/\(total.formatted())"
+                )
+            }
+            if let visionReport {
+                print("\(topic.title) vision prep: \(visionReport.summaryLine)")
+            }
+        }
+
+        status?("Searching \(topic.title) pictures…")
+        guard let result = runMilestonePictureSearch(topicId: topicId) else {
+            return nil
+        }
+        return HolidayPhotosPipelineResult(
+            definition: result.definition,
+            report: result.report,
+            visionReport: visionReport
+        )
+    }
+
+    /// Events path: reuse latest Picture Search when present, then score candidates.
+    func runMilestoneEventsPipeline(
+        topicId: String,
+        status: (@Sendable (String) -> Void)? = nil
+    ) async -> HolidayEventsPipelineResult? {
+        guard let topic = MilestoneTopicCatalog.topic(id: topicId),
+              let definition = ensureMilestonePictureSearch(topicId: topicId) else {
+            return nil
+        }
+
+        if definition.hasUsableVisionTags {
+            status?("Tagging \(topic.title) photos…")
+            _ = await prepareHolidayVisionTagsIfNeeded(definition: definition) {
+                current,
+                total in
+                status?(
+                    "Tagging \(topic.title) photos… \(current.formatted())/\(total.formatted())"
+                )
+            }
+        }
+
+        status?("Finding \(topic.title) pictures…")
+        let report: PictureSearchRunReport
+        let resolvedDefinition: PictureSearchDefinition
+        if let pictureSearchId = definition.pictureSearchId,
+           let latest = fetchLatestPictureSearchRun(pictureSearchId: pictureSearchId),
+           !latest.photoMatches.isEmpty {
+            report = latest
+            resolvedDefinition = definition
+        } else if let result = runMilestonePictureSearch(topicId: topicId) {
+            report = result.report
+            resolvedDefinition = result.definition
+        } else {
+            return nil
+        }
+
+        let candidateCount = report.candidateEventIds.count
+        guard candidateCount > 0 else {
+            return HolidayEventsPipelineResult(
+                definition: resolvedDefinition,
+                report: report,
+                checkReport: nil,
+                summaryLine: "No candidate events from \(topic.title) pictures."
+            )
+        }
+
+        status?(
+            "Scoring \(candidateCount) possible \(topic.title) event"
+                + (candidateCount == 1 ? "…" : "s…")
+        )
+        let scoreCard = ensureEventScoreCardSettings(for: resolvedDefinition)
+        let checkReport = checkPictureSearchEventTypes(
+            runReport: report,
+            definition: resolvedDefinition,
+            scoreCard: scoreCard,
+            progress: nil
+        )
+        return HolidayEventsPipelineResult(
+            definition: resolvedDefinition,
+            report: report,
+            checkReport: checkReport,
+            summaryLine: checkReport.summaryLine
+        )
+    }
+
+    /// Photos path for an outing topic: Vision prep (if needed) → Picture Search.
+    func runOutingPhotosPipeline(
+        topicId: String,
+        status: (@Sendable (String) -> Void)? = nil
+    ) async -> HolidayPhotosPipelineResult? {
+        guard let topic = OutingTopicCatalog.topic(id: topicId),
+              let definition = ensureOutingPictureSearch(topicId: topicId) else {
+            return nil
+        }
+
+        var visionReport: PhotoVisionTagScanReport?
+        if definition.hasUsableVisionTags {
+            status?("Tagging \(topic.title) photos…")
+            visionReport = await prepareHolidayVisionTagsIfNeeded(definition: definition) {
+                current,
+                total in
+                status?(
+                    "Tagging \(topic.title) photos… \(current.formatted())/\(total.formatted())"
+                )
+            }
+            if let visionReport {
+                print("\(topic.title) vision prep: \(visionReport.summaryLine)")
+            }
+        }
+
+        status?("Searching \(topic.title) pictures…")
+        guard let result = runOutingPictureSearch(topicId: topicId) else {
+            return nil
+        }
+        return HolidayPhotosPipelineResult(
+            definition: result.definition,
+            report: result.report,
+            visionReport: visionReport
+        )
+    }
+
+    /// Events path for outings: reuse latest Picture Search when present, then score candidates.
+    func runOutingEventsPipeline(
+        topicId: String,
+        status: (@Sendable (String) -> Void)? = nil
+    ) async -> HolidayEventsPipelineResult? {
+        guard let topic = OutingTopicCatalog.topic(id: topicId),
+              let definition = ensureOutingPictureSearch(topicId: topicId) else {
+            return nil
+        }
+
+        if definition.hasUsableVisionTags {
+            status?("Tagging \(topic.title) photos…")
+            _ = await prepareHolidayVisionTagsIfNeeded(definition: definition) {
+                current,
+                total in
+                status?(
+                    "Tagging \(topic.title) photos… \(current.formatted())/\(total.formatted())"
+                )
+            }
+        }
+
+        status?("Finding \(topic.title) pictures…")
+        let report: PictureSearchRunReport
+        let resolvedDefinition: PictureSearchDefinition
+        if let pictureSearchId = definition.pictureSearchId,
+           let latest = fetchLatestPictureSearchRun(pictureSearchId: pictureSearchId),
+           !latest.photoMatches.isEmpty {
+            report = latest
+            resolvedDefinition = definition
+        } else if let result = runOutingPictureSearch(topicId: topicId) {
+            report = result.report
+            resolvedDefinition = result.definition
+        } else {
+            return nil
+        }
+
+        let candidateCount = report.candidateEventIds.count
+        guard candidateCount > 0 else {
+            return HolidayEventsPipelineResult(
+                definition: resolvedDefinition,
+                report: report,
+                checkReport: nil,
+                summaryLine: "No candidate events from \(topic.title) pictures."
+            )
+        }
+
+        status?(
+            "Scoring \(candidateCount) possible \(topic.title) event"
+                + (candidateCount == 1 ? "…" : "s…")
+        )
+        let scoreCard = ensureEventScoreCardSettings(for: resolvedDefinition)
+        let checkReport = checkPictureSearchEventTypes(
+            runReport: report,
+            definition: resolvedDefinition,
+            scoreCard: scoreCard,
+            progress: nil
+        )
+        return HolidayEventsPipelineResult(
+            definition: resolvedDefinition,
+            report: report,
+            checkReport: checkReport,
+            summaryLine: checkReport.summaryLine
+        )
+    }
+
+    /// Photos path for one person's birthday: Vision prep around birth month/day → Picture Search.
+    func runPersonBirthdayPhotosPipeline(
+        personId: Int,
+        status: (@Sendable (String) -> Void)? = nil
+    ) async -> HolidayPhotosPipelineResult? {
+        guard let person = fetchPersonBirthdayRecord(personId: personId),
+              let definition = ensurePersonBirthdayPictureSearch(person: person) else {
+            return nil
+        }
+        let title = "\(person.name) Birthday"
+
+        var visionReport: PhotoVisionTagScanReport?
+        if definition.hasUsableVisionTags {
+            status?("Tagging \(title) photos…")
+            visionReport = await prepareHolidayVisionTagsIfNeeded(definition: definition) {
+                current,
+                total in
+                status?("Tagging \(title) photos… \(current.formatted())/\(total.formatted())")
+            }
+            if let visionReport {
+                print("\(title) vision prep: \(visionReport.summaryLine)")
+            }
+        }
+
+        status?("Searching \(title) pictures…")
+        guard let result = runPersonBirthdayPictureSearch(person: person) else {
+            return nil
+        }
+        return HolidayPhotosPipelineResult(
+            definition: result.definition,
+            report: result.report,
+            visionReport: visionReport
+        )
+    }
+
+    /// Events path for one person's birthday: reuse Picture Search → score Birthday candidates.
+    func runPersonBirthdayEventsPipeline(
+        personId: Int,
+        status: (@Sendable (String) -> Void)? = nil
+    ) async -> HolidayEventsPipelineResult? {
+        guard let person = fetchPersonBirthdayRecord(personId: personId),
+              let definition = ensurePersonBirthdayPictureSearch(person: person) else {
+            return nil
+        }
+        let title = "\(person.name) Birthday"
+
+        if definition.hasUsableVisionTags {
+            status?("Tagging \(title) photos…")
+            _ = await prepareHolidayVisionTagsIfNeeded(definition: definition) {
+                current,
+                total in
+                status?("Tagging \(title) photos… \(current.formatted())/\(total.formatted())")
+            }
+        }
+
+        status?("Finding \(title) pictures…")
+        let report: PictureSearchRunReport
+        let resolvedDefinition: PictureSearchDefinition
+        if let pictureSearchId = definition.pictureSearchId,
+           let latest = fetchLatestPictureSearchRun(pictureSearchId: pictureSearchId),
+           !latest.photoMatches.isEmpty {
+            report = latest
+            resolvedDefinition = definition
+        } else if let result = runPersonBirthdayPictureSearch(person: person) {
+            report = result.report
+            resolvedDefinition = result.definition
+        } else {
+            return nil
+        }
+
+        let candidateCount = report.candidateEventIds.count
+        guard candidateCount > 0 else {
+            return HolidayEventsPipelineResult(
+                definition: resolvedDefinition,
+                report: report,
+                checkReport: nil,
+                summaryLine: "No candidate events from \(title) pictures."
+            )
+        }
+
+        status?(
+            "Scoring \(candidateCount) possible \(title) event"
+                + (candidateCount == 1 ? "…" : "s…")
+        )
+        let scoreCard = ensureEventScoreCardSettings(for: resolvedDefinition)
+        let checkReport = checkPictureSearchEventTypes(
+            runReport: report,
+            definition: resolvedDefinition,
+            scoreCard: scoreCard,
+            progress: nil
+        )
+        return HolidayEventsPipelineResult(
+            definition: resolvedDefinition,
+            report: report,
+            checkReport: checkReport,
+            summaryLine: checkReport.summaryLine
+        )
+    }
+
+    func ensureEventScoreCardSettings(
+        for definition: PictureSearchDefinition,
+        personNamesById: [Int: String] = [:]
+    ) -> PictureSearchEventScoreCardSettings {
+        let names = personNamesById.isEmpty
+            ? Dictionary(uniqueKeysWithValues: fetchAllPeople().map { ($0.personId, $0.name) })
+            : personNamesById
+        return container.pictureSearches.ensureEventScoreCardSettings(
+            for: definition,
+            personNamesById: names
+        )
+    }
+
+    @discardableResult
+    func saveEventScoreCardSettings(
+        _ settings: PictureSearchEventScoreCardSettings
+    ) -> PictureSearchEventScoreCardSettings {
+        container.pictureSearches.saveEventScoreCardSettings(settings)
+    }
+
+    func checkPictureSearchEventTypes(
+        runReport: PictureSearchRunReport,
+        definition: PictureSearchDefinition,
+        scoreCard: PictureSearchEventScoreCardSettings,
+        progress: (@Sendable (Int, Int) -> Void)? = nil
+    ) -> PictureSearchEventTypeCheckReport {
+        let floatingHoliday: FloatingHolidayDefinition? = {
+            guard let floatingId = scoreCard.dateSearch.floatingHolidayId else { return nil }
+            return container.pictureSearches.fetchFloatingHolidays()
+                .first { $0.floatingHolidayId == floatingId }
+        }()
+        let service = PictureSearchEventTypeCheckService(
+            database: databaseManager,
+            eventTags: container.eventTags
+        )
+        return service.checkEventTypes(
+            runReport: runReport,
+            definition: definition,
+            scoreCard: scoreCard,
+            floatingHoliday: floatingHoliday,
+            progress: progress
+        )
     }
 
     func upsertPerson(name: String) -> Int {
@@ -183,11 +914,15 @@ final class PhotoDatabase: @unchecked Sendable {
     func resumeGeocodingIfNeeded() {
         repairHomeLocations()
         restoreDeletedTripContainersOnQueue()
-        LocationGeocodeCoordinator.shared.resumeIfNeeded()
+        if #available(iOS 26.0, *) {
+            LocationGeocodeCoordinator.shared.resumeIfNeeded()
+        }
     }
 
     func stopGeocoding() {
-        LocationGeocodeCoordinator.shared.stopAll()
+        if #available(iOS 26.0, *) {
+            LocationGeocodeCoordinator.shared.stopAll()
+        }
     }
 
     func repairHomeLocations() {
@@ -207,6 +942,156 @@ final class PhotoDatabase: @unchecked Sendable {
 
     func startGeocodingEventLocations(limit: Int? = nil) {
         locationRepository.startGeocodingEventLocations(limit: limit)
+    }
+
+    /// On event open: create/link a location if needed, then reverse-geocode when incomplete.
+    /// Returns `true` when place/city/state were newly written (UI should refresh).
+    func ensureEventLocationGeocoded(eventId: Int) async -> Bool {
+        enum Prep {
+            case alreadyUpToDate
+            case refreshedFromExistingLocation
+            case needsReverseGeocode(PendingLocation)
+        }
+
+        let prep: Prep = dbQueue.sync {
+            let existing = eventRepository.getEvent(eventId: eventId)
+            if existing?.locationId == nil {
+                eventLocationCoordinator.updateEventLocationFromRepresentativePoint(
+                    eventId: eventId
+                )
+            }
+
+            guard let event = eventRepository.getEvent(eventId: eventId),
+                  let locationId = event.locationId,
+                  let location = locationRepository.getLocation(locationId: locationId),
+                  let latitude = location.latitude ?? event.latitude,
+                  let longitude = location.longitude ?? event.longitude else {
+                return .alreadyUpToDate
+            }
+
+            if locationRepository.isLocationGeocodeComplete(locationId: locationId) {
+                let needsEventFill =
+                    (event.placeName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ?? true)
+                    && (event.city?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+                if needsEventFill {
+                    eventRepository.updateEventsFromLocation(locationId: locationId)
+                    return .refreshedFromExistingLocation
+                }
+                return .alreadyUpToDate
+            }
+
+            return .needsReverseGeocode(
+                PendingLocation(
+                    locationId: locationId,
+                    latitude: latitude,
+                    longitude: longitude
+                )
+            )
+        }
+
+        switch prep {
+        case .alreadyUpToDate:
+            return false
+        case .refreshedFromExistingLocation:
+            return true
+        case .needsReverseGeocode(let target):
+            if tryCopyNearbyGeocode(
+                locationId: target.locationId,
+                latitude: target.latitude,
+                longitude: target.longitude
+            ) {
+                return true
+            }
+
+            if locationRepository.isLocationGeocodeComplete(locationId: target.locationId) {
+                eventRepository.updateEventsFromLocation(locationId: target.locationId)
+                return true
+            }
+
+            return await reverseGeocodeAndComplete(
+                eventId: eventId,
+                locationId: target.locationId,
+                latitude: target.latitude,
+                longitude: target.longitude
+            )
+        }
+    }
+
+    private func reverseGeocodeAndComplete(
+        eventId: Int,
+        locationId: Int,
+        latitude: Double,
+        longitude: Double
+    ) async -> Bool {
+        let clLocation = CLLocation(latitude: latitude, longitude: longitude)
+
+        if #available(iOS 26.0, *) {
+            guard let request = MKReverseGeocodingRequest(location: clLocation) else {
+                markLocationGeocodeFailed(locationId: locationId)
+                return false
+            }
+            do {
+                let mapItems = try await request.mapItems
+                guard let mapItem = mapItems.first else {
+                    markLocationGeocodeFailed(locationId: locationId)
+                    return false
+                }
+                let city = ReverseGeocodeParser.geocodedCity(from: mapItem)
+                let state = ReverseGeocodeParser.administrativeArea(from: mapItem)
+                let placeName = ReverseGeocodeParser.placeLabel(from: mapItem)
+                completeLocationGeocode(
+                    locationId: locationId,
+                    city: city,
+                    state: state,
+                    placeName: placeName
+                )
+                print(
+                    "Event \(eventId) geocoded location \(locationId):"
+                        + " \(placeName ?? "nil"), \(city ?? "nil"), \(state ?? "nil")"
+                )
+                return true
+            } catch {
+                print(
+                    "Event \(eventId) geocode failed for location \(locationId):"
+                        + " \(error.localizedDescription)"
+                )
+                markLocationGeocodeFailed(locationId: locationId)
+                return false
+            }
+        }
+
+        // Pre-iOS 26 fallback.
+        do {
+            let placemarks = try await CLGeocoder().reverseGeocodeLocation(clLocation)
+            guard let placemark = placemarks.first else {
+                markLocationGeocodeFailed(locationId: locationId)
+                return false
+            }
+            let city = placemark.locality
+            let state = placemark.administrativeArea
+            let placeName = placemark.name
+                ?? placemark.areasOfInterest?.first
+                ?? placemark.thoroughfare
+            completeLocationGeocode(
+                locationId: locationId,
+                city: city,
+                state: state,
+                placeName: placeName
+            )
+            print(
+                "Event \(eventId) geocoded location \(locationId):"
+                    + " \(placeName ?? "nil"), \(city ?? "nil"), \(state ?? "nil")"
+            )
+            return true
+        } catch {
+            print(
+                "Event \(eventId) geocode failed for location \(locationId):"
+                    + " \(error.localizedDescription)"
+            )
+            markLocationGeocodeFailed(locationId: locationId)
+            return false
+        }
     }
 
     func completeLocationGeocode(
@@ -409,6 +1294,10 @@ final class PhotoDatabase: @unchecked Sendable {
         container.metadataEnrichment.runPostIndexPhase()
     }
 
+    func importMissingPhotoExif(onProgress: @escaping @Sendable (String) -> Void) async {
+        await container.photoExifImport.importMissingExif(onProgress: onProgress)
+    }
+
     func runPostIndexMetadataEnrichmentIfNeeded() {
         guard container.albums.countAlbums() == 0,
               photoRepository.countActivePhotos() > 0 else {
@@ -434,27 +1323,20 @@ final class PhotoDatabase: @unchecked Sendable {
         }
     }
 
-    func importPeopleFromAlbums() {
-        peopleImportService.importPeopleFromAlbums()
-    }
-
     // MARK: - Event clustering forwards
 
     func clusterEventsByTime() {
         eventClustering.clusterEventsByTime()
-        dbQueue.sync { rebuildOccasionLandingMetricsUnsafe() }
     }
 
     func syncEventsIncrementally() {
         eventClustering.syncEventsIncrementally()
-        dbQueue.sync { rebuildOccasionLandingMetricsUnsafe() }
     }
 
     @discardableResult
     func syncEventsAssignmentBatch() -> Bool {
         let hasMore = eventClustering.syncEventsAssignmentBatch()
         if !hasMore {
-            dbQueue.sync { rebuildOccasionLandingMetricsUnsafe() }
         }
         return hasMore
     }
@@ -489,12 +1371,10 @@ final class PhotoDatabase: @unchecked Sendable {
     /// Metadata attach, then time-only clustering for remaining no-GPS photos (used by Sync Events).
     func syncMetadataAssignmentUntilComplete() {
         eventClustering.syncSecondaryPhotoAssignmentPasses()
-        dbQueue.sync { rebuildOccasionLandingMetricsUnsafe() }
     }
 
     func rebuildAllEvents() {
         eventClustering.rebuildAllEvents()
-        dbQueue.sync { rebuildOccasionLandingMetricsUnsafe() }
     }
 
     @discardableResult
@@ -504,17 +1384,22 @@ final class PhotoDatabase: @unchecked Sendable {
 
     func finishEventRebuild() {
         eventClustering.finishEventRebuild()
-        dbQueue.sync { rebuildOccasionLandingMetricsUnsafe() }
+    }
+
+    func relinkEventLocationsFromPhotos() {
+        eventClustering.relinkEventLocationsFromPhotos()
     }
 
     func finishEventSyncMaintenance() {
         eventClustering.finishEventSyncMaintenance()
-        dbQueue.sync { rebuildOccasionLandingMetricsUnsafe() }
+    }
+
+    func joinTimeOnlyEventsToSameDayLocatedEvents() {
+        eventClustering.joinTimeOnlyEventsToSameDayLocatedEvents()
     }
 
     func clearAllEventDataPreservingLocations() {
         eventClustering.clearAllEventDataPreservingLocations()
-        dbQueue.sync { rebuildOccasionLandingMetricsUnsafe() }
     }
     func debugSchema() {
         DevDatabaseTools.debugSchema(database: databaseManager)
@@ -622,6 +1507,15 @@ final class PhotoDatabase: @unchecked Sendable {
         eventRepository.updateCoverPhotoForEvent(eventId: eventId)
     }
 
+    func updateWeddingCoverPhotoForEvent(eventId: Int) {
+        eventRepository.updateWeddingCoverPhotoForEvent(eventId: eventId)
+    }
+
+    func replaceUserEventMainPeople(eventId: Int, names: [String]) {
+        eventTags.replaceUserEventMainPeople(eventId: eventId, names: names)
+        eventRepository.updateEventAttribute(eventId: eventId, field: .mainPerson, value: names.first)
+    }
+
     func updateAllEventCoverPhotos() {
         eventRepository.updateAllEventCoverPhotos()
     }
@@ -630,27 +1524,21 @@ final class PhotoDatabase: @unchecked Sendable {
         eventRepository.backfillEventAssignedAt()
     }
 
-    func rebuildEventPeople() {
-        eventRepository.rebuildEventPeople()
-        dbQueue.sync { rebuildOccasionLandingMetricsUnsafe() }
-    }
-
-    func rescoreHolidayTagsForSyncedEventsUnsafe(eventIds: Set<Int>, scoreAllEvents: Bool) {
-        container.occasionScoring.rescoreHolidayEventsAfterEventSyncUnsafe(
-            eventIds: eventIds,
-            scoreAllEvents: scoreAllEvents
-        )
-        rebuildOccasionLandingMetricsUnsafe()
-    }
 
     func setEventShowOnFrame(eventId: Int, show: Bool) {
         eventRepository.setEventShowOnFrame(eventId: eventId, show: show)
-        dbQueue.sync { reconcileOccasionCollectionCountsUnsafe(forEventId: eventId) }
+    }
+
+    func setEventFavorite(eventId: Int, isFavorite: Bool) {
+        eventRepository.setEventFavorite(eventId: eventId, isFavorite: isFavorite)
+    }
+
+    func listEventIdsWithOnFramePhotos(among eventIds: [Int]) -> Set<Int> {
+        eventRepository.listEventIdsWithOnFramePhotos(among: eventIds)
     }
 
     func setEventUserHidden(eventId: Int, hidden: Bool) {
         eventRepository.setEventUserHidden(eventId: eventId, hidden: hidden)
-        dbQueue.sync { reconcileOccasionCollectionCountsUnsafe(forEventId: eventId) }
     }
 
     func getEventAttributeOptions(for field: EventAttributeField) -> [String] {
@@ -664,7 +1552,6 @@ final class PhotoDatabase: @unchecked Sendable {
     func updateEventAttribute(eventId: Int, field: EventAttributeField, value: String?) {
         eventRepository.updateEventAttribute(eventId: eventId, field: field, value: value)
         eventTags.syncUserAttributeTag(eventId: eventId, field: field, tagValue: value)
-        dbQueue.sync { reconcileOccasionCollectionCountsUnsafe(forEventId: eventId) }
     }
 
     func updateWeddingDate(eventId: Int, weddingDate: String?) {
@@ -691,106 +1578,6 @@ final class PhotoDatabase: @unchecked Sendable {
         }
     }
 
-    func fetchAITagScoringDetail(
-        eventId: Int,
-        field: EventAttributeField,
-        includesDescendantPhotos: Bool
-    ) -> AITagScoringDetail? {
-        dbQueue.sync {
-            aiTagScoringDetailServiceUnsafe()
-                .buildDetailUnsafe(
-                    eventId: eventId,
-                    field: field,
-                    includesDescendantPhotos: includesDescendantPhotos
-                )
-        }
-    }
-
-    func fetchHolidayScorecards(
-        eventId: Int,
-        includesDescendantPhotos: Bool
-    ) -> [AITagScoringDetail] {
-        dbQueue.sync {
-            aiTagScoringDetailServiceUnsafe()
-                .buildHolidayScorecardsForEventUnsafe(
-                    eventId: eventId,
-                    includesDescendantPhotos: includesDescendantPhotos
-                )
-        }
-    }
-
-    private func aiTagScoringDetailServiceUnsafe() -> AITagScoringDetailService {
-        AITagScoringDetailService(
-            events: eventRepository,
-            occasions: occasionRepository,
-            eventTags: eventTags,
-            tuning: { [weak self] in
-                self?.eventTuningUnsafe() ?? .defaults
-            }
-        )
-    }
-
-    func updateOccasionDateScoringSettings(
-        occasionId: Int,
-        edit: OccasionDateScoringEdit
-    ) {
-        occasionRepository.updateOccasionDateScoringSettings(
-            occasionId: occasionId,
-            edit: edit
-        )
-    }
-
-    func fetchObjectScoringRules(occasionId: Int) -> [EditableObjectScoringRule] {
-        occasionRepository.fetchObjectScoringRules(occasionId: occasionId)
-    }
-
-    @discardableResult
-    func saveObjectScoringRules(
-        occasionId: Int,
-        rules: [EditableObjectScoringRule]
-    ) -> Int {
-        dbQueue.sync {
-            occasionRepository.saveObjectScoringRulesUnsafe(
-                occasionId: occasionId,
-                rules: rules
-            )
-            return invalidateObjectRecognitionForOccasionCandidatesUnsafe(
-                occasionId: occasionId
-            )
-        }
-    }
-
-    /// Clears object-scan completion for holiday candidate events so Vision re-runs with updated object keys.
-    private func invalidateObjectRecognitionForOccasionCandidatesUnsafe(
-        occasionId: Int
-    ) -> Int {
-        guard let occasion = occasionRepository.fetchOccasionByIdUnsafe(occasionId: occasionId),
-              occasion.scoring.occasionType == "holiday",
-              ObjectDetectionCategory(occasionKey: occasion.scoring.occasionKey) != nil else {
-            return 0
-        }
-
-        let threshold = eventTuningUnsafe().holidayTagPreObjectMinTotalScore
-        let eventIds = occasionRepository.fetchEventIdsQualifyingForOccasionUnsafe(
-            occasionId: occasionId,
-            minimumTotalScore: threshold
-        )
-        guard !eventIds.isEmpty else { return 0 }
-
-        eventTags.clearObjectRecognitionForEventsUnsafe(eventIds: eventIds)
-        container.objectTags.clearPhotoVisionScansForEventsUnsafe(eventIds: eventIds)
-
-        for eventId in eventIds {
-            container.occasionScoring.scoreHolidayEventOnDatabaseQueueUnsafe(eventId: eventId)
-        }
-
-        return eventIds.count
-    }
-
-    func scoreHolidayEvent(eventId: Int) {
-        container.occasionScoring.scoreHolidayEvent(eventId: eventId)
-        dbQueue.sync { reconcileOccasionCollectionCountsUnsafe(forEventId: eventId) }
-    }
 
     func runEventObjectRecognitionIfNeeded(
         eventId: Int,
@@ -802,7 +1589,6 @@ final class PhotoDatabase: @unchecked Sendable {
             includeHiddenPhotos: includeHiddenPhotos,
             progress: progress
         )
-        dbQueue.sync { reconcileOccasionCollectionCountsUnsafe(forEventId: eventId) }
         return result
     }
 
@@ -872,15 +1658,11 @@ final class PhotoDatabase: @unchecked Sendable {
     }
 
     func holidayVisionLandingConfig(tagValue: String) -> HolidayVisionLandingConfig? {
-        dbQueue.sync {
-            container.occasions.holidayVisionLandingConfigUnsafe(tagValue: tagValue)
-        }
+        HolidayVisionLandingConfig.matching(tagValue: tagValue)
     }
 
     func fetchAllHolidayVisionLandingConfigs() -> [HolidayVisionLandingConfig] {
-        dbQueue.sync {
-            container.occasions.fetchAllHolidayVisionLandingConfigsUnsafe()
-        }
+        HolidayVisionLandingConfig.allWithObjectKeys
     }
 
     func holidayYearNeedsVisionScan(
@@ -1123,8 +1905,6 @@ final class PhotoDatabase: @unchecked Sendable {
         if !eventIds.isEmpty {
             dbQueue.sync {
                 for eventId in eventIds {
-                    container.occasionScoring.scoreHolidayEventOnDatabaseQueueUnsafe(eventId: eventId)
-                    reconcileOccasionCollectionCountsUnsafe(forEventId: eventId)
                 }
             }
         }
@@ -1178,7 +1958,6 @@ final class PhotoDatabase: @unchecked Sendable {
             container.visionJobs.purgeJobsForEventsUnsafe(eventIds: eventIds)
 
             for eventId in eventIds {
-                container.occasionScoring.scoreHolidayEventOnDatabaseQueueUnsafe(eventId: eventId)
             }
 
             let candidates = eventTags.fetchAITaggedHolidayEventIdsNeedingObjectRecognitionUnsafe(
@@ -1288,12 +2067,87 @@ final class PhotoDatabase: @unchecked Sendable {
 
     func confirmAIAttributeTag(eventId: Int, field: EventAttributeField) {
         eventTags.confirmAIAttributeTag(eventId: eventId, field: field)
-        dbQueue.sync { reconcileOccasionCollectionCountsUnsafe(forEventId: eventId) }
     }
 
     func rejectAIAttributeTag(eventId: Int, field: EventAttributeField) {
         eventTags.rejectAIAttributeTag(eventId: eventId, field: field)
-        dbQueue.sync { reconcileOccasionCollectionCountsUnsafe(forEventId: eventId) }
+    }
+
+    func removeEventAttributeTag(eventId: Int, tag: EventAttributeTag) {
+        eventTags.removeEventAttributeTag(eventId: eventId, tag: tag)
+    }
+
+    func fetchSimilarEventAlternatives(
+        tagCategory: String,
+        tagValue: String
+    ) -> [SimilarEventTagAlternative] {
+        eventTags.fetchSimilarEventAlternatives(
+            tagCategory: tagCategory,
+            tagValue: tagValue
+        )
+    }
+
+    func applySimilarEventUserTag(
+        eventId: Int,
+        tagCategory: String,
+        tagValue: String
+    ) {
+        eventTags.applySimilarEventUserTag(
+            eventId: eventId,
+            tagCategory: tagCategory,
+            tagValue: tagValue
+        )
+        eventRepository.updateEventAttribute(
+            eventId: eventId,
+            field: EventAttributeField.fromTagCategory(tagCategory) ?? .milestoneType,
+            value: tagValue
+        )
+    }
+
+    func fetchEventNameTemplate(
+        tagCategory: String,
+        tagValue: String
+    ) -> EventNameTemplate? {
+        eventTags.fetchEventNameTemplate(tagCategory: tagCategory, tagValue: tagValue)
+    }
+
+    func fetchAllEventNameTemplates() -> [EventNameTemplate] {
+        eventTags.fetchAllEventNameTemplates()
+    }
+
+    func upsertEventNameTemplate(
+        tagCategory: String,
+        tagValue: String,
+        nameTemplate: String,
+        personCount: Int
+    ) -> EventNameTemplate? {
+        eventTags.upsertEventNameTemplate(
+            tagCategory: tagCategory,
+            tagValue: tagValue,
+            nameTemplate: nameTemplate,
+            personCount: personCount
+        )
+    }
+
+    func fetchAllSimilarEventTags() -> [SimilarEventTagAlternative] {
+        eventTags.fetchAllSimilarEventTags()
+    }
+
+    @discardableResult
+    func insertSimilarEventTag(
+        tagCategory: String,
+        tagValue: String,
+        possibleTagCategory: String,
+        possibleTagValue: String,
+        possibleNumberOfEventMainPeople: Int
+    ) -> SimilarEventTagAlternative? {
+        eventTags.insertSimilarEventTag(
+            tagCategory: tagCategory,
+            tagValue: tagValue,
+            possibleTagCategory: possibleTagCategory,
+            possibleTagValue: possibleTagValue,
+            possibleNumberOfEventMainPeople: possibleNumberOfEventMainPeople
+        )
     }
 
     func confirmAIHolidayTag(eventId: Int) {
@@ -1331,6 +2185,104 @@ final class PhotoDatabase: @unchecked Sendable {
         eventRepository.countListEvents(includeHidden: includeHidden, filter: filter)
     }
 
+    func fetchAllStadiums() -> [Stadium] {
+        container.stadiums.fetchAllStadiums()
+    }
+
+    func fetchStadium(stadiumId: Int) -> Stadium? {
+        container.stadiums.fetchStadium(stadiumId: stadiumId)
+    }
+
+    @discardableResult
+    func upsertStadium(
+        stadiumId: Int?,
+        name: String,
+        city: String?,
+        state: String?,
+        latitude: Double?,
+        longitude: Double?
+    ) -> Int? {
+        container.stadiums.upsertStadium(
+            stadiumId: stadiumId,
+            name: name,
+            city: city,
+            state: state,
+            latitude: latitude,
+            longitude: longitude
+        )
+    }
+
+    func deleteStadium(stadiumId: Int) {
+        container.stadiums.deleteStadium(stadiumId: stadiumId)
+    }
+
+    func addStadiumAlias(stadiumId: Int, alias: String) {
+        container.stadiums.addStadiumAlias(stadiumId: stadiumId, alias: alias)
+    }
+
+    func deleteStadiumAlias(stadiumId: Int, alias: String) {
+        container.stadiums.deleteStadiumAlias(stadiumId: stadiumId, alias: alias)
+    }
+
+    @discardableResult
+    func upsertStadiumTeam(
+        stadiumTeamId: Int?,
+        stadiumId: Int,
+        league: SportsLeague,
+        teamName: String,
+        displayName: String?,
+        teamAbbreviation: String?,
+        isPrimaryHome: Bool
+    ) -> Int? {
+        container.stadiums.upsertStadiumTeam(
+            stadiumTeamId: stadiumTeamId,
+            stadiumId: stadiumId,
+            league: league,
+            teamName: teamName,
+            displayName: displayName,
+            teamAbbreviation: teamAbbreviation,
+            isPrimaryHome: isPrimaryHome
+        )
+    }
+
+    func deleteStadiumTeam(stadiumTeamId: Int) {
+        container.stadiums.deleteStadiumTeam(stadiumTeamId: stadiumTeamId)
+    }
+
+    func fetchEventGameResult(eventId: Int) -> EventGameResult? {
+        container.stadiums.fetchGameResult(eventId: eventId)
+    }
+
+    func fetchEventGameResults(eventIds: [Int]) -> [Int: EventGameResult] {
+        container.stadiums.fetchGameResults(eventIds: eventIds)
+    }
+
+    func saveEventGameResult(_ result: EventGameResult) {
+        container.stadiums.saveGameResult(result)
+    }
+
+    func clearEventGameResult(eventId: Int) {
+        container.stadiums.clearGameResult(eventId: eventId)
+    }
+
+    func lookupSportsGameCandidates(
+        eventDateISO: String,
+        placeName: String?,
+        city: String?,
+        state: String?,
+        latitude: Double?,
+        longitude: Double?
+    ) async throws -> (stadiums: [Stadium], candidates: [SportsGameCandidate]) {
+        try await container.sportsGameLookup.lookupCandidates(
+            eventDateISO: eventDateISO,
+            placeName: placeName,
+            city: city,
+            state: state,
+            latitude: latitude,
+            longitude: longitude
+        )
+    }
+
     func countLocations() -> Int {
         locationRepository.countRows("locations")
     }
@@ -1347,13 +2299,40 @@ final class PhotoDatabase: @unchecked Sendable {
         filter: EventListFilter = .allEvents
     ) -> [IndexedEvent] {
         dbQueue.sync {
-            let events = eventRepository.getEventsUnsafe(
-                includeHidden: includeHidden,
-                forList: true,
-                limit: limit,
-                filter: filter
+            var events = eventTags.attachAttributeTagsUnsafe(
+                to: eventRepository.getEventsUnsafe(
+                    includeHidden: includeHidden,
+                    forList: true,
+                    limit: limit,
+                    filter: filter
+                )
             )
-            return eventTags.attachAttributeTagsUnsafe(to: events)
+            if case .milestoneTag(let tagValue) = filter {
+                events.sort {
+                    IndexedEvent.compareMilestoneTaggedListOrder(
+                        $0,
+                        $1,
+                        tagValue: tagValue
+                    )
+                }
+            } else if case .eventTypeTag(let tagValue) = filter {
+                events.sort {
+                    IndexedEvent.compareEventTypeTaggedListOrder(
+                        $0,
+                        $1,
+                        tagValue: tagValue
+                    )
+                }
+            } else if case .holidayTag(let tagValue) = filter, tagValue == "Christmas" {
+                events.sort {
+                    IndexedEvent.compareHolidayTaggedListOrder(
+                        $0,
+                        $1,
+                        tagValue: tagValue
+                    )
+                }
+            }
+            return events
         }
     }
 
@@ -1375,21 +2354,16 @@ final class PhotoDatabase: @unchecked Sendable {
     }
 
     func setPhotoShowOnFrame(photoId: String, eventId: Int, show: Bool) {
-        eventRepository.setPhotoShowOnFrame(photoId: photoId, eventId: eventId, show: show)
-        dbQueue.sync {
-            syncPhotoOccasionOnFrameFromEventPhotoUnsafe(
-                photoId: photoId,
-                eventId: eventId,
-                isOnFrame: show
-            )
-            refreshCachedHolidayOnFrameCountsForEventUnsafe(eventId: eventId)
-            reconcileOccasionCollectionCountsUnsafe(forEventId: eventId)
-        }
+        persistPhotoOnFrameChanges(
+            defaultEventId: eventId,
+            writes: [(photoId: photoId, show: show)],
+            similarGroupPicks: [],
+            clearCropFocusPhotoIds: []
+        )
     }
 
     func removePhotoFromEvent(photoId: String, eventId: Int) {
         eventRepository.removePhotoFromEvent(photoId: photoId, eventId: eventId)
-        dbQueue.sync { reconcileOccasionCollectionCountsUnsafe(forEventId: eventId) }
     }
 
     func getPhotosForEvent(eventId: Int, includeHidden: Bool = false) -> [IndexedPhoto] {
@@ -1401,24 +2375,87 @@ final class PhotoDatabase: @unchecked Sendable {
     }
 
     func setPhotosShowOnFrame(photoIds: [String], show: Bool) {
-        eventRepository.setPhotosShowOnFrame(photoIds: photoIds, show: show)
+        persistPhotoOnFrameChanges(
+            defaultEventId: 0,
+            writes: photoIds.map { (photoId: $0, show: show) },
+            similarGroupPicks: [],
+            clearCropFocusPhotoIds: []
+        )
+    }
+
+    func persistPhotoOnFrameChanges(
+        defaultEventId: Int,
+        writes: [(photoId: String, show: Bool)],
+        similarGroupPicks: [(groupPhotoIds: [String], pickedPhotoIds: [String])],
+        clearCropFocusPhotoIds: [String]
+    ) {
+        guard !writes.isEmpty || !similarGroupPicks.isEmpty || !clearCropFocusPhotoIds.isEmpty else {
+            return
+        }
+
         dbQueue.sync {
-            for photoId in photoIds {
-                guard let eventId = eventRepository.getEventIdForPhotoUnsafe(photoId: photoId) else {
-                    continue
-                }
-                syncPhotoOccasionOnFrameFromEventPhotoUnsafe(
-                    photoId: photoId,
-                    eventId: eventId,
-                    isOnFrame: show
+            for pick in similarGroupPicks {
+                eventRepository.setSimilarGroupPicks(
+                    groupPhotoIds: pick.groupPhotoIds,
+                    pickedPhotoIds: Set(pick.pickedPhotoIds)
                 )
             }
-            rebuildOccasionLandingOnFrameCountsUnsafe()
+
+            var touchedEventIds = Set<Int>()
+            var lastWriteByPhotoId: [String: Bool] = [:]
+            for write in writes {
+                lastWriteByPhotoId[write.photoId] = write.show
+            }
+
+            for (photoId, show) in lastWriteByPhotoId {
+                let eventId = eventRepository.getEventIdForPhotoUnsafe(photoId: photoId)
+                    ?? (defaultEventId > 0 ? defaultEventId : nil)
+                guard let eventId else { continue }
+
+                eventRepository.setPhotoShowOnFrameUnsafe(
+                    photoId: photoId,
+                    eventId: eventId,
+                    show: show
+                )
+                touchedEventIds.insert(eventId)
+            }
+
+            for photoId in clearCropFocusPhotoIds {
+                photoRepository.clearCropFocus(photoId: photoId)
+            }
+
+            if !touchedEventIds.isEmpty {
+                eventRepository.refreshSummariesAndCovers(for: touchedEventIds)
+            }
         }
     }
 
     func setPhotosHiddenInEvent(photoIds: [String], hidden: Bool) {
         eventRepository.setPhotosHiddenInEvent(photoIds: photoIds, hidden: hidden)
+    }
+
+    func fetchPhotosForBrowser(photoIds: [String]) -> [(photo: IndexedPhoto, mediaType: Int)] {
+        photoRepository.fetchPhotosForBrowser(photoIds: photoIds)
+    }
+
+    func fetchAllPhotosForBrowser() -> [(photo: IndexedPhoto, mediaType: Int, indexedAt: String)] {
+        photoRepository.fetchAllPhotosForBrowser()
+    }
+
+    func fetchPhotosForBrowserYear(_ year: Int) -> [(photo: IndexedPhoto, mediaType: Int, indexedAt: String)] {
+        photoRepository.fetchPhotosForBrowserYear(year)
+    }
+
+    func fetchDistinctPhotoYearsForBrowser() -> [Int] {
+        photoRepository.fetchDistinctPhotoYearsForBrowser()
+    }
+
+    func countActivePhotosForBrowser() -> Int {
+        photoRepository.countActivePhotosForBrowser()
+    }
+
+    func setPhotosFavorite(photoIds: [String], isFavorite: Bool) {
+        photoRepository.setPhotosFavorite(photoIds: photoIds, isFavorite: isFavorite)
     }
 
     func getEventIdForPhoto(photoId: String) -> Int? {
@@ -1441,7 +2478,9 @@ final class PhotoDatabase: @unchecked Sendable {
     func geocodePendingLocations(limit: Int = 10) {
         if limit > 0 {
             let pending = locationRepository.fetchPendingGeocodeLocations(limit: limit)
-            LocationGeocodeCoordinator.shared.enqueue(pending)
+            if #available(iOS 26.0, *) {
+                LocationGeocodeCoordinator.shared.enqueue(pending)
+            }
         } else {
             startGeocodingAllPending()
         }
@@ -1485,664 +2524,17 @@ final class PhotoDatabase: @unchecked Sendable {
         DevDatabaseTools.debugEventPipeline(database: databaseManager)
     }
 
-    func occasionScoringCounts() -> OccasionScoringCounts {
-        container.occasionScoring.occasionScoringCounts()
-    }
 
-    func scoreAllHolidayOccasions() -> (scoring: OccasionScoringRunResult, tags: HolidayTagApplyResult) {
-        let result = container.occasionScoring.scoreAllHolidayEvents()
-        dbQueue.sync { rebuildOccasionLandingMetricsUnsafe() }
-        return result
-    }
-
-    @discardableResult
-    func debugPrintTopHolidayOccasionScores(limit: Int = 25) -> [OccasionScoringTopMatch] {
-        DevDatabaseTools.debugPrintTopHolidayOccasionScores(
-            database: databaseManager,
-            limit: limit
+    func fetchHolidayLandingCatalogItems() -> [HolidayLandingItem] {
+        let holidays = container.holidays.fetchAllEnabledHolidays()
+        let birthdays = fetchPeopleWithBirthDates()
+        return HolidayLandingCatalog.build(
+            holidays: holidays,
+            nextOccurrenceForHoliday: { holiday in
+                container.holidays.nextOccurrence(for: holiday)
+            },
+            peopleWithBirthDates: birthdays
         )
-    }
-
-    func fetchEditableOccasions() -> [EditableOccasion] {
-        container.occasions.fetchEditableOccasions()
-    }
-
-    func saveEditableOccasions(_ occasions: [EditableOccasion]) {
-        container.occasions.saveEditableOccasions(occasions)
-    }
-
-    // MARK: - Photo ↔ occasion (per-occasion on-frame)
-
-    func linkPhotoToOccasion(
-        photoId: String,
-        occasionKey: String,
-        source: PhotoOccasionSource,
-        personId: Int? = nil,
-        isOnFrame: Bool = false
-    ) {
-        dbQueue.sync {
-            guard let occasionId = container.photoOccasions.occasionIdUnsafe(occasionKey: occasionKey) else {
-                return
-            }
-
-            let wasOnFrame = container.photoOccasions.isPhotoOnFrameForOccasionUnsafe(
-                photoId: photoId,
-                occasionId: occasionId
-            )
-
-            container.photoOccasions.linkPhotoToOccasionUnsafe(
-                photoId: photoId,
-                occasionId: occasionId,
-                source: source,
-                personId: personId,
-                isOnFrame: isOnFrame
-            )
-
-            if isOnFrame && !wasOnFrame {
-                adjustOccasionOnFrameCountUnsafe(occasionKey: occasionKey, delta: 1)
-            } else if !isOnFrame && wasOnFrame {
-                adjustOccasionOnFrameCountUnsafe(occasionKey: occasionKey, delta: -1)
-            }
-        }
-    }
-
-    func setPhotoOccasionOnFrame(
-        photoId: String,
-        occasionKey: String,
-        isOnFrame: Bool
-    ) {
-        dbQueue.sync {
-            guard let occasionId = container.photoOccasions.occasionIdUnsafe(occasionKey: occasionKey) else {
-                return
-            }
-
-            let wasOnFrame = container.photoOccasions.isPhotoOnFrameForOccasionUnsafe(
-                photoId: photoId,
-                occasionId: occasionId
-            )
-
-            container.photoOccasions.setPhotoOccasionOnFrameUnsafe(
-                photoId: photoId,
-                occasionId: occasionId,
-                isOnFrame: isOnFrame
-            )
-
-            if isOnFrame && !wasOnFrame {
-                adjustOccasionOnFrameCountUnsafe(occasionKey: occasionKey, delta: 1)
-            } else if !isOnFrame && wasOnFrame {
-                adjustOccasionOnFrameCountUnsafe(occasionKey: occasionKey, delta: -1)
-            }
-        }
-    }
-
-    func setPhotosOccasionOnFrame(
-        photoIds: [String],
-        occasionKey: String,
-        isOnFrame: Bool
-    ) {
-        dbQueue.sync {
-            guard let occasionId = container.photoOccasions.occasionIdUnsafe(occasionKey: occasionKey) else {
-                return
-            }
-
-            var delta = 0
-
-            for photoId in photoIds {
-                let wasOnFrame = container.photoOccasions.isPhotoOnFrameForOccasionUnsafe(
-                    photoId: photoId,
-                    occasionId: occasionId
-                )
-
-                container.photoOccasions.setPhotoOccasionOnFrameUnsafe(
-                    photoId: photoId,
-                    occasionId: occasionId,
-                    isOnFrame: isOnFrame
-                )
-
-                if isOnFrame && !wasOnFrame {
-                    delta += 1
-                } else if !isOnFrame && wasOnFrame {
-                    delta -= 1
-                }
-            }
-
-            if delta != 0 {
-                adjustOccasionOnFrameCountUnsafe(occasionKey: occasionKey, delta: delta)
-            }
-        }
-    }
-
-    func fetchOnFramePhotoIds(occasionKey: String) -> [String] {
-        guard let occasionId = container.photoOccasions.occasionId(forKey: occasionKey) else {
-            return []
-        }
-
-        return container.photoOccasions.fetchOnFramePhotoIds(occasionId: occasionId)
-    }
-
-    func countOnFramePhotos(occasionKey: String) -> Int {
-        guard let occasionId = container.photoOccasions.occasionId(forKey: occasionKey) else {
-            return 0
-        }
-
-        return container.photoOccasions.countOnFramePhotos(occasionId: occasionId)
-    }
-
-    func fetchPhotoOccasions(photoId: String) -> [PhotoOccasionLink] {
-        container.photoOccasions.fetchPhotoOccasions(photoId: photoId)
-    }
-
-    func saveOccasionSubjects(
-        occasionKey: String,
-        subjects: [(personId: Int, role: OccasionSubjectRole)]
-    ) {
-        guard let occasionId = container.photoOccasions.occasionId(forKey: occasionKey) else {
-            return
-        }
-
-        container.photoOccasions.saveOccasionSubjects(
-            occasionId: occasionId,
-            subjects: subjects
-        )
-    }
-
-    func fetchOccasionSubjects(occasionKey: String) -> [OccasionSubject] {
-        guard let occasionId = container.photoOccasions.occasionId(forKey: occasionKey) else {
-            return []
-        }
-
-        return container.photoOccasions.fetchOccasionSubjects(occasionId: occasionId)
-    }
-
-    func searchPhotosWithPeople(
-        requiredPersonId: Int,
-        includingAnyOfPersonIds childPersonIds: [Int],
-        exactPeopleOnly: Bool = true
-    ) -> [String] {
-        container.photoOccasions.searchPhotosWithPeople(
-            requiredPersonId: requiredPersonId,
-            includingAnyOfPersonIds: childPersonIds,
-            exactPeopleOnly: exactPeopleOnly
-        )
-    }
-
-    func searchPhotosWithPerson(personId: Int, exactPeopleOnly: Bool = true) -> [String] {
-        container.photoOccasions.searchPhotosWithPerson(
-            personId: personId,
-            exactPeopleOnly: exactPeopleOnly
-        )
-    }
-
-    func fetchOccasionPersonId(occasionKey: String) -> Int? {
-        container.occasions.fetchOccasionPersonId(occasionKey: occasionKey)
-    }
-
-    func fetchOccasionLandingCatalogItems() -> [OccasionLandingItem] {
-        dbQueue.sync {
-            var catalog = container.occasions.fetchOccasionLandingCatalogUnsafe()
-            if catalog.isEmpty {
-                container.occasions.ensureDefaultSeedDataUnsafe()
-                catalog = container.occasions.fetchOccasionLandingCatalogUnsafe()
-            }
-            return Self.makeLandingItems(from: catalog, collectionCounts: nil, onFrameCounts: nil)
-        }
-    }
-
-    func applyCachedOccasionLandingMetrics(
-        to items: [OccasionLandingItem]
-    ) -> (items: [OccasionLandingItem], staleTagValues: [String]) {
-        dbQueue.sync {
-            let cache = container.landingMetricsCache
-            var staleTagValues: [String] = []
-
-            let updatedItems = items.map { item in
-                if let cached = cache.fetchCachedUnsafe(tagValue: item.tagValue) {
-                    return item.withCounts(
-                        collection: cached.collectionCount,
-                        onFrame: cached.onFramePhotoCount
-                    )
-                }
-
-                staleTagValues.append(item.tagValue)
-                return item
-            }
-
-            return (updatedItems, staleTagValues)
-        }
-    }
-
-    func countOccasionLandingItemMetrics(
-        occasionKey: String,
-        tagValue: String,
-        occasionType: String,
-        displayName: String
-    ) -> (collections: Int, onFramePhotos: Int) {
-        dbQueue.sync {
-            countOccasionLandingItemMetricsUnsafe(
-                occasionKey: occasionKey,
-                tagValue: tagValue,
-                occasionType: occasionType,
-                displayName: displayName
-            )
-        }
-    }
-
-    func countOccasionLandingMetricsBatch(
-        requests: [OccasionLandingMetricsRequest]
-    ) -> [String: (collections: Int, onFramePhotos: Int)] {
-        dbQueue.sync {
-            var results: [String: (collections: Int, onFramePhotos: Int)] = [:]
-            results.reserveCapacity(requests.count)
-
-            for request in requests {
-                results[request.tagValue] = countOccasionLandingItemMetricsUnsafe(
-                    occasionKey: request.occasionKey,
-                    tagValue: request.tagValue,
-                    occasionType: request.occasionType,
-                    displayName: request.displayName
-                )
-            }
-
-            return results
-        }
-    }
-
-    private func countOccasionLandingItemMetricsUnsafe(
-        occasionKey: String,
-        tagValue: String,
-        occasionType: String,
-        displayName: String
-    ) -> (collections: Int, onFramePhotos: Int) {
-        let cache = container.landingMetricsCache
-
-        if let cached = cache.fetchCachedUnsafe(tagValue: tagValue) {
-            return (cached.collectionCount, cached.onFramePhotoCount)
-        }
-
-        let filter = occasionEventListFilter(
-            occasionKey: occasionKey,
-            tagValue: tagValue,
-            occasionType: occasionType,
-            displayName: displayName
-        )
-        let listEventIds = eventRepository.fetchListEventIdsForFilterUnsafe(
-            filter: filter,
-            includeHidden: false
-        )
-        let onFramePhotos = countOnFramePhotosForOccasionUnsafe(
-            occasionKey: occasionKey,
-            tagValue: tagValue,
-            occasionType: occasionType
-        )
-
-        if let occasionId = container.photoOccasions.occasionIdUnsafe(occasionKey: occasionKey) {
-            cache.replaceCollectionMembershipForOccasionUnsafe(
-                occasionId: occasionId,
-                listEventIds: listEventIds,
-                tagValue: tagValue
-            )
-        }
-
-        cache.saveUnsafe(
-            tagValue: tagValue,
-            collectionCount: listEventIds.count,
-            onFramePhotoCount: onFramePhotos
-        )
-
-        return (listEventIds.count, onFramePhotos)
-    }
-
-    func fetchOccasionFrameLandingSnapshot(
-        occasionKey: String,
-        tagValue: String,
-        name: String,
-        nextOccurrence: Date,
-        occasionType: String
-    ) -> OccasionFrameLandingSnapshot {
-        dbQueue.sync {
-            let metrics = countOccasionLandingItemMetricsUnsafe(
-                occasionKey: occasionKey,
-                tagValue: tagValue,
-                occasionType: occasionType,
-                displayName: name
-            )
-            let collectionCount = metrics.collections
-
-            syncEventInheritedOnFrameForOccasionUnsafe(
-                occasionKey: occasionKey,
-                occasionType: occasionType,
-                tagValue: tagValue,
-                displayName: name
-            )
-
-            var photoIds: [String] = []
-            if let occasionId = container.photoOccasions.occasionIdUnsafe(occasionKey: occasionKey) {
-                photoIds = container.photoOccasions.fetchOnFramePhotoIdsUnsafe(
-                    occasionId: occasionId
-                )
-            }
-
-            if photoIds.isEmpty, occasionType != "birthday" {
-                photoIds = eventRepository.fetchOnFramePhotoIdsForHolidayTagUnsafe(
-                    tagValue: tagValue,
-                    includeHidden: false
-                )
-            }
-
-            if container.landingMetricsCache.hasMetricsUnsafe(tagValue: tagValue) {
-                container.landingMetricsCache.updateOnFrameCountUnsafe(
-                    tagValue: tagValue,
-                    onFramePhotoCount: photoIds.count
-                )
-            }
-
-            return OccasionFrameLandingSnapshot(
-                occasionKey: occasionKey,
-                name: name,
-                tagValue: tagValue,
-                nextOccurrence: nextOccurrence,
-                collectionCount: collectionCount,
-                onFramePhotoIds: photoIds
-            )
-        }
-    }
-
-    private func tagValueForOccasionCatalogRow(
-        _ row: OccasionLandingCatalogRow
-    ) -> String {
-        OccasionHolidayTagService.holidayTagValue(
-            occasionKey: row.occasionKey,
-            displayName: row.name
-        )
-    }
-
-    private func countOnFramePhotosForOccasionUnsafe(
-        occasionKey: String,
-        tagValue: String,
-        occasionType: String
-    ) -> Int {
-        if occasionType == "birthday"
-            || occasionKey == "mothers_day"
-            || occasionKey == "fathers_day",
-           let occasionId = container.photoOccasions.occasionIdUnsafe(occasionKey: occasionKey) {
-            return container.photoOccasions.countOnFramePhotosUnsafe(occasionId: occasionId)
-        }
-
-        return eventRepository.countOnFramePhotosForHolidayTagUnsafe(
-            tagValue: tagValue,
-            includeHidden: false
-        )
-    }
-
-    private func usesPhotoOccasionOnFrame(
-        occasionKey: String,
-        occasionType: String
-    ) -> Bool {
-        occasionType == "birthday"
-            || occasionKey == "mothers_day"
-            || occasionKey == "fathers_day"
-    }
-
-    private func syncPhotoOccasionOnFrameFromEventPhotoUnsafe(
-        photoId: String,
-        eventId: Int,
-        isOnFrame: Bool
-    ) {
-        let listEventId = eventRepository.resolveListEventIdUnsafe(eventId: eventId)
-        guard listEventId > 0 else { return }
-
-        for row in container.occasions.fetchOccasionLandingCatalogUnsafe() {
-            guard usesPhotoOccasionOnFrame(
-                occasionKey: row.occasionKey,
-                occasionType: row.occasionType
-            ) else {
-                continue
-            }
-
-            let tagValue = tagValueForOccasionCatalogRow(row)
-            let filter = occasionEventListFilter(
-                occasionKey: row.occasionKey,
-                tagValue: tagValue,
-                occasionType: row.occasionType,
-                displayName: row.name
-            )
-            guard eventRepository.listEventQualifiesForFilterUnsafe(
-                listEventId: listEventId,
-                filter: filter,
-                includeHidden: false
-            ) else {
-                continue
-            }
-
-            guard let occasionId = container.photoOccasions.occasionIdUnsafe(
-                occasionKey: row.occasionKey
-            ) else {
-                continue
-            }
-
-            let wasOnFrame = container.photoOccasions.isPhotoOnFrameForOccasionUnsafe(
-                photoId: photoId,
-                occasionId: occasionId
-            )
-
-            if isOnFrame {
-                container.photoOccasions.linkPhotoToOccasionUnsafe(
-                    photoId: photoId,
-                    occasionId: occasionId,
-                    source: .eventInherit,
-                    personId: nil,
-                    isOnFrame: true
-                )
-                if !wasOnFrame {
-                    adjustOccasionOnFrameCountUnsafe(occasionKey: row.occasionKey, delta: 1)
-                }
-            } else if wasOnFrame,
-                      container.photoOccasions.photoOccasionSourceUnsafe(
-                          photoId: photoId,
-                          occasionId: occasionId
-                      ) == .eventInherit {
-                container.photoOccasions.setPhotoOccasionOnFrameUnsafe(
-                    photoId: photoId,
-                    occasionId: occasionId,
-                    isOnFrame: false
-                )
-                adjustOccasionOnFrameCountUnsafe(occasionKey: row.occasionKey, delta: -1)
-            }
-        }
-    }
-
-    private func syncEventInheritedOnFrameForOccasionUnsafe(
-        occasionKey: String,
-        occasionType: String,
-        tagValue: String,
-        displayName: String
-    ) {
-        guard usesPhotoOccasionOnFrame(
-            occasionKey: occasionKey,
-            occasionType: occasionType
-        ) else {
-            return
-        }
-
-        guard let occasionId = container.photoOccasions.occasionIdUnsafe(occasionKey: occasionKey) else {
-            return
-        }
-
-        let filter = occasionEventListFilter(
-            occasionKey: occasionKey,
-            tagValue: tagValue,
-            occasionType: occasionType,
-            displayName: displayName
-        )
-        let listEventIds = eventRepository.fetchListEventIdsForFilterUnsafe(
-            filter: filter,
-            includeHidden: false
-        )
-
-        for listEventId in listEventIds {
-            let photoIds = eventRepository.fetchOnFramePhotoIdsForListEventUnsafe(
-                listEventId: listEventId
-            )
-            for photoId in photoIds {
-                container.photoOccasions.linkPhotoToOccasionUnsafe(
-                    photoId: photoId,
-                    occasionId: occasionId,
-                    source: .eventInherit,
-                    personId: nil,
-                    isOnFrame: true
-                )
-            }
-        }
-    }
-
-    private func adjustOccasionOnFrameCountUnsafe(occasionKey: String, delta: Int) {
-        guard delta != 0,
-              let row = container.occasions.fetchOccasionLandingCatalogUnsafe()
-                  .first(where: { $0.occasionKey == occasionKey }) else {
-            return
-        }
-
-        let tagValue = tagValueForOccasionCatalogRow(row)
-        guard container.landingMetricsCache.hasMetricsUnsafe(tagValue: tagValue) else {
-            return
-        }
-
-        container.landingMetricsCache.adjustCountsUnsafe(
-            tagValue: tagValue,
-            onFrameDelta: delta
-        )
-    }
-
-    private func reconcileOccasionCollectionCountsUnsafe(forEventId eventId: Int) {
-        let listEventId = eventRepository.resolveListEventIdUnsafe(eventId: eventId)
-        guard listEventId > 0 else { return }
-
-        let catalog = container.occasions.fetchOccasionLandingCatalogUnsafe()
-
-        for row in catalog {
-            let tagValue = tagValueForOccasionCatalogRow(row)
-            let filter = occasionEventListFilter(
-                occasionKey: row.occasionKey,
-                tagValue: tagValue,
-                occasionType: row.occasionType,
-                displayName: row.name
-            )
-            let qualifies = eventRepository.listEventQualifiesForFilterUnsafe(
-                listEventId: listEventId,
-                filter: filter,
-                includeHidden: false
-            )
-            let hadMembership = container.landingMetricsCache.hasCollectionMembershipUnsafe(
-                occasionId: row.occasionId,
-                listEventId: listEventId
-            )
-
-            if qualifies != hadMembership {
-                container.landingMetricsCache.setCollectionMembershipUnsafe(
-                    occasionId: row.occasionId,
-                    listEventId: listEventId,
-                    isMember: qualifies,
-                    tagValue: tagValue
-                )
-            }
-        }
-    }
-
-    private func refreshCachedHolidayOnFrameCountsForEventUnsafe(eventId: Int) {
-        let listEventId = eventRepository.resolveListEventIdUnsafe(eventId: eventId)
-        guard listEventId > 0 else { return }
-
-        let tagValues = eventTags.fetchHolidayTagValuesForEventUnsafe(eventId: listEventId)
-        guard !tagValues.isEmpty else { return }
-
-        for tagValue in tagValues {
-            guard container.landingMetricsCache.hasMetricsUnsafe(tagValue: tagValue) else {
-                continue
-            }
-
-            let onFrame = eventRepository.countOnFramePhotosForHolidayTagUnsafe(
-                tagValue: tagValue,
-                includeHidden: false
-            )
-            container.landingMetricsCache.updateOnFrameCountUnsafe(
-                tagValue: tagValue,
-                onFramePhotoCount: onFrame
-            )
-        }
-    }
-
-    private func rebuildOccasionLandingOnFrameCountsUnsafe() {
-        let catalog = container.occasions.fetchOccasionLandingCatalogUnsafe()
-
-        for row in catalog {
-            let tagValue = tagValueForOccasionCatalogRow(row)
-            guard container.landingMetricsCache.hasMetricsUnsafe(tagValue: tagValue) else {
-                continue
-            }
-
-            let onFrame = countOnFramePhotosForOccasionUnsafe(
-                occasionKey: row.occasionKey,
-                tagValue: tagValue,
-                occasionType: row.occasionType
-            )
-            container.landingMetricsCache.updateOnFrameCountUnsafe(
-                tagValue: tagValue,
-                onFramePhotoCount: onFrame
-            )
-        }
-    }
-
-    private func rebuildOccasionLandingMetricsUnsafe() {
-        let catalog = container.occasions.fetchOccasionLandingCatalogUnsafe()
-        let cache = container.landingMetricsCache
-
-        cache.clearAllCollectionMembershipUnsafe()
-
-        for row in catalog {
-            let tagValue = tagValueForOccasionCatalogRow(row)
-            let filter = occasionEventListFilter(
-                occasionKey: row.occasionKey,
-                tagValue: tagValue,
-                occasionType: row.occasionType,
-                displayName: row.name
-            )
-            let listEventIds = eventRepository.fetchListEventIdsForFilterUnsafe(
-                filter: filter,
-                includeHidden: false
-            )
-            let onFrame = countOnFramePhotosForOccasionUnsafe(
-                occasionKey: row.occasionKey,
-                tagValue: tagValue,
-                occasionType: row.occasionType
-            )
-
-            cache.replaceCollectionMembershipForOccasionUnsafe(
-                occasionId: row.occasionId,
-                listEventIds: listEventIds,
-                tagValue: tagValue
-            )
-            cache.saveUnsafe(
-                tagValue: tagValue,
-                collectionCount: listEventIds.count,
-                onFramePhotoCount: onFrame
-            )
-        }
-    }
-
-    func fetchOccasionLandingItems() -> [OccasionLandingItem] {
-        let catalog = fetchOccasionLandingCatalogItems()
-        return catalog.map { item in
-            let metrics = countOccasionLandingItemMetrics(
-                occasionKey: item.occasionKey,
-                tagValue: item.tagValue,
-                occasionType: item.occasionType,
-                displayName: item.name
-            )
-            return item.withCounts(
-                collection: metrics.collections,
-                onFrame: metrics.onFramePhotos
-            )
-        }
     }
 
     func fetchAllPeople() -> [PeopleRepository.PersonRecord] {
@@ -2153,6 +2545,179 @@ final class PhotoDatabase: @unchecked Sendable {
         peopleRepository.fetchPeopleWithBirthDates()
     }
 
+    func enqueueFaceRecognitionScan(forceRescan: Bool = false, limit: Int = 2_000) -> VisionJobEnqueueSummary {
+        let summary = container.visionJobEnqueue.enqueueFaceRecognitionScan(
+            forceRescan: forceRescan,
+            limit: limit
+        )
+        if summary.enqueuedCount > 0 {
+            container.visionJobCoordinator.startIfNeeded()
+        }
+        return summary
+    }
+
+    /// Seeds face detect+embed for specific photos (Picture Search results / event open).
+    @discardableResult
+    func enqueueFaceRecognitionForPhotoIds(_ photoIds: [String]) -> VisionJobEnqueueSummary {
+        let summary = container.visionJobEnqueue.enqueueFaceRecognitionForPhotoIds(photoIds)
+        if summary.enqueuedCount > 0 {
+            container.visionJobCoordinator.startIfNeeded()
+        }
+        return summary
+    }
+
+    /// Seeds face detect for photos in an event that still need a scan.
+    @discardableResult
+    func enqueueFaceRecognitionForEvent(
+        eventId: Int,
+        includeHidden: Bool = false
+    ) -> VisionJobEnqueueSummary {
+        let photoIds = getPhotosForEvent(eventId: eventId, includeHidden: includeHidden).map(\.id)
+        return enqueueFaceRecognitionForPhotoIds(photoIds)
+    }
+
+    private func maybeEnqueueFaceDetectAfterPictureSearch(
+        definition: PictureSearchDefinition,
+        report: PictureSearchRunReport
+    ) {
+        guard definition.performFaceDetect else { return }
+        let photoIds = report.photoMatches.map(\.photoId)
+        guard !photoIds.isEmpty else { return }
+        _ = enqueueFaceRecognitionForPhotoIds(photoIds)
+    }
+
+    /// Cancels queued face jobs and re-stamps photos that already have face rows (undo accidental force-rescan).
+    @discardableResult
+    func cancelFaceRecognitionScan(restoreScannedVersions: Bool = true) -> Int {
+        container.visionJobCoordinator.cancelScope("faceRecognition:library")
+        guard restoreScannedVersions else { return 0 }
+        return restoreFaceRecognitionVersionsForScannedPhotos()
+    }
+
+    /// Fixes progress after force-rescan cleared version stamps while face rows still exist.
+    @discardableResult
+    func restoreFaceRecognitionVersionsForScannedPhotos() -> Int {
+        databaseManager.sync {
+            container.faceRecognition.restoreFaceRecognitionVersionsForPhotosWithFacesUnsafe(
+                algorithmVersion: FaceRecognitionAnalyzer.algorithmVersion
+            )
+        }
+    }
+
+    /// Cancels/purges face jobs and deletes all face recognition + face-named people data.
+    func resetAllFaceRecognitionData() {
+        container.visionJobCoordinator.cancelScope("faceRecognition:library")
+        databaseManager.sync {
+            container.visionJobs.purgeJobsOfTypeUnsafe(jobType: .faceRecognitionScan)
+        }
+        container.faceRecognitionService.resetAllFaceRecognitionData()
+    }
+
+    func fetchUnnamedFaceClusters() -> [PersonClusterRecord] {
+        container.faceRecognitionService.fetchUnnamedClusters()
+    }
+
+    func fetchFaceAnnotations(forPhotoId photoId: String) -> [PhotoFaceAnnotation] {
+        container.faceRecognitionService.fetchFaceAnnotations(forPhotoId: photoId)
+    }
+
+    func ensurePhotoFaceScanned(photoId: String) async -> [PhotoFaceAnnotation] {
+        await container.faceRecognitionService.ensurePhotoFaceScanned(photoId: photoId)
+    }
+
+    @discardableResult
+    func nameFaceInstance(
+        faceInstanceId: Int,
+        displayName: String,
+        firstName: String?,
+        lastName: String?,
+        maidenName: String?
+    ) -> Int {
+        container.faceRecognitionService.nameFaceInstance(
+            faceInstanceId: faceInstanceId,
+            displayName: displayName,
+            firstName: firstName,
+            lastName: lastName,
+            maidenName: maidenName
+        )
+    }
+
+    @discardableResult
+    func propagateNamedFaceToSimilarPhotos(
+        sourceFaceInstanceId: Int,
+        siblingPhotoIds: [String]
+    ) async -> Int {
+        await container.faceRecognitionService.propagateNamedFaceToSimilarPhotos(
+            sourceFaceInstanceId: sourceFaceInstanceId,
+            siblingPhotoIds: siblingPhotoIds
+        )
+    }
+
+    func nameFaceCluster(
+        clusterId: Int,
+        displayName: String,
+        firstName: String?,
+        lastName: String?,
+        maidenName: String?
+    ) -> Int {
+        container.faceRecognitionService.nameCluster(
+            clusterId: clusterId,
+            displayName: displayName,
+            firstName: firstName,
+            lastName: lastName,
+            maidenName: maidenName
+        )
+    }
+
+    func mergeFaceCluster(clusterId: Int, intoPersonId personId: Int) {
+        container.faceRecognitionService.mergeClusterIntoPerson(
+            clusterId: clusterId,
+            personId: personId
+        )
+    }
+
+    func ignoreFaceCluster(clusterId: Int) {
+        container.faceRecognitionService.ignoreCluster(clusterId: clusterId)
+    }
+
+    @discardableResult
+    func consolidateUnnamedFaceClusters() -> Int {
+        container.faceRecognitionService.consolidateUnnamedClusters()
+    }
+
+    @discardableResult
+    func rebuildUnnamedFaceClusters() -> Int {
+        container.faceRecognitionService.rebuildUnnamedClusters()
+    }
+
+    func fetchPhotoIdsForPerson(personId: Int) -> [String] {
+        container.faceRecognitionService.fetchPhotoIds(forPersonId: personId)
+    }
+
+    func fetchPhotoIdsForFaceCluster(clusterId: Int) -> [String] {
+        container.faceRecognitionService.fetchPhotoIds(forClusterId: clusterId)
+    }
+
+    func countPhotosNeedingFaceRecognition() -> Int {
+        databaseManager.sync {
+            container.faceRecognition.countPhotosNeedingFaceRecognitionUnsafe(
+                algorithmVersion: FaceRecognitionAnalyzer.algorithmVersion
+            )
+        }
+    }
+
+    func faceRecognitionProgress() -> FaceRecognitionProgress {
+        databaseManager.sync {
+            container.faceRecognition.faceRecognitionProgressUnsafe(
+                algorithmVersion: FaceRecognitionAnalyzer.algorithmVersion
+            )
+        }
+    }
+
+    func pendingFaceRecognitionJobCount() -> Int {
+        container.visionJobCoordinator.pendingCount(scopeKey: "faceRecognition:library")
+    }
+
     func fetchEventPeople(
         eventId: Int,
         includeChildEvents: Bool
@@ -2161,55 +2726,5 @@ final class PhotoDatabase: @unchecked Sendable {
             eventId: eventId,
             includeChildEvents: includeChildEvents
         )
-    }
-
-    private static func makeLandingItems(
-        from catalog: [OccasionLandingCatalogRow],
-        collectionCounts: [String: Int]?,
-        onFrameCounts: [String: Int]?
-    ) -> [OccasionLandingItem] {
-        catalog.map { row in
-            let nextOccurrence = parseLandingDate(row.nextOccurrenceISO) ?? Date()
-            let tagValue = OccasionHolidayTagService.holidayTagValue(
-                occasionKey: row.occasionKey,
-                displayName: row.name
-            )
-
-            return OccasionLandingItem(
-                occasionId: row.occasionId,
-                occasionKey: row.occasionKey,
-                name: row.name,
-                occasionType: row.occasionType,
-                tagValue: tagValue,
-                nextOccurrence: nextOccurrence,
-                collectionCount: collectionCounts?[tagValue],
-                onFramePhotoCount: onFrameCounts?[tagValue]
-            )
-        }
-    }
-
-    private func occasionEventListFilter(
-        occasionKey: String,
-        tagValue: String,
-        occasionType: String,
-        displayName: String
-    ) -> EventListFilter {
-        if occasionType == "birthday" {
-            return .birthdayOccasion(occasionKey: occasionKey, displayName: displayName)
-        }
-        return .holidayTag(value: tagValue)
-    }
-
-    private static func parseLandingDate(_ iso: String) -> Date? {
-        if let date = EventDateParser.parseDate(iso) {
-            return date
-        }
-
-        let formatter = DateFormatter()
-        formatter.calendar = Calendar.current
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = Calendar.current.timeZone
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.date(from: iso)
     }
 }

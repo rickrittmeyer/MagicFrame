@@ -4,14 +4,9 @@ struct EventLibraryRowView: View {
 
     let event: IndexedEvent
     var slideshowPhotoIds: [String] = []
+    var gameCoverScoreBoard: GameCoverScoreBoard? = nil
+    var gameSuggestedName: String? = nil
     var slideshowQuality: PhotoThumbnailView.Quality = .high
-    var showsHiddenBadge: Bool = false
-    var onHide: (() -> Void)? = nil
-    var onUnhide: (() -> Void)? = nil
-    var onConfirmAIAttributeTag: ((EventAttributeTag) -> Void)? = nil
-    var onRemoveAIAttributeTag: ((EventAttributeTag) -> Void)? = nil
-
-    @State private var isConfirmingHideEvent = false
 
     private let cornerRadius: CGFloat = 5
     /// Full-width banner uses 4:3 so height scales with row width.
@@ -19,54 +14,32 @@ struct EventLibraryRowView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if showsHiddenBadge {
-                if let onUnhide {
-                    Button(action: onUnhide) {
-                        Label("Hidden", systemImage: "eye.slash")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Unhide event")
-                } else {
-                    Label("Hidden", systemImage: "eye.slash")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                }
-            }
-
             titleLine
-
-            if !event.libraryAttributeTags.isEmpty {
-                FlowLayout(spacing: 8, lineSpacing: 8) {
-                    ForEach(event.libraryAttributeTags) { tag in
-                        EventAttributeTagChip(
-                            tag: tag,
-                            showsCategoryIcon: true,
-                            onConfirmAI: tag.isAIDerived
-                                ? { onConfirmAIAttributeTag?(tag) }
-                                : nil,
-                            onRemoveAI: tag.isAIDerived
-                                ? { onRemoveAIAttributeTag?(tag) }
-                                : nil
-                        )
-                    }
-                }
-            }
 
             EventSlideshowRotatorView(
                 photoIds: displaySlideshowPhotoIds,
                 aspectRatio: photoAspectRatio,
                 cornerRadius: cornerRadius,
-                thumbnailQuality: slideshowQuality
+                thumbnailQuality: slideshowQuality,
+                coverScoreBoard: gameCoverScoreBoard
             )
 
             locationLine
 
             HStack(alignment: .top, spacing: 12) {
-                Label("\(event.photoCount)", systemImage: "camera")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if event.photoCount > 0 {
+                    Label("\(event.photoCount)", systemImage: "camera")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("\(event.photoCount) photos")
+                }
+
+                if event.videoCount > 0 {
+                    Label("\(event.videoCount)", systemImage: "video")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("\(event.videoCount) videos")
+                }
 
                 if !event.people.isEmpty {
                     Text(event.people.joined(separator: ", "))
@@ -82,45 +55,38 @@ struct EventLibraryRowView: View {
             RoundedRectangle(cornerRadius: cornerRadius)
                 .strokeBorder(Color(white: 0.35), lineWidth: 2)
         }
-        .confirmationDialog(
-            "Hide Event",
-            isPresented: $isConfirmingHideEvent,
-            titleVisibility: .visible
-        ) {
-            Button("Hide Event", role: .destructive) {
-                onHide?()
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text(
-                "This event will now be hidden. You can find this Event again by selecting Show Hidden Events."
-            )
-        }
     }
 
     private var displaySlideshowPhotoIds: [String] {
-        slideshowPhotoIds
+        if !slideshowPhotoIds.isEmpty {
+            return slideshowPhotoIds
+        }
+        if let coverPhotoId = event.coverPhotoId, !coverPhotoId.isEmpty {
+            return [coverPhotoId]
+        }
+        return []
     }
 
     @ViewBuilder
     private var titleLine: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            if onHide != nil {
-                Button {
-                    isConfirmingHideEvent = true
-                } label: {
-                    Image(systemName: "eye.slash")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Hide event")
-            }
-
-            if let title = event.listTitleText {
+            if let gameTitle = gameSuggestedName,
+               event.usesSuggestedName {
+                Text(gameTitle)
+                    .font(.headline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else if let title = event.listTitleText {
                 Text(title)
                     .font(.headline)
                     .foregroundStyle(event.usesSuggestedName ? .secondary : .primary)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else if let gameTitle = gameSuggestedName {
+                Text(gameTitle)
+                    .font(.headline)
+                    .foregroundStyle(.secondary)
                     .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
@@ -168,6 +134,7 @@ private struct EventSlideshowRotatorView: View {
     let aspectRatio: CGFloat
     let cornerRadius: CGFloat
     var thumbnailQuality: PhotoThumbnailView.Quality = .high
+    var coverScoreBoard: GameCoverScoreBoard? = nil
 
     private let photoHold: Duration = .seconds(2)
     private let crossfadeDuration: TimeInterval = 0.5
@@ -176,31 +143,41 @@ private struct EventSlideshowRotatorView: View {
     @State private var previousIndex: Int?
 
     var body: some View {
-        Group {
-            if photoIds.isEmpty {
-                placeholder
-            } else if photoIds.count == 1 || thumbnailQuality == .fast {
-                slideshowPhoto(photoIds[0])
-            } else {
-                ZStack {
-                    ForEach(visibleSlideIndices, id: \.self) { index in
-                        slideshowPhoto(photoIds[index])
-                            .opacity(index == currentIndex ? 1 : 0)
-                            .zIndex(index == currentIndex ? 1 : 0)
+        ZStack(alignment: .bottom) {
+            Group {
+                if photoIds.isEmpty {
+                    placeholder
+                } else if photoIds.count == 1 || thumbnailQuality == .fast {
+                    slideshowPhoto(photoIds[0])
+                } else {
+                    ZStack {
+                        ForEach(visibleSlideIndices, id: \.self) { index in
+                            slideshowPhoto(photoIds[index])
+                                .opacity(index == currentIndex ? 1 : 0)
+                                .zIndex(index == currentIndex ? 1 : 0)
+                        }
+                    }
+                    .animation(.easeInOut(duration: crossfadeDuration), value: currentIndex)
+                    .onChange(of: photoIds) { _, _ in
+                        currentIndex = 0
+                        previousIndex = nil
+                    }
+                    .onChange(of: thumbnailQuality) { _, _ in
+                        currentIndex = 0
+                        previousIndex = nil
+                    }
+                    .task(id: rotationTaskKey) {
+                        await runRotation()
                     }
                 }
-                .animation(.easeInOut(duration: crossfadeDuration), value: currentIndex)
-                .onChange(of: photoIds) { _, _ in
-                    currentIndex = 0
-                    previousIndex = nil
-                }
-                .onChange(of: thumbnailQuality) { _, _ in
-                    currentIndex = 0
-                    previousIndex = nil
-                }
-                .task(id: rotationTaskKey) {
-                    await runRotation()
-                }
+            }
+
+            if let coverScoreBoard {
+                GameCoverScoreBoardView(board: coverScoreBoard)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.black.opacity(0.55))
             }
         }
         .frame(maxWidth: .infinity)

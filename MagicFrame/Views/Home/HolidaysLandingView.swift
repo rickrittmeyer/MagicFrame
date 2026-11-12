@@ -11,24 +11,24 @@ struct HolidaysLandingView: View {
 
     var body: some View {
         ScrollView {
-            if !vm.hasLoadedOccasionLanding || vm.isLoadingOccasionLanding {
-                ProgressView("Loading occasions…")
+            if !vm.hasLoadedHolidayLanding || vm.isLoadingHolidayLanding {
+                ProgressView("Loading holidays…")
                     .frame(maxWidth: .infinity)
                     .padding(.top, 48)
-            } else if vm.occasionLandingItems.isEmpty {
+            } else if vm.holidayLandingItems.isEmpty {
                 ContentUnavailableView(
-                    "No Occasions",
+                    "No Holidays",
                     systemImage: "calendar",
-                    description: Text("Holiday and birthday occasions will appear here after seed data is loaded.")
+                    description: Text("Built-in holidays and people with birthdays will appear here.")
                 )
                 .padding(.top, 40)
             } else {
                 LazyVGrid(columns: columns, spacing: 12) {
-                    ForEach(vm.occasionLandingItems) { item in
+                    ForEach(vm.holidayLandingItems) { item in
                         NavigationLink {
                             destination(for: item)
                         } label: {
-                            OccasionLandingCard(item: item)
+                            HolidayLandingCard(item: item)
                         }
                         .buttonStyle(.plain)
                     }
@@ -39,37 +39,32 @@ struct HolidaysLandingView: View {
         }
         .navigationTitle("Holidays")
         .navigationBarTitleDisplayMode(.large)
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            if vm.isLoadingOccasionLandingCounts {
-                HStack(spacing: 8) {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text("Updating collection counts…")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 8)
-                .background(.bar)
-            }
-        }
         .task {
-            vm.scheduleOccasionLandingRefresh()
+            vm.scheduleHolidayLandingRefresh()
+        }
+        .onAppear {
+            vm.clearEventsTabFocus()
         }
         .onDisappear {
-            vm.cancelOccasionLandingRefresh()
+            vm.cancelHolidayLandingRefresh()
         }
     }
 
     @ViewBuilder
-    private func destination(for item: OccasionLandingItem) -> some View {
-        if item.usesOccasionFrameLanding {
-            OccasionFrameLandingView(item: item, vm: vm)
-        } else {
-            EventsLibraryScreen(
-                filter: .holidayTag(value: item.tagValue),
-                vm: vm
-            )
+    private func destination(for item: HolidayLandingItem) -> some View {
+        switch item.kind {
+        case .holidayTag(let value):
+            HolidayTopicView(tagValue: value, vm: vm)
+        case .birthdayPerson(let personId, _):
+            if let person = vm.database.fetchPersonBirthdayRecord(personId: personId) {
+                BirthdayPersonTopicView(person: person, vm: vm)
+            } else {
+                ContentUnavailableView(
+                    "Birthday Unavailable",
+                    systemImage: "birthday.cake",
+                    description: Text("Could not load this person’s birthday photos.")
+                )
+            }
         }
     }
 }

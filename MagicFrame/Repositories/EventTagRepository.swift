@@ -1,7 +1,7 @@
 import Foundation
 import SQLite3
 
-/// SQLite access for `event_tags` and holiday mirror on `events.holidayType`.
+/// SQLite access for `event_tags` (event classification / people tags).
 final class EventTagRepository {
 
     static let holidayCategory = "holiday"
@@ -51,23 +51,26 @@ final class EventTagRepository {
             }
         }
 
-        return events.map { event in
-            var tags = tagsByEventId[event.eventId] ?? []
-            for field in EventAttributeField.columnBackedTagFields {
-                guard !tags.contains(where: { $0.category == field }) else { continue }
-                let trimmed = event.attributeColumnValue(for: field)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                guard !trimmed.isEmpty else { continue }
-                tags.append(
-                    EventAttributeTag(
-                        category: field,
-                        tagValue: trimmed,
-                        source: .user
-                    )
-                )
+        let parentIdsMissingMilestone = events
+            .filter {
+                $0.parentEventId == nil
+                    && !(tagsByEventId[$0.eventId]?.contains { $0.category == .milestoneType } ?? false)
             }
+            .map(\.eventId)
+        if !parentIdsMissingMilestone.isEmpty {
+            let fromChildren = fetchMilestoneTagsFromDescendantsUnsafe(
+                parentEventIds: parentIdsMissingMilestone
+            )
+            for (parentId, milestoneTag) in fromChildren {
+                var tags = tagsByEventId[parentId] ?? []
+                guard !tags.contains(where: { $0.category == .milestoneType }) else { continue }
+                tags.append(milestoneTag)
+                tagsByEventId[parentId] = tags
+            }
+        }
 
-            return eventWithAttributeTags(event, tags: tags)
+        return events.map { event in
+            eventWithAttributeTags(event, tags: tagsByEventId[event.eventId] ?? [])
         }
     }
 
@@ -83,6 +86,71 @@ final class EventTagRepository {
         sync { backfillAttributeTagsFromColumnsIfNeededUnsafe() }
     }
 
+    func fetchSimilarEventAlternatives(
+        tagCategory: String,
+        tagValue: String
+    ) -> [SimilarEventTagAlternative] {
+        sync {
+            fetchSimilarEventAlternativesUnsafe(
+                tagCategory: tagCategory,
+                tagValue: tagValue
+            )
+        }
+    }
+
+    func fetchSimilarEventAlternativesUnsafe(
+        tagCategory: String,
+        tagValue: String
+    ) -> [SimilarEventTagAlternative] {
+        let sql = """
+        SELECT
+            similarEventTagId,
+            tagCategory,
+            tagValue,
+            possibleTagCategory,
+            possibleTagValue,
+            possibleNumberOfEventMainPeople
+        FROM similar_event_tags
+        WHERE tagCategory = ? COLLATE NOCASE
+          AND tagValue = ? COLLATE NOCASE
+        ORDER BY similarEventTagId ASC;
+        """
+
+        var statement: OpaquePointer?
+        var rows: [SimilarEventTagAlternative] = []
+
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            sqlite3_bind_text(statement, 1, (tagCategory as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, 2, (tagValue as NSString).utf8String, -1, nil)
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let sourceCategory = sqliteOptionalText(statement, column: 1),
+                      let sourceValue = sqliteOptionalText(statement, column: 2),
+                      let possibleCategory = sqliteOptionalText(statement, column: 3),
+                      let possibleValue = sqliteOptionalText(statement, column: 4) else {
+                    continue
+                }
+                rows.append(
+                    SimilarEventTagAlternative(
+                        similarEventTagId: Int(sqlite3_column_int(statement, 0)),
+                        tagCategory: sourceCategory,
+                        tagValue: sourceValue,
+                        possibleTagCategory: possibleCategory,
+                        possibleTagValue: possibleValue,
+                        possibleNumberOfEventMainPeople: Int(sqlite3_column_int(statement, 5))
+                    )
+                )
+            }
+        }
+
+        sqlite3_finalize(statement)
+        return rows
+    }
+
+    /// Moves milestone values that were incorrectly stored as `eventType` into `milestoneType`.
+    func migrateMisclassifiedMilestoneEventTypesIfNeeded() {
+        sync { migrateMisclassifiedMilestoneEventTypesIfNeededUnsafe() }
+    }
+
     func syncUserAttributeTag(
         eventId: Int,
         field: EventAttributeField,
@@ -93,6 +161,301 @@ final class EventTagRepository {
         }
     }
 
+    /// Writes a user tag using category/value from `similar_event_tags` (or any raw pair).
+    func applySimilarEventUserTag(
+        eventId: Int,
+        tagCategory: String,
+        tagValue: String
+    ) {
+        sync {
+            applySimilarEventUserTagUnsafe(
+                eventId: eventId,
+                tagCategory: tagCategory,
+                tagValue: tagValue
+            )
+        }
+    }
+
+    func fetchEventNameTemplate(
+        tagCategory: String,
+        tagValue: String
+    ) -> EventNameTemplate? {
+        sync {
+            fetchEventNameTemplateUnsafe(tagCategory: tagCategory, tagValue: tagValue)
+        }
+    }
+
+    func fetchAllEventNameTemplates() -> [EventNameTemplate] {
+        sync { fetchAllEventNameTemplatesUnsafe() }
+    }
+
+    func upsertEventNameTemplate(
+        tagCategory: String,
+        tagValue: String,
+        nameTemplate: String,
+        personCount: Int
+    ) -> EventNameTemplate? {
+        sync {
+            upsertEventNameTemplateUnsafe(
+                tagCategory: tagCategory,
+                tagValue: tagValue,
+                nameTemplate: nameTemplate,
+                personCount: personCount
+            )
+        }
+    }
+
+    func fetchAllSimilarEventTags() -> [SimilarEventTagAlternative] {
+        sync { fetchAllSimilarEventTagsUnsafe() }
+    }
+
+    @discardableResult
+    func insertSimilarEventTag(
+        tagCategory: String,
+        tagValue: String,
+        possibleTagCategory: String,
+        possibleTagValue: String,
+        possibleNumberOfEventMainPeople: Int
+    ) -> SimilarEventTagAlternative? {
+        sync {
+            insertSimilarEventTagUnsafe(
+                tagCategory: tagCategory,
+                tagValue: tagValue,
+                possibleTagCategory: possibleTagCategory,
+                possibleTagValue: possibleTagValue,
+                possibleNumberOfEventMainPeople: possibleNumberOfEventMainPeople
+            )
+        }
+    }
+
+    func fetchEventNameTemplateUnsafe(
+        tagCategory: String,
+        tagValue: String
+    ) -> EventNameTemplate? {
+        let sql = """
+        SELECT eventNameTemplateId, tagCategory, tagValue, nameTemplate, personCount
+        FROM event_name_templates
+        WHERE tagCategory = ?
+          AND tagValue = ? COLLATE NOCASE
+        LIMIT 1;
+        """
+
+        var statement: OpaquePointer?
+        var template: EventNameTemplate?
+
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            let categoryNS = tagCategory as NSString
+            let valueNS = tagValue as NSString
+            sqlite3_bind_text(statement, 1, categoryNS.utf8String, -1, nil)
+            sqlite3_bind_text(statement, 2, valueNS.utf8String, -1, nil)
+            if sqlite3_step(statement) == SQLITE_ROW {
+                template = readEventNameTemplateRow(statement)
+            }
+        }
+        sqlite3_finalize(statement)
+        return template
+    }
+
+    func fetchAllEventNameTemplatesUnsafe() -> [EventNameTemplate] {
+        let sql = """
+        SELECT eventNameTemplateId, tagCategory, tagValue, nameTemplate, personCount
+        FROM event_name_templates
+        ORDER BY tagCategory COLLATE NOCASE ASC, tagValue COLLATE NOCASE ASC;
+        """
+
+        var statement: OpaquePointer?
+        var rows: [EventNameTemplate] = []
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            while sqlite3_step(statement) == SQLITE_ROW {
+                if let row = readEventNameTemplateRow(statement) {
+                    rows.append(row)
+                }
+            }
+        }
+        sqlite3_finalize(statement)
+        return rows
+    }
+
+    func upsertEventNameTemplateUnsafe(
+        tagCategory: String,
+        tagValue: String,
+        nameTemplate: String,
+        personCount: Int
+    ) -> EventNameTemplate? {
+        let category = tagCategory.trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = tagValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let template = nameTemplate.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !category.isEmpty, !value.isEmpty, !template.isEmpty else { return nil }
+
+        let count = max(0, min(2, personCount))
+        let sql = """
+        INSERT INTO event_name_templates (tagCategory, tagValue, nameTemplate, personCount)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(tagCategory, tagValue) DO UPDATE SET
+            nameTemplate = excluded.nameTemplate,
+            personCount = excluded.personCount;
+        """
+
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            return nil
+        }
+        let categoryNS = category as NSString
+        let valueNS = value as NSString
+        let templateNS = template as NSString
+        sqlite3_bind_text(statement, 1, categoryNS.utf8String, -1, nil)
+        sqlite3_bind_text(statement, 2, valueNS.utf8String, -1, nil)
+        sqlite3_bind_text(statement, 3, templateNS.utf8String, -1, nil)
+        sqlite3_bind_int(statement, 4, Int32(count))
+        let ok = sqlite3_step(statement) == SQLITE_DONE
+        sqlite3_finalize(statement)
+        guard ok else { return nil }
+        return fetchEventNameTemplateUnsafe(tagCategory: category, tagValue: value)
+    }
+
+    func fetchAllSimilarEventTagsUnsafe() -> [SimilarEventTagAlternative] {
+        let sql = """
+        SELECT
+            similarEventTagId,
+            tagCategory,
+            tagValue,
+            possibleTagCategory,
+            possibleTagValue,
+            possibleNumberOfEventMainPeople
+        FROM similar_event_tags
+        ORDER BY tagCategory COLLATE NOCASE ASC,
+                 tagValue COLLATE NOCASE ASC,
+                 possibleTagValue COLLATE NOCASE ASC;
+        """
+
+        var statement: OpaquePointer?
+        var rows: [SimilarEventTagAlternative] = []
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let sourceCategory = sqliteOptionalText(statement, column: 1),
+                      let sourceValue = sqliteOptionalText(statement, column: 2),
+                      let possibleCategory = sqliteOptionalText(statement, column: 3),
+                      let possibleValue = sqliteOptionalText(statement, column: 4) else {
+                    continue
+                }
+                rows.append(
+                    SimilarEventTagAlternative(
+                        similarEventTagId: Int(sqlite3_column_int(statement, 0)),
+                        tagCategory: sourceCategory,
+                        tagValue: sourceValue,
+                        possibleTagCategory: possibleCategory,
+                        possibleTagValue: possibleValue,
+                        possibleNumberOfEventMainPeople: Int(sqlite3_column_int(statement, 5))
+                    )
+                )
+            }
+        }
+        sqlite3_finalize(statement)
+        return rows
+    }
+
+    func insertSimilarEventTagUnsafe(
+        tagCategory: String,
+        tagValue: String,
+        possibleTagCategory: String,
+        possibleTagValue: String,
+        possibleNumberOfEventMainPeople: Int
+    ) -> SimilarEventTagAlternative? {
+        let sourceCategory = tagCategory.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sourceValue = tagValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let possibleCategory = possibleTagCategory.trimmingCharacters(in: .whitespacesAndNewlines)
+        let possibleValue = possibleTagValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !sourceCategory.isEmpty,
+              !sourceValue.isEmpty,
+              !possibleCategory.isEmpty,
+              !possibleValue.isEmpty else {
+            return nil
+        }
+
+        let people = max(0, min(2, possibleNumberOfEventMainPeople))
+        let sql = """
+        INSERT OR IGNORE INTO similar_event_tags (
+            tagCategory, tagValue, possibleTagCategory, possibleTagValue,
+            possibleNumberOfEventMainPeople
+        )
+        VALUES (?, ?, ?, ?, ?);
+        """
+
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            return nil
+        }
+        let sourceCategoryNS = sourceCategory as NSString
+        let sourceValueNS = sourceValue as NSString
+        let possibleCategoryNS = possibleCategory as NSString
+        let possibleValueNS = possibleValue as NSString
+        sqlite3_bind_text(statement, 1, sourceCategoryNS.utf8String, -1, nil)
+        sqlite3_bind_text(statement, 2, sourceValueNS.utf8String, -1, nil)
+        sqlite3_bind_text(statement, 3, possibleCategoryNS.utf8String, -1, nil)
+        sqlite3_bind_text(statement, 4, possibleValueNS.utf8String, -1, nil)
+        sqlite3_bind_int(statement, 5, Int32(people))
+        let step = sqlite3_step(statement)
+        sqlite3_finalize(statement)
+        guard step == SQLITE_DONE else { return nil }
+
+        // INSERT OR IGNORE: changes == 0 means the row already existed.
+        if sqlite3_changes(db) == 0 {
+            return fetchSimilarEventAlternativesUnsafe(
+                tagCategory: sourceCategory,
+                tagValue: sourceValue
+            ).first {
+                $0.possibleTagCategory.compare(possibleCategory, options: .caseInsensitive) == .orderedSame
+                    && $0.possibleTagValue.compare(possibleValue, options: .caseInsensitive) == .orderedSame
+            }
+        }
+
+        return fetchSimilarEventAlternativesUnsafe(
+            tagCategory: sourceCategory,
+            tagValue: sourceValue
+        ).last {
+            $0.possibleTagCategory.compare(possibleCategory, options: .caseInsensitive) == .orderedSame
+                && $0.possibleTagValue.compare(possibleValue, options: .caseInsensitive) == .orderedSame
+        }
+    }
+
+    private func readEventNameTemplateRow(_ statement: OpaquePointer?) -> EventNameTemplate? {
+        guard let statement else { return nil }
+        guard let category = sqliteOptionalText(statement, column: 1),
+              let value = sqliteOptionalText(statement, column: 2),
+              let template = sqliteOptionalText(statement, column: 3) else {
+            return nil
+        }
+        return EventNameTemplate(
+            eventNameTemplateId: Int(sqlite3_column_int(statement, 0)),
+            tagCategory: category,
+            tagValue: value,
+            nameTemplate: template,
+            personCount: Int(sqlite3_column_int(statement, 4))
+        )
+    }
+
+    func applySimilarEventUserTagUnsafe(
+        eventId: Int,
+        tagCategory: String,
+        tagValue: String
+    ) {
+        let trimmedValue = tagValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedValue.isEmpty else { return }
+
+        // Prefer canonical category when we recognize it (e.g. "MilestoneType" → milestoneType).
+        let category = EventAttributeField.fromTagCategory(tagCategory)?.tagCategory
+            ?? tagCategory.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !category.isEmpty else { return }
+
+        upsertAttributeTagUnsafe(
+            eventId: eventId,
+            category: category,
+            tagValue: trimmedValue,
+            source: .user,
+            totalScore: nil
+        )
+    }
+
     func syncUserAttributeTagUnsafe(
         eventId: Int,
         field: EventAttributeField,
@@ -101,7 +464,6 @@ final class EventTagRepository {
         let trimmed = tagValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if trimmed.isEmpty {
             deleteAttributeTagUnsafe(eventId: eventId, category: field.tagCategory, source: .user)
-            mirrorAttributeColumnUnsafe(eventId: eventId, field: field, value: nil)
             return
         }
 
@@ -110,13 +472,8 @@ final class EventTagRepository {
             category: field.tagCategory,
             tagValue: trimmed,
             source: .user,
-            appliedPhase: nil,
-            occasionId: nil,
-            scoringYear: nil,
-            confidence: nil,
             totalScore: nil
         )
-        mirrorAttributeColumnUnsafe(eventId: eventId, field: field, value: trimmed)
     }
 
     func syncUserHolidayTag(eventId: Int, tagValue: String?) {
@@ -130,10 +487,6 @@ final class EventTagRepository {
     func upsertAIHolidayTagUnsafe(
         eventId: Int,
         tagValue: String,
-        appliedPhase: EventTagAppliedPhase,
-        occasionId: Int,
-        scoringYear: Int,
-        confidence: String?,
         totalScore: Double
     ) {
         upsertAttributeTagUnsafe(
@@ -141,20 +494,12 @@ final class EventTagRepository {
             category: Self.holidayCategory,
             tagValue: tagValue,
             source: .ai,
-            appliedPhase: appliedPhase,
-            occasionId: occasionId,
-            scoringYear: scoringYear,
-            confidence: confidence,
             totalScore: totalScore
         )
-        mirrorAttributeColumnUnsafe(eventId: eventId, field: .holidayType, value: tagValue)
     }
 
     func deleteAIHolidayTagUnsafe(eventId: Int) {
         deleteAttributeTagUnsafe(eventId: eventId, category: Self.holidayCategory, source: .ai)
-        if fetchAttributeTagRowUnsafe(eventId: eventId, field: .holidayType)?.source != .user {
-            mirrorAttributeColumnUnsafe(eventId: eventId, field: .holidayType, value: nil)
-        }
     }
 
     func isAIHolidayTagRejected(eventId: Int) -> Bool {
@@ -191,6 +536,39 @@ final class EventTagRepository {
         return false
     }
 
+    /// True when this exact AI tag value was rejected (tombstone row still present).
+    func isAIAttributeTagValueRejectedUnsafe(
+        eventId: Int,
+        category: String,
+        tagValue: String
+    ) -> Bool {
+        let sql = """
+        SELECT 1
+        FROM event_tags
+        WHERE eventId = ?
+          AND tagCategory = ?
+          AND tagValue = ? COLLATE NOCASE
+          AND isRejected = 1
+        LIMIT 1;
+        """
+
+        var statement: OpaquePointer?
+
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            let categoryNS = category as NSString
+            let tagValueNS = tagValue as NSString
+            sqlite3_bind_int(statement, 1, Int32(eventId))
+            sqlite3_bind_text(statement, 2, categoryNS.utf8String, -1, nil)
+            sqlite3_bind_text(statement, 3, tagValueNS.utf8String, -1, nil)
+            let found = sqlite3_step(statement) == SQLITE_ROW
+            sqlite3_finalize(statement)
+            return found
+        }
+
+        sqlite3_finalize(statement)
+        return false
+    }
+
     func isAIHolidayTagRejectedUnsafe(eventId: Int) -> Bool {
         isAIAttributeTagRejectedUnsafe(eventId: eventId, field: .holidayType)
     }
@@ -199,19 +577,93 @@ final class EventTagRepository {
         eventId: Int,
         field: EventAttributeField,
         tagValue: String,
-        appliedPhase: EventTagAppliedPhase? = .postObject
+        totalScore: Double? = nil,
+        mirrorColumn: Bool = true
     ) {
+        _ = mirrorColumn
+        // Never resurrect a user-rejected AI value (e.g. Possible Wedding after Remove).
+        if isAIAttributeTagValueRejectedUnsafe(
+            eventId: eventId,
+            category: field.tagCategory,
+            tagValue: tagValue
+        ) {
+            return
+        }
         upsertAttributeTagUnsafe(
             eventId: eventId,
             category: field.tagCategory,
             tagValue: tagValue,
             source: .ai,
-            appliedPhase: appliedPhase,
-            occasionId: nil,
-            scoringYear: nil,
-            confidence: nil,
-            totalScore: nil
+            totalScore: totalScore
         )
+    }
+
+    /// Replaces all `eventMainPerson` tags with these user-confirmed names (Bride, Groom, etc.).
+    func replaceUserEventMainPeople(eventId: Int, names: [String]) {
+        sync { replaceUserEventMainPeopleUnsafe(eventId: eventId, names: names) }
+    }
+
+    func replaceUserEventMainPeopleUnsafe(eventId: Int, names: [String]) {
+        let trimmedNames = names
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        deleteAttributeTagCategoryUnsafe(
+            eventId: eventId,
+            category: EventAttributeField.mainPerson.tagCategory
+        )
+        // Weddings store both people under eventMainPerson; clear legacy second-person category.
+        deleteAttributeTagCategoryUnsafe(
+            eventId: eventId,
+            category: EventAttributeField.secondaryMainPerson.tagCategory
+        )
+
+        for name in trimmedNames {
+            upsertAttributeTagUnsafe(
+                eventId: eventId,
+                category: EventAttributeField.mainPerson.tagCategory,
+                tagValue: name,
+                source: .user,
+                totalScore: nil
+            )
+        }
+    }
+
+    /// Writes one or two `eventMainPerson` tag rows (same category, different values).
+    @discardableResult
+    func upsertAIEventMainPeopleUnsafe(
+        eventId: Int,
+        primaryName: String?,
+        secondaryName: String?,
+        totalScore: Double?
+    ) -> (primaryWritten: Bool, secondaryWritten: Bool) {
+        let primary = primaryName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let secondary = secondaryName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        var primaryWritten = false
+        var secondaryWritten = false
+
+        if !primary.isEmpty {
+            upsertAIAttributeTagUnsafe(
+                eventId: eventId,
+                field: .mainPerson,
+                tagValue: primary,
+                totalScore: totalScore
+            )
+            primaryWritten = true
+        }
+
+        if !secondary.isEmpty {
+            upsertAIAttributeTagUnsafe(
+                eventId: eventId,
+                field: .mainPerson,
+                tagValue: secondary,
+                totalScore: totalScore
+            )
+            secondaryWritten = true
+        }
+
+        return (primaryWritten, secondaryWritten)
     }
 
     func confirmAIAttributeTag(eventId: Int, field: EventAttributeField) {
@@ -230,6 +682,50 @@ final class EventTagRepository {
         sync { rejectAIAttributeTagUnsafe(eventId: eventId, field: field) }
     }
 
+    /// Removes an AI or user tag row. AI removals are marked rejected so they are not re-applied.
+    func removeEventAttributeTag(eventId: Int, tag: EventAttributeTag) {
+        sync { removeEventAttributeTagUnsafe(eventId: eventId, tag: tag) }
+    }
+
+    func removeEventAttributeTagUnsafe(eventId: Int, tag: EventAttributeTag) {
+        if tag.source == .ai {
+            deleteAttributeTagValueUnsafe(
+                eventId: eventId,
+                category: tag.category.tagCategory,
+                tagValue: tag.tagValue,
+                source: .ai
+            )
+            // For singular categories, also clear any other AI row on that category.
+            if !tag.category.allowsMultipleTagValues {
+                deleteAttributeTagUnsafe(
+                    eventId: eventId,
+                    category: tag.category.tagCategory,
+                    source: .ai
+                )
+            }
+            upsertRejectedAttributeTagUnsafe(
+                eventId: eventId,
+                field: tag.category,
+                tagValue: tag.tagValue
+            )
+            return
+        }
+
+        deleteAttributeTagValueUnsafe(
+            eventId: eventId,
+            category: tag.category.tagCategory,
+            tagValue: tag.tagValue,
+            source: .user
+        )
+        if !tag.category.allowsMultipleTagValues {
+            deleteAttributeTagUnsafe(
+                eventId: eventId,
+                category: tag.category.tagCategory,
+                source: .user
+            )
+        }
+    }
+
     func rejectAIAttributeTagUnsafe(eventId: Int, field: EventAttributeField) {
         let tagValue = fetchAttributeTagRowUnsafe(eventId: eventId, field: field)?.tagValue
             ?? fetchStoredAttributeTagValueUnsafe(eventId: eventId, field: field)
@@ -240,7 +736,6 @@ final class EventTagRepository {
             field: field,
             tagValue: tagValue
         )
-        mirrorAttributeColumnUnsafe(eventId: eventId, field: field, value: nil)
     }
 
     func confirmAIHolidayTag(eventId: Int) {
@@ -301,10 +796,6 @@ final class EventTagRepository {
     struct AttributeTagScoringMetadata: Sendable {
         let tagValue: String
         let source: EventTagSource
-        let appliedPhase: EventTagAppliedPhase?
-        let occasionId: Int?
-        let scoringYear: Int?
-        let confidence: String?
         let totalScore: Double?
     }
 
@@ -313,7 +804,7 @@ final class EventTagRepository {
         field: EventAttributeField
     ) -> AttributeTagScoringMetadata? {
         let sql = """
-        SELECT tagValue, source, appliedPhase, occasionId, scoringYear, confidence, totalScore
+        SELECT tagValue, source, totalScore
         FROM event_tags
         WHERE eventId = ?
           AND tagCategory = ?
@@ -336,29 +827,14 @@ final class EventTagRepository {
                let tagValue = sqliteOptionalText(statement, column: 0),
                let sourceRaw = sqliteOptionalText(statement, column: 1),
                let source = EventTagSource(rawValue: sourceRaw) {
-                let phaseRaw = sqliteOptionalText(statement, column: 2)
-                let phase = phaseRaw.flatMap { EventTagAppliedPhase(rawValue: $0) }
-                let occasionId: Int? =
-                    sqlite3_column_type(statement, 3) == SQLITE_NULL
-                    ? nil
-                    : Int(sqlite3_column_int(statement, 3))
-                let scoringYear: Int? =
-                    sqlite3_column_type(statement, 4) == SQLITE_NULL
-                    ? nil
-                    : Int(sqlite3_column_int(statement, 4))
-                let confidence = sqliteOptionalText(statement, column: 5)
                 let totalScore: Double? =
-                    sqlite3_column_type(statement, 6) == SQLITE_NULL
+                    sqlite3_column_type(statement, 2) == SQLITE_NULL
                     ? nil
-                    : sqlite3_column_double(statement, 6)
+                    : sqlite3_column_double(statement, 2)
                 sqlite3_finalize(statement)
                 return AttributeTagScoringMetadata(
                     tagValue: tagValue,
                     source: source,
-                    appliedPhase: phase,
-                    occasionId: occasionId,
-                    scoringYear: scoringYear,
-                    confidence: confidence,
                     totalScore: totalScore
                 )
             }
@@ -414,7 +890,7 @@ final class EventTagRepository {
 
         let placeholders = Array(repeating: "?", count: eventIds.count).joined(separator: ", ")
         let sql = """
-        SELECT eventId, tagCategory, tagValue, source, appliedPhase, totalScore
+        SELECT eventId, tagCategory, tagValue, source, totalScore
         FROM event_tags
         WHERE isRejected = 0
           AND eventId IN (\(placeholders));
@@ -436,20 +912,24 @@ final class EventTagRepository {
                       let source = EventTagSource(rawValue: sourceRaw) else {
                     continue
                 }
-                let phaseRaw = sqliteOptionalText(statement, column: 4)
-                let phase = phaseRaw.flatMap { EventTagAppliedPhase(rawValue: $0) }
                 let totalScore: Double? =
-                    sqlite3_column_type(statement, 5) == SQLITE_NULL
+                    sqlite3_column_type(statement, 4) == SQLITE_NULL
                     ? nil
-                    : sqlite3_column_double(statement, 5)
+                    : sqlite3_column_double(statement, 4)
                 var tags = tagsByEventId[eventId] ?? []
-                tags.removeAll { $0.category == field }
+                if field.allowsMultipleTagValues {
+                    tags.removeAll {
+                        $0.category == field
+                            && $0.tagValue.compare(tagValue, options: .caseInsensitive) == .orderedSame
+                    }
+                } else {
+                    tags.removeAll { $0.category == field }
+                }
                 tags.append(
                     EventAttributeTag(
                         category: field,
                         tagValue: tagValue,
                         source: source,
-                        appliedPhase: phase,
                         totalScore: totalScore
                     )
                 )
@@ -463,16 +943,53 @@ final class EventTagRepository {
 
     func backfillAttributeTagsFromColumnsIfNeededUnsafe() {
         let metadataKey = "eventAttributeTagsBackfilledV1"
-        guard getAppMetadataUnsafe(key: metadataKey) != "1" else { return }
+        let alreadyMarked = getAppMetadataUnsafe(key: metadataKey) == "1"
+
+        // Legacy: "Trip" is not an eventType tag (trips use isTripEvent / tripType).
+        sqlite3_exec(
+            db,
+            """
+            DELETE FROM event_tags
+            WHERE tagCategory = 'eventType'
+              AND LOWER(TRIM(tagValue)) = 'trip';
+            """,
+            nil,
+            nil,
+            nil
+        )
 
         let now = ISO8601DateFormatter().string(from: Date())
+        var anyColumnPresent = false
         for field in EventAttributeField.allCases {
-            let column = field.sqlColumn
+            let column = field.legacyColumnName
+            guard eventsColumnExistsUnsafe(column) else { continue }
+            anyColumnPresent = true
             let category = field.tagCategory
+            // For multi-value person tags, only skip an exact value match.
+            let existsClause: String
+            if field.allowsMultipleTagValues {
+                existsClause = """
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM event_tags t
+                    WHERE t.eventId = e.eventId
+                      AND t.tagCategory = ?
+                      AND t.tagValue = TRIM(e.\(column)) COLLATE NOCASE
+                  )
+                """
+            } else {
+                existsClause = """
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM event_tags t
+                    WHERE t.eventId = e.eventId
+                      AND t.tagCategory = ?
+                  )
+                """
+            }
             let sql = """
             INSERT INTO event_tags (
-                eventId, tagCategory, tagValue, source, appliedPhase,
-                occasionId, scoringYear, confidence, totalScore,
+                eventId, tagCategory, tagValue, source, totalScore,
                 isRejected, createdAt, updatedAt
             )
             SELECT
@@ -481,22 +998,13 @@ final class EventTagRepository {
                 TRIM(e.\(column)),
                 'user',
                 NULL,
-                NULL,
-                NULL,
-                NULL,
-                NULL,
                 0,
                 ?,
                 ?
             FROM events e
             WHERE e.isDeleted = 0
               AND TRIM(COALESCE(e.\(column), '')) != ''
-              AND NOT EXISTS (
-                SELECT 1
-                FROM event_tags t
-                WHERE t.eventId = e.eventId
-                  AND t.tagCategory = ?
-              );
+              \(existsClause);
             """
 
             var statement: OpaquePointer?
@@ -510,7 +1018,146 @@ final class EventTagRepository {
             sqlite3_finalize(statement)
         }
 
+        if anyColumnPresent || alreadyMarked {
+            setAppMetadataUnsafe(key: metadataKey, value: "1")
+        }
+    }
+
+    func migrateMisclassifiedMilestoneEventTypesIfNeededUnsafe() {
+        let metadataKey = "milestoneEventTypesMigratedFromEventTypeV1"
+        guard getAppMetadataUnsafe(key: metadataKey) != "1" else { return }
+
+        let milestoneValues = EventAttributeField.milestoneType.builtInOptions
+        guard !milestoneValues.isEmpty else {
+            setAppMetadataUnsafe(key: metadataKey, value: "1")
+            return
+        }
+
+        let valueList = milestoneValues
+            .map { "'\(escapeSQLLiteral($0.lowercased()))'" }
+            .joined(separator: ", ")
+        let now = escapeSQLLiteral(ISO8601DateFormatter().string(from: Date()))
+
+        // Promote eventType → milestoneType when the event has no milestone yet.
+        sqlite3_exec(
+            db,
+            """
+            INSERT INTO event_tags (
+                eventId, tagCategory, tagValue, source, totalScore,
+                isRejected, createdAt, updatedAt
+            )
+            SELECT
+                et.eventId,
+                'milestoneType',
+                et.tagValue,
+                et.source,
+                et.totalScore,
+                et.isRejected,
+                '\(now)',
+                '\(now)'
+            FROM event_tags et
+            WHERE et.tagCategory = 'eventType'
+              AND LOWER(TRIM(et.tagValue)) IN (\(valueList))
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM event_tags m
+                  WHERE m.eventId = et.eventId
+                    AND m.tagCategory = 'milestoneType'
+                    AND m.isRejected = 0
+              );
+            """,
+            nil,
+            nil,
+            nil
+        )
+
+        // Drop the duplicate / misplaced eventType rows (including when milestone already existed).
+        sqlite3_exec(
+            db,
+            """
+            DELETE FROM event_tags
+            WHERE tagCategory = 'eventType'
+              AND LOWER(TRIM(tagValue)) IN (\(valueList));
+            """,
+            nil,
+            nil,
+            nil
+        )
+
+        // Clear legacy columns so a future backfill cannot recreate eventType=Wedding chips.
+        for column in ["eventType", "XeventType"] where eventsColumnExistsUnsafe(column) {
+            sqlite3_exec(
+                db,
+                """
+                UPDATE events
+                SET \(column) = NULL
+                WHERE LOWER(TRIM(COALESCE(\(column), ''))) IN (\(valueList));
+                """,
+                nil,
+                nil,
+                nil
+            )
+        }
+
         setAppMetadataUnsafe(key: metadataKey, value: "1")
+        print("Migrated misclassified milestone values out of eventType tags")
+    }
+
+    /// Removes leftover `eventType` rows that duplicate a milestone value (e.g. Wedding).
+    func deleteMisclassifiedEventTypeForMilestoneUnsafe(eventId: Int, tagValue: String) {
+        let trimmed = tagValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        let sql = """
+        DELETE FROM event_tags
+        WHERE eventId = ?
+          AND tagCategory = 'eventType'
+          AND LOWER(TRIM(tagValue)) = LOWER(?);
+        """
+        var statement: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            sqlite3_bind_int(statement, 1, Int32(eventId))
+            sqlite3_bind_text(statement, 2, (trimmed as NSString).utf8String, -1, nil)
+            sqlite3_step(statement)
+        }
+        sqlite3_finalize(statement)
+
+        for column in ["eventType", "XeventType"] where eventsColumnExistsUnsafe(column) {
+            let updateSQL = """
+            UPDATE events
+            SET \(column) = NULL
+            WHERE eventId = ?
+              AND LOWER(TRIM(COALESCE(\(column), ''))) = LOWER(?);
+            """
+            var updateStatement: OpaquePointer?
+            if sqlite3_prepare_v2(db, updateSQL, -1, &updateStatement, nil) == SQLITE_OK {
+                sqlite3_bind_int(updateStatement, 1, Int32(eventId))
+                sqlite3_bind_text(updateStatement, 2, (trimmed as NSString).utf8String, -1, nil)
+                sqlite3_step(updateStatement)
+            }
+            sqlite3_finalize(updateStatement)
+        }
+    }
+
+    private func escapeSQLLiteral(_ value: String) -> String {
+        value.replacingOccurrences(of: "'", with: "''")
+    }
+
+    private func eventsColumnExistsUnsafe(_ column: String) -> Bool {
+        let sql = "PRAGMA table_info(events);"
+        var statement: OpaquePointer?
+        var found = false
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let name = String(cString: sqlite3_column_text(statement, 1))
+                if name == column {
+                    found = true
+                    break
+                }
+            }
+        }
+        sqlite3_finalize(statement)
+        return found
     }
 
     func fetchHolidayTagsUnsafe(eventIds: [Int]) -> [Int: EventHolidayTag] {
@@ -518,7 +1165,7 @@ final class EventTagRepository {
 
         let placeholders = Array(repeating: "?", count: eventIds.count).joined(separator: ", ")
         let sql = """
-        SELECT eventId, tagValue, source, appliedPhase
+        SELECT eventId, tagValue, source
         FROM event_tags
         WHERE tagCategory = ?
           AND isRejected = 0
@@ -546,12 +1193,9 @@ final class EventTagRepository {
                       let source = EventTagSource(rawValue: sourceRaw) else {
                     continue
                 }
-                let phaseRaw = sqliteOptionalText(statement, column: 3)
-                let phase = phaseRaw.flatMap { EventTagAppliedPhase(rawValue: $0) }
                 tags[eventId] = EventHolidayTag(
                     tagValue: tagValue,
-                    source: source,
-                    appliedPhase: phase
+                    source: source
                 )
             }
         }
@@ -574,8 +1218,7 @@ final class EventTagRepository {
             child.parentEventId,
             child.eventId,
             ht.tagValue,
-            ht.source,
-            ht.appliedPhase
+            ht.source
         FROM events child
         JOIN event_tags ht
             ON ht.eventId = child.eventId
@@ -612,12 +1255,79 @@ final class EventTagRepository {
                     continue
                 }
                 let childEventId = Int(sqlite3_column_int(statement, 1))
-                let phaseRaw = sqliteOptionalText(statement, column: 4)
-                let phase = phaseRaw.flatMap { EventTagAppliedPhase(rawValue: $0) }
                 tags[parentId] = EventHolidayTag(
                     tagValue: tagValue,
                     source: source,
-                    appliedPhase: phase,
+                    owningEventId: childEventId
+                )
+            }
+        }
+
+        sqlite3_finalize(statement)
+        return tags
+    }
+
+    func fetchMilestoneTagsFromDescendantsUnsafe(
+        parentEventIds: [Int]
+    ) -> [Int: EventAttributeTag] {
+        guard !parentEventIds.isEmpty else { return [:] }
+
+        let placeholders = Array(repeating: "?", count: parentEventIds.count).joined(
+            separator: ", "
+        )
+        let sql = """
+        SELECT
+            child.parentEventId,
+            child.eventId,
+            ht.tagValue,
+            ht.source,
+            ht.totalScore
+        FROM events child
+        JOIN event_tags ht
+            ON ht.eventId = child.eventId
+        WHERE child.isDeleted = 0
+          AND child.parentEventId IN (\(placeholders))
+          AND ht.tagCategory = ?
+          AND ht.isRejected = 0
+        ORDER BY
+            child.parentEventId,
+            CASE ht.source WHEN 'user' THEN 0 ELSE 1 END,
+            COALESCE(ht.totalScore, 0) DESC;
+        """
+
+        var statement: OpaquePointer?
+        var tags: [Int: EventAttributeTag] = [:]
+        let category = EventAttributeField.milestoneType.tagCategory
+
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            for (index, eventId) in parentEventIds.enumerated() {
+                sqlite3_bind_int(statement, Int32(index + 1), Int32(eventId))
+            }
+            sqlite3_bind_text(
+                statement,
+                Int32(parentEventIds.count + 1),
+                (category as NSString).utf8String,
+                -1,
+                nil
+            )
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let parentId = Int(sqlite3_column_int(statement, 0))
+                guard tags[parentId] == nil,
+                      let tagValue = sqliteOptionalText(statement, column: 2),
+                      let sourceRaw = sqliteOptionalText(statement, column: 3),
+                      let source = EventTagSource(rawValue: sourceRaw) else {
+                    continue
+                }
+                let childEventId = Int(sqlite3_column_int(statement, 1))
+                let totalScore: Double? =
+                    sqlite3_column_type(statement, 4) == SQLITE_NULL
+                    ? nil
+                    : sqlite3_column_double(statement, 4)
+                tags[parentId] = EventAttributeTag(
+                    category: .milestoneType,
+                    tagValue: tagValue,
+                    source: source,
+                    totalScore: totalScore,
                     owningEventId: childEventId
                 )
             }
@@ -895,6 +1605,7 @@ final class EventTagRepository {
             startDate: event.startDate,
             endDate: event.endDate,
             photoCount: event.photoCount,
+            videoCount: event.videoCount,
             latitude: event.latitude,
             longitude: event.longitude,
             city: event.city,
@@ -903,20 +1614,14 @@ final class EventTagRepository {
             people: event.people,
             coverPhotoId: event.coverPhotoId,
             showOnFrame: event.showOnFrame,
+            isFavorite: event.isFavorite,
             userEditedName: event.userEditedName,
             locationNickname: event.locationNickname,
             locationId: event.locationId,
             parentEventId: event.parentEventId,
             isTripEvent: event.isTripEvent,
-            eventType: event.eventType,
-            activityType: event.activityType,
-            milestoneType: event.milestoneType,
-            holidayType: event.holidayType,
             attributeTags: tags,
-            eventMainPerson: event.eventMainPerson,
-            eventMainPerson2: event.eventMainPerson2,
             weddingDate: event.weddingDate,
-            tripType: event.tripType,
             childEventName: event.childEventName,
             userEditedChildEventName: event.userEditedChildEventName,
             isUserHidden: event.isUserHidden
@@ -927,10 +1632,6 @@ final class EventTagRepository {
         eventId: Int,
         tagValue: String,
         source: EventTagSource,
-        appliedPhase: EventTagAppliedPhase?,
-        occasionId: Int?,
-        scoringYear: Int?,
-        confidence: String?,
         totalScore: Double?
     ) {
         upsertAttributeTagUnsafe(
@@ -938,10 +1639,6 @@ final class EventTagRepository {
             category: Self.holidayCategory,
             tagValue: tagValue,
             source: source,
-            appliedPhase: appliedPhase,
-            occasionId: occasionId,
-            scoringYear: scoringYear,
-            confidence: confidence,
             totalScore: totalScore
         )
     }
@@ -951,44 +1648,29 @@ final class EventTagRepository {
         category: String,
         tagValue: String,
         source: EventTagSource,
-        appliedPhase: EventTagAppliedPhase?,
-        occasionId: Int?,
-        scoringYear: Int?,
-        confidence: String?,
         totalScore: Double?
     ) {
+        let field = EventAttributeField.fromTagCategory(category)
+        // Singular categories keep one value: clear other values for this category first.
+        if field?.allowsMultipleTagValues != true {
+            deleteOtherTagValuesUnsafe(
+                eventId: eventId,
+                category: category,
+                keepingTagValue: tagValue
+            )
+        }
+
         let now = ISO8601DateFormatter().string(from: Date())
         let sql = """
         INSERT INTO event_tags (
-            eventId, tagCategory, tagValue, source, appliedPhase,
-            occasionId, scoringYear, confidence, totalScore,
+            eventId, tagCategory, tagValue, source, totalScore,
             isRejected, createdAt, updatedAt
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-        ON CONFLICT(eventId, tagCategory) DO UPDATE SET
-            tagValue = CASE
-                WHEN event_tags.source = 'user' AND excluded.source = 'ai' THEN event_tags.tagValue
-                ELSE excluded.tagValue
-            END,
+        VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+        ON CONFLICT(eventId, tagCategory, tagValue) DO UPDATE SET
             source = CASE
                 WHEN event_tags.source = 'user' AND excluded.source = 'ai' THEN event_tags.source
                 ELSE excluded.source
-            END,
-            appliedPhase = CASE
-                WHEN event_tags.source = 'user' AND excluded.source = 'ai' THEN event_tags.appliedPhase
-                ELSE excluded.appliedPhase
-            END,
-            occasionId = CASE
-                WHEN event_tags.source = 'user' AND excluded.source = 'ai' THEN event_tags.occasionId
-                ELSE excluded.occasionId
-            END,
-            scoringYear = CASE
-                WHEN event_tags.source = 'user' AND excluded.source = 'ai' THEN event_tags.scoringYear
-                ELSE excluded.scoringYear
-            END,
-            confidence = CASE
-                WHEN event_tags.source = 'user' AND excluded.source = 'ai' THEN event_tags.confidence
-                ELSE excluded.confidence
             END,
             totalScore = CASE
                 WHEN event_tags.source = 'user' AND excluded.source = 'ai' THEN event_tags.totalScore
@@ -1013,40 +1695,14 @@ final class EventTagRepository {
         sqlite3_bind_text(statement, 3, (tagValue as NSString).utf8String, -1, nil)
         sqlite3_bind_text(statement, 4, (source.rawValue as NSString).utf8String, -1, nil)
 
-        if let appliedPhase {
-            sqlite3_bind_text(
-                statement,
-                5,
-                (appliedPhase.rawValue as NSString).utf8String,
-                -1,
-                nil
-            )
+        if let totalScore {
+            sqlite3_bind_double(statement, 5, totalScore)
         } else {
             sqlite3_bind_null(statement, 5)
         }
 
-        if let occasionId {
-            sqlite3_bind_int(statement, 6, Int32(occasionId))
-        } else {
-            sqlite3_bind_null(statement, 6)
-        }
-
-        if let scoringYear {
-            sqlite3_bind_int(statement, 7, Int32(scoringYear))
-        } else {
-            sqlite3_bind_null(statement, 7)
-        }
-
-        bindOptionalText(confidence, to: statement, index: 8)
-
-        if let totalScore {
-            sqlite3_bind_double(statement, 9, totalScore)
-        } else {
-            sqlite3_bind_null(statement, 9)
-        }
-
-        sqlite3_bind_text(statement, 10, (now as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(statement, 11, (now as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 6, (now as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 7, (now as NSString).utf8String, -1, nil)
         sqlite3_step(statement)
         sqlite3_finalize(statement)
     }
@@ -1097,18 +1753,12 @@ final class EventTagRepository {
         let now = ISO8601DateFormatter().string(from: Date())
         let sql = """
         INSERT INTO event_tags (
-            eventId, tagCategory, tagValue, source, appliedPhase,
-            occasionId, scoringYear, confidence, totalScore,
+            eventId, tagCategory, tagValue, source, totalScore,
             isRejected, createdAt, updatedAt
         )
-        VALUES (?, ?, ?, 'ai', NULL, NULL, NULL, NULL, NULL, 1, ?, ?)
-        ON CONFLICT(eventId, tagCategory) DO UPDATE SET
-            tagValue = excluded.tagValue,
+        VALUES (?, ?, ?, 'ai', NULL, 1, ?, ?)
+        ON CONFLICT(eventId, tagCategory, tagValue) DO UPDATE SET
             source = 'ai',
-            appliedPhase = NULL,
-            occasionId = NULL,
-            scoringYear = NULL,
-            confidence = NULL,
             totalScore = NULL,
             isRejected = 1,
             updatedAt = excluded.updatedAt;
@@ -1137,6 +1787,33 @@ final class EventTagRepository {
         )
     }
 
+    private func deleteOtherTagValuesUnsafe(
+        eventId: Int,
+        category: String,
+        keepingTagValue: String
+    ) {
+        // Keep rejected AI tombstones (isRejected = 1) so e.g. Wedding cannot be
+        // re-suggested after the user removes it and applies Prom / Engagement / etc.
+        let sql = """
+        DELETE FROM event_tags
+        WHERE eventId = ?
+          AND tagCategory = ?
+          AND LOWER(tagValue) != LOWER(?)
+          AND COALESCE(isRejected, 0) = 0;
+        """
+
+        var statement: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            let categoryNS = category as NSString
+            let keepingNS = keepingTagValue as NSString
+            sqlite3_bind_int(statement, 1, Int32(eventId))
+            sqlite3_bind_text(statement, 2, categoryNS.utf8String, -1, nil)
+            sqlite3_bind_text(statement, 3, keepingNS.utf8String, -1, nil)
+            sqlite3_step(statement)
+        }
+        sqlite3_finalize(statement)
+    }
+
     private func deleteAttributeTagUnsafe(
         eventId: Int,
         category: String,
@@ -1161,38 +1838,49 @@ final class EventTagRepository {
         sqlite3_finalize(statement)
     }
 
-    private func deleteHolidayTagUnsafe(eventId: Int, source: EventTagSource) {
-        deleteAttributeTagUnsafe(eventId: eventId, category: Self.holidayCategory, source: source)
-    }
-
-    private func mirrorAttributeColumnUnsafe(
+    private func deleteAttributeTagValueUnsafe(
         eventId: Int,
-        field: EventAttributeField,
-        value: String?
+        category: String,
+        tagValue: String,
+        source: EventTagSource
     ) {
-        let column = field.sqlColumn
         let sql = """
-        UPDATE events
-        SET \(column) = ?,
-            updatedAt = ?
-        WHERE eventId = ?;
+        DELETE FROM event_tags
+        WHERE eventId = ?
+          AND tagCategory = ?
+          AND tagValue = ? COLLATE NOCASE
+          AND source = ?;
         """
 
-        let now = ISO8601DateFormatter().string(from: Date())
         var statement: OpaquePointer?
-
         if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
-            bindOptionalText(value, to: statement, index: 1)
-            sqlite3_bind_text(statement, 2, (now as NSString).utf8String, -1, nil)
-            sqlite3_bind_int(statement, 3, Int32(eventId))
+            sqlite3_bind_int(statement, 1, Int32(eventId))
+            sqlite3_bind_text(statement, 2, (category as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, 3, (tagValue as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, 4, (source.rawValue as NSString).utf8String, -1, nil)
             sqlite3_step(statement)
         }
-
         sqlite3_finalize(statement)
     }
 
-    private func mirrorHolidayTypeUnsafe(eventId: Int, value: String?) {
-        mirrorAttributeColumnUnsafe(eventId: eventId, field: .holidayType, value: value)
+    private func deleteAttributeTagCategoryUnsafe(eventId: Int, category: String) {
+        let sql = """
+        DELETE FROM event_tags
+        WHERE eventId = ?
+          AND tagCategory = ?;
+        """
+
+        var statement: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            sqlite3_bind_int(statement, 1, Int32(eventId))
+            sqlite3_bind_text(statement, 2, (category as NSString).utf8String, -1, nil)
+            sqlite3_step(statement)
+        }
+        sqlite3_finalize(statement)
+    }
+
+    private func deleteHolidayTagUnsafe(eventId: Int, source: EventTagSource) {
+        deleteAttributeTagUnsafe(eventId: eventId, category: Self.holidayCategory, source: source)
     }
 
     private func getAppMetadataUnsafe(key: String) -> String? {

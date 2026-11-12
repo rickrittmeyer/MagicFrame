@@ -8,16 +8,158 @@ final class VisionJobEnqueueService {
     private let eventObjectRecognition: EventObjectRecognitionService
     private let eventTags: EventTagRepository
 
+    private let faceRecognition: FaceRecognitionRepository
+
     init(
         database: DatabaseManager,
         visionJobs: VisionJobRepository,
         eventObjectRecognition: EventObjectRecognitionService,
-        eventTags: EventTagRepository
+        eventTags: EventTagRepository,
+        faceRecognition: FaceRecognitionRepository
     ) {
         self.database = database
         self.visionJobs = visionJobs
         self.eventObjectRecognition = eventObjectRecognition
         self.eventTags = eventTags
+        self.faceRecognition = faceRecognition
+    }
+
+    /// Enqueues face detect/embed jobs for photos not yet at the current algorithm version.
+    func enqueueFaceRecognitionScan(
+        forceRescan: Bool = false,
+        limit: Int = 2_000,
+        priority: Int = 40
+    ) -> VisionJobEnqueueSummary {
+        database.sync {
+            enqueueFaceRecognitionScanUnsafe(
+                forceRescan: forceRescan,
+                limit: limit,
+                priority: priority
+            )
+        }
+    }
+
+    private func enqueueFaceRecognitionScanUnsafe(
+        forceRescan: Bool,
+        limit: Int,
+        priority: Int
+    ) -> VisionJobEnqueueSummary {
+        let algorithmVersion = FaceRecognitionAnalyzer.algorithmVersion
+        let scopeKey = "faceRecognition:library"
+        let createdAt = ISO8601DateFormatter().string(from: Date())
+
+        if forceRescan {
+            faceRecognition.clearFaceRecognitionVersionsUnsafe()
+        } else {
+            // Accidental force-rescan clears versions; put stamps back for photos
+            // that already have face rows so progress/queue stay coherent.
+            _ = faceRecognition.restoreFaceRecognitionVersionsForPhotosWithFacesUnsafe(
+                algorithmVersion: algorithmVersion
+            )
+        }
+
+        let photoIds = faceRecognition.fetchPhotoIdsNeedingFaceRecognitionUnsafe(
+            algorithmVersion: algorithmVersion,
+            limit: limit
+        )
+
+        var enqueued = 0
+        for photoId in photoIds {
+            let dedupeKey = "faceRecognitionScan|\(photoId)|v\(algorithmVersion)"
+            if visionJobs.enqueueUnsafe(
+                jobType: .faceRecognitionScan,
+                priority: priority,
+                photoId: photoId,
+                eventId: nil,
+                occasionKey: nil,
+                algorithmVersion: algorithmVersion,
+                payload: VisionJobPayload(scopeKey: scopeKey),
+                dedupeKey: dedupeKey,
+                createdAt: createdAt
+            ) {
+                enqueued += 1
+            }
+        }
+
+        let remaining = faceRecognition.countPhotosNeedingFaceRecognitionUnsafe(
+            algorithmVersion: algorithmVersion
+        )
+        let skipped: String?
+        if photoIds.isEmpty {
+            skipped = remaining == 0
+                ? "All photos already face-scanned"
+                : "No eligible photos in this batch"
+        } else if enqueued == 0 {
+            skipped = "Could not queue face scans (jobs already active)"
+        } else {
+            skipped = nil
+        }
+
+        return VisionJobEnqueueSummary(
+            enqueuedCount: enqueued,
+            skippedReason: skipped
+        )
+    }
+
+    /// Enqueues face detect/embed for specific photos that still need the current algorithm version.
+    /// Used by Picture Search results and event-open seeding (not library bulk scan).
+    func enqueueFaceRecognitionForPhotoIds(
+        _ photoIds: [String],
+        priority: Int = 70
+    ) -> VisionJobEnqueueSummary {
+        database.sync {
+            enqueueFaceRecognitionForPhotoIdsUnsafe(photoIds, priority: priority)
+        }
+    }
+
+    private func enqueueFaceRecognitionForPhotoIdsUnsafe(
+        _ photoIds: [String],
+        priority: Int
+    ) -> VisionJobEnqueueSummary {
+        let uniqueIds = Array(Set(photoIds.filter { !$0.isEmpty }))
+        guard !uniqueIds.isEmpty else {
+            return VisionJobEnqueueSummary(enqueuedCount: 0, skippedReason: "No photos to face-scan")
+        }
+
+        let algorithmVersion = FaceRecognitionAnalyzer.algorithmVersion
+        let needing = faceRecognition.filterPhotoIdsNeedingFaceRecognitionUnsafe(
+            photoIds: uniqueIds,
+            algorithmVersion: algorithmVersion
+        )
+        guard !needing.isEmpty else {
+            return VisionJobEnqueueSummary(
+                enqueuedCount: 0,
+                skippedReason: "All selected photos already face-scanned"
+            )
+        }
+
+        let scopeKey = "faceRecognition:library"
+        let createdAt = ISO8601DateFormatter().string(from: Date())
+        var enqueued = 0
+        for photoId in needing {
+            let dedupeKey = "faceRecognitionScan|\(photoId)|v\(algorithmVersion)"
+            if visionJobs.enqueueUnsafe(
+                jobType: .faceRecognitionScan,
+                priority: priority,
+                photoId: photoId,
+                eventId: nil,
+                occasionKey: nil,
+                algorithmVersion: algorithmVersion,
+                payload: VisionJobPayload(scopeKey: scopeKey),
+                dedupeKey: dedupeKey,
+                createdAt: createdAt
+            ) {
+                enqueued += 1
+            }
+        }
+
+        let skipped: String?
+        if enqueued == 0 {
+            skipped = "Could not queue face scans (jobs already active)"
+        } else {
+            skipped = nil
+        }
+        return VisionJobEnqueueSummary(enqueuedCount: enqueued, skippedReason: skipped)
     }
 
     func enqueueEventObjectRecognition(

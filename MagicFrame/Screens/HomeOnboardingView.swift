@@ -1,6 +1,7 @@
 import SwiftUI
 import MapKit
 
+@available(iOS 26.0, *)
 struct HomeOnboardingView: View {
 
     @StateObject private var vm = HomeOnboardingViewModel()

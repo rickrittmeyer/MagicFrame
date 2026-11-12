@@ -1,5 +1,4 @@
 import SwiftUI
-import Photos
 
 struct EventDetailView: View {
 
@@ -29,14 +28,6 @@ struct EventDetailView: View {
         )
     }
 
-    private let gridSpacing: CGFloat = 2
-    private var columns: [GridItem] {
-        Array(
-            repeating: GridItem(.flexible(), spacing: gridSpacing),
-            count: 3
-        )
-    }
-
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
@@ -59,7 +50,6 @@ struct EventDetailView: View {
                         .padding(.top, 8)
                 }
 
-                holidayScorecardsSection
             }
         }
         .background(Color(.systemBackground))
@@ -88,6 +78,24 @@ struct EventDetailView: View {
                         Menu {
                             Button(vm.showHiddenPhotos ? "Hide Hidden Photos" : "Show Hidden Photos") {
                                 vm.toggleShowHiddenPhotos()
+                            }
+
+                            if vm.canLookupGameScore {
+                                Button {
+                                    Task { await vm.findGameScore() }
+                                } label: {
+                                    Label(
+                                        vm.isLookingUpGameScore ? "Looking Up Score…" : "Find Game Score",
+                                        systemImage: "sportscourt"
+                                    )
+                                }
+                                .disabled(vm.isLookingUpGameScore)
+
+                                if vm.gameResult != nil {
+                                    Button("Clear Game Score", role: .destructive) {
+                                        vm.clearSavedGameScore()
+                                    }
+                                }
                             }
 
                             if vm.isUserHidden {
@@ -123,7 +131,40 @@ struct EventDetailView: View {
         .task(id: vm.event.eventId) {
             vm.loadPhotos()
             vm.loadClassificationOptions()
-            vm.loadHolidayScorecards()
+        }
+        .onDisappear {
+            vm.cancelObjectRecognition()
+        }
+        .sheet(isPresented: $vm.showGameLookupCandidates) {
+            NavigationStack {
+                List(vm.gameLookupCandidates) { candidate in
+                    Button {
+                        vm.saveGameCandidate(candidate)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 4) {
+                            GameCoverScoreBoardView(
+                                board: candidate.coverScoreBoard,
+                                font: .body.weight(.semibold),
+                                foregroundStyle: .primary
+                            )
+                            Text(candidate.detailLine)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+                .navigationTitle("Choose Game")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") {
+                            vm.showGameLookupCandidates = false
+                        }
+                    }
+                }
+            }
+            .presentationDetents([.medium, .large])
         }
         .confirmationDialog(
             "Hide Event",
@@ -198,6 +239,7 @@ struct EventDetailView: View {
                     items: vm.milestonePersonPickerItems(for: kind),
                     defaultWeddingDate: vm.defaultWeddingDate(),
                     onComplete: { person1, person2, weddingDate in
+                        guard let person2 else { return }
                         vm.assignCoupleMilestone(
                             person1: person1,
                             person2: person2,
@@ -214,6 +256,41 @@ struct EventDetailView: View {
                     }
                 )
             }
+        }
+        .sheet(item: $vm.pendingSimilarEventAlternatives, onDismiss: {
+            vm.pendingSimilarEventAlternatives = nil
+        }) { request in
+            SimilarEventAlternativesSheet(
+                rejectedTagValue: request.rejectedTag.tagValue,
+                alternatives: request.alternatives,
+                onSelect: { alternative in
+                    vm.applySimilarEventAlternative(alternative)
+                },
+                onSkip: {
+                    vm.pendingSimilarEventAlternatives = nil
+                }
+            )
+        }
+        .sheet(item: $vm.pendingSimilarEventPeoplePick, onDismiss: {
+            vm.pendingSimilarEventPeoplePick = nil
+        }) { request in
+            let personCount = max(1, min(2, request.alternative.possibleNumberOfEventMainPeople))
+            CoupleMilestonePickerSheet(
+                copy: .forSimilarEvent(
+                    tagValue: request.alternative.possibleTagValue,
+                    personCount: personCount
+                ),
+                personCount: personCount,
+                items: request.people,
+                defaultWeddingDate: vm.defaultWeddingDate(),
+                includesWeddingDateStep: false,
+                onComplete: { person1, person2, _ in
+                    vm.completeSimilarEventPeoplePick(
+                        person1: person1,
+                        person2: person2
+                    )
+                }
+            )
         }
     }
 
@@ -258,47 +335,6 @@ struct EventDetailView: View {
     }
 
     @ViewBuilder
-    private var holidayScorecardsSection: some View {
-        ForEach(vm.holidayScorecards) { scoringDetail in
-            if let occasionId = scoringDetail.occasionId {
-                AITagScoringDetailPanel(
-                    detail: scoringDetail,
-                    editorRevision: vm.holidayScorecardRevision,
-                    onSaveDateScoring: scoringDetail.supportsDateScoringEdits
-                        ? { edit in
-                            vm.saveOccasionDateScoringSettings(
-                                occasionId: occasionId,
-                                edit: edit
-                            )
-                        }
-                        : nil,
-                    onSaveObjectScoring: scoringDetail.supportsObjectScoringEdits
-                        ? { rules in
-                            vm.saveOccasionObjectScoringRules(
-                                occasionId: occasionId,
-                                rules: rules
-                            )
-                        }
-                        : nil
-                )
-            } else {
-                AITagScoringDetailPanel(
-                    detail: scoringDetail,
-                    editorRevision: vm.holidayScorecardRevision
-                )
-            }
-        }
-
-        if let saveStatus = vm.aiTagScoringSaveStatus {
-            Text(saveStatus)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 16)
-                .padding(.top, 4)
-        }
-    }
-
-    @ViewBuilder
     private var selectedAttributeChips: some View {
         if !vm.event.libraryAttributeTags.isEmpty {
             FlowLayout(spacing: 8, lineSpacing: 8) {
@@ -306,16 +342,20 @@ struct EventDetailView: View {
                     EventAttributeTagChip(
                         tag: tag,
                         showsCategoryIcon: true,
-                        showsScore: true,
+                        showsScore: false,
                         onConfirmAI: tag.isAIDerived
-                            ? { vm.confirmAIAttributeTag(tag) }
+                            ? {
+                                if tag.category == .milestoneType,
+                                   tag.tagValue.compare("Wedding", options: .caseInsensitive) == .orderedSame {
+                                    vm.confirmAIWeddingMilestoneTag(tag)
+                                    activeMilestonePersonPicker = .wedding
+                                } else {
+                                    vm.confirmAIAttributeTag(tag)
+                                }
+                            }
                             : nil,
-                        onRemoveAI: tag.isAIDerived
-                            ? { vm.rejectAIAttributeTag(tag) }
-                            : nil,
-                        onShowScoreDetails: tag.isAIDerived
-                            ? { vm.showAITagScoringDetail(for: tag) }
-                            : nil,
+                        onRemove: { vm.removeAttributeTag(tag) },
+                        onShowScoreDetails: nil,
                         onTap: vm.isMilestonePersonPickerTag(tag) && !tag.isAIDerived
                             ? {
                                 if let kind = MilestonePersonPickerKind.from(milestoneType: tag.tagValue) {
@@ -344,13 +384,44 @@ struct EventDetailView: View {
                 locationSummary(showChevron: false)
             }
 
+            if let locationGeocodeStatus = vm.locationGeocodeStatus {
+                Text(locationGeocodeStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let gameResult = vm.gameResult {
+                VStack(alignment: .leading, spacing: 2) {
+                    GameCoverScoreBoardView(
+                        board: gameResult.coverScoreBoard,
+                        font: .subheadline.weight(.semibold),
+                        foregroundStyle: .primary
+                    )
+                    Text(
+                        [
+                            gameResult.league.displayName,
+                            gameResult.venueName,
+                        ]
+                        .compactMap { $0 }
+                        .filter { !$0.isEmpty }
+                        .joined(separator: " · ")
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+            } else if let gameLookupStatus = vm.gameLookupStatus {
+                Text(gameLookupStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             HStack(spacing: 12) {
                 if vm.collapsedSimilarPhotoCount > 0 {
-                    Text("\(vm.photoCount) photos · \(vm.visiblePhotoCount) shown")
+                    Text("\(vm.photoCount) photos · \(vm.visiblePhotoCount) shown · \(vm.videoCount) videos")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
-                    Text("\(vm.photoCount) photos")
+                    Text("\(vm.photoCount) photos · \(vm.videoCount) videos")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -502,151 +573,46 @@ struct EventDetailView: View {
         .padding(.horizontal, 16)
     }
 
-    @ViewBuilder
-    private var photoGrid: some View {
+    private var photoGridSections: [PhotoGridSection] {
         if vm.event.isTripContainer, !vm.tripPhotoDisplaySections.isEmpty {
-            VStack(alignment: .leading, spacing: 20) {
-                ForEach(vm.tripPhotoDisplaySections) { section in
-                    VStack(alignment: .leading, spacing: 10) {
-                        tripSectionHeader(section)
-
-                        LazyVGrid(columns: columns, spacing: gridSpacing) {
-                            ForEach(Array(section.displayItems.enumerated()), id: \.element.id) { _, item in
-                                displayItemCell(
-                                    item,
-                                    index: displayIndex(for: item, in: section)
-                                )
-                            }
-                        }
-                        .padding(.horizontal, 16)
-                    }
-                }
-            }
-        } else {
-            LazyVGrid(columns: columns, spacing: gridSpacing) {
-                ForEach(Array(vm.photoDisplayItems.enumerated()), id: \.element.id) { index, item in
-                    displayItemCell(item, index: index)
-                }
+            return vm.tripPhotoDisplaySections.map { section in
+                PhotoGridSection(id: "trip-\(section.id)", items: section.displayItems)
             }
         }
+        return [PhotoGridSection(id: "photos", items: vm.photoDisplayItems)]
     }
 
-    private func displayIndex(for item: EventPhotoDisplayItem, in section: TripPhotoDisplaySection) -> Int {
-        var index = 0
-        for tripSection in vm.tripPhotoDisplaySections {
-            if tripSection.id == section.id {
-                if let itemIndex = tripSection.displayItems.firstIndex(where: { $0.id == item.id }) {
-                    return index + itemIndex
-                }
-            }
-            index += tripSection.displayItems.count
-        }
-        return 0
-    }
-
-    @ViewBuilder
-    private func displayItemCell(_ item: EventPhotoDisplayItem, index: Int) -> some View {
-        let photo = item.representative
-        let isSelected = vm.selectedPhotoIds.contains(photo.id)
-
-        Button {
-            if vm.isSelectingPhotos {
-                vm.toggleDisplayItemSelection(item)
-            } else {
-                selectedPhotoIndex = index
-            }
-        } label: {
-            Group {
-                if item.isStack {
-                    SimilarPhotoStackCell(
-                        representative: photo,
-                        extraCount: item.extraCount
-                    )
-                } else {
-                    PhotoThumbnailView(
-                        assetIdentifier: photo.id,
-                        cornerRadius: 0,
-                        quality: .high
-                    )
-                    .id(photo.id)
-                    .aspectRatio(1, contentMode: .fill)
-                    .clipped()
-                }
-            }
-            .overlay {
-                if photo.showOnFrame {
-                    RoundedRectangle(cornerRadius: 0)
-                        .strokeBorder(Color.green, lineWidth: 3)
-                }
-            }
-            .overlay {
+    private var photoGrid: some View {
+        PhotoGrid(
+            sections: photoGridSections,
+            isSelecting: vm.isSelectingPhotos,
+            selectedPhotoIds: vm.selectedPhotoIds,
+            onTap: { item in
                 if vm.isSelectingPhotos {
-                    RoundedRectangle(cornerRadius: 0)
-                        .strokeBorder(isSelected ? Color.accentColor : Color.white.opacity(0.6), lineWidth: isSelected ? 3 : 1)
-                    RoundedRectangle(cornerRadius: 0)
-                        .fill(isSelected ? Color.accentColor.opacity(0.25) : Color.black.opacity(0.12))
+                    vm.toggleDisplayItemSelection(item)
+                } else if let index = vm.fullscreenDisplayItems.firstIndex(where: { $0.id == item.id }) {
+                    selectedPhotoIndex = index
                 }
-            }
-            .overlay {
-                if photo.isHiddenInEvent {
-                    RoundedRectangle(cornerRadius: 0)
-                        .fill(Color.black.opacity(0.35))
+            },
+            sectionHeader: { section in
+                if let trip = vm.tripPhotoDisplaySections.first(where: { "trip-\($0.id)" == section.id }) {
+                    tripSectionHeader(trip)
                 }
-            }
-            .overlay(alignment: .topLeading) {
-                if photo.isHiddenInEvent, !vm.isSelectingPhotos {
-                    Image(systemName: "eye.slash")
-                        .font(.caption2)
-                        .foregroundStyle(.white)
-                        .padding(5)
-                        .background(.black.opacity(0.35), in: Circle())
-                        .padding(4)
-                }
-            }
-            .overlay(alignment: .topTrailing) {
-                if vm.isSelectingPhotos {
-                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                        .font(.title3)
-                        .symbolRenderingMode(.palette)
-                        .foregroundStyle(isSelected ? Color.white : Color.white.opacity(0.9), isSelected ? Color.accentColor : Color.black.opacity(0.35))
-                        .padding(6)
-                } else if photo.isFavorite {
-                    Image(systemName: "heart.fill")
-                        .font(.caption2)
-                        .foregroundStyle(.white)
-                        .padding(5)
-                        .background(.black.opacity(0.35), in: Circle())
-                        .padding(4)
-                }
-            }
-            .overlay(alignment: .bottomLeading) {
-                if photo.showOnFrame, !vm.isSelectingPhotos {
-                    Image(systemName: "play.rectangle.fill")
-                        .font(.caption2)
-                        .foregroundStyle(.green)
-                        .padding(5)
-                        .background(.black.opacity(0.35), in: Circle())
-                        .padding(4)
-                }
-            }
-        }
-        .buttonStyle(.plain)
-        .contextMenu {
-            if !vm.isSelectingPhotos {
-                Button(photo.showOnFrame ? "Remove from Frame" : "Add to Frame") {
+            },
+            contextMenu: { item in
+                Button(item.representative.showOnFrame ? "Remove from Frame" : "Add to Frame") {
                     vm.togglePhotoOnFrame(
-                        photoId: photo.id,
+                        photoId: item.representative.id,
                         in: item.isStack ? item.group : nil
                     )
                 }
-
                 Button("Hide") {
                     if vm.hideDisplayItem(item) {
                         dismiss()
                     }
                 }
             }
-        }
+        )
     }
 }
 
@@ -754,66 +720,6 @@ private struct EventAttributePickerSheet: View {
     }
 }
 
-private struct SimilarPhotoStackCell: View {
-
-    let representative: IndexedPhoto
-    let extraCount: Int
-    let cornerRadius: CGFloat
-
-    init(
-        representative: IndexedPhoto,
-        extraCount: Int,
-        cornerRadius: CGFloat = 0
-    ) {
-        self.representative = representative
-        self.extraCount = extraCount
-        self.cornerRadius = cornerRadius
-    }
-
-    var body: some View {
-        ZStack(alignment: .topTrailing) {
-            ZStack {
-                if extraCount >= 2 {
-                    stackLayer(offset: CGSize(width: 8, height: -8), opacity: 0.35)
-                }
-                if extraCount >= 1 {
-                    stackLayer(offset: CGSize(width: 4, height: -4), opacity: 0.55)
-                }
-
-                PhotoThumbnailView(
-                    assetIdentifier: representative.id,
-                    cornerRadius: cornerRadius,
-                    quality: .high
-                )
-            }
-            .aspectRatio(1, contentMode: .fill)
-            .clipped()
-
-            if extraCount > 0 {
-                Text("+\(extraCount)")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
-                    .background(.black.opacity(0.55), in: Capsule())
-                    .padding(6)
-            }
-        }
-    }
-
-    private func stackLayer(offset: CGSize, opacity: Double) -> some View {
-        RoundedRectangle(cornerRadius: cornerRadius)
-            .fill(Color(.secondarySystemFill))
-            .overlay {
-                RoundedRectangle(cornerRadius: cornerRadius)
-                    .strokeBorder(Color.white.opacity(0.35), lineWidth: 1)
-            }
-            .aspectRatio(1, contentMode: .fill)
-            .offset(offset)
-            .opacity(opacity)
-    }
-}
-
 private struct SimilarPhotoGroupPickerView: View {
 
     let group: SimilarPhotoGroup
@@ -866,9 +772,30 @@ private struct SimilarPhotoGroupPickerView: View {
             }
             .fullScreenCover(isPresented: isPreviewPresented) {
                 if let photoId = previewPhotoId {
-                    SimilarPhotoPreviewView(
-                        photoIds: group.photos.map(\.id),
-                        initialPhotoId: photoId
+                    PhotoPreviewView(
+                        items: [
+                            EventPhotoDisplayItem(
+                                group: group,
+                                representative: group.photos.first { $0.id == photoId }
+                                    ?? group.autoBestPhoto()
+                            )
+                        ],
+                        resolvingPhotos: group.photos,
+                        initialIndex: 0,
+                        initialPhotoId: photoId,
+                        showsActionBar: false,
+                        onDismiss: { previewPhotoId = nil },
+                        header: { context in
+                            PhotoPreviewStandardHeader(
+                                index: context.displayIndex + 1,
+                                count: context.displayCount,
+                                showsCounter: !context.isZoomed,
+                                onClose: { previewPhotoId = nil }
+                            )
+                        },
+                        actions: { _ in
+                            EmptyView()
+                        }
                     )
                 }
             }
@@ -935,98 +862,6 @@ private struct SimilarPhotoGroupPickerView: View {
             }
         } else {
             selectedPhotoIds.insert(photoId)
-        }
-    }
-}
-
-private struct SimilarPhotoPreviewView: View {
-
-    let photoIds: [String]
-    let initialPhotoId: String
-
-    @Environment(\.dismiss) private var dismiss
-    @State private var currentIndex: Int = 0
-
-    var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-
-            TabView(selection: $currentIndex) {
-                ForEach(Array(photoIds.enumerated()), id: \.offset) { index, photoId in
-                    SimilarPhotoPreviewPage(assetIdentifier: photoId)
-                        .tag(index)
-                }
-            }
-            .tabViewStyle(.page(indexDisplayMode: .automatic))
-            .ignoresSafeArea()
-
-            VStack {
-                HStack {
-                    Spacer()
-                    Button {
-                        dismiss()
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.title)
-                            .symbolRenderingMode(.palette)
-                            .foregroundStyle(.white, .black.opacity(0.35))
-                    }
-                    .padding(.trailing, 16)
-                    .padding(.top, 8)
-                }
-                Spacer()
-            }
-        }
-        .onAppear {
-            currentIndex = photoIds.firstIndex(of: initialPhotoId) ?? 0
-        }
-    }
-}
-
-private struct SimilarPhotoPreviewPage: View {
-
-    let assetIdentifier: String
-    @State private var image: UIImage?
-
-    var body: some View {
-        Group {
-            if let image {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
-            } else {
-                ProgressView()
-                    .tint(.white)
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onAppear {
-            loadFullImage()
-        }
-    }
-
-    private func loadFullImage() {
-        let assets = PHAsset.fetchAssets(
-            withLocalIdentifiers: [assetIdentifier],
-            options: nil
-        )
-
-        guard let asset = assets.firstObject else { return }
-
-        let options = PHImageRequestOptions()
-        options.deliveryMode = .highQualityFormat
-        options.resizeMode = .none
-        options.isNetworkAccessAllowed = true
-
-        PHImageManager.default().requestImage(
-            for: asset,
-            targetSize: PHImageManagerMaximumSize,
-            contentMode: .aspectFit,
-            options: options
-        ) { result, _ in
-            DispatchQueue.main.async {
-                self.image = result
-            }
         }
     }
 }

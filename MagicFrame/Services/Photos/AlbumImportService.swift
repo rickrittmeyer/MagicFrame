@@ -25,12 +25,10 @@ final class AlbumImportService {
 
     private let albums: AlbumRepository
     private let photos: PhotoRepository
-    private let people: PeopleRepository
 
-    init(albums: AlbumRepository, photos: PhotoRepository, people: PeopleRepository) {
+    init(albums: AlbumRepository, photos: PhotoRepository) {
         self.albums = albums
         self.photos = photos
-        self.people = people
     }
 
     /// Rebuilds album rows and indexed-photo memberships from visible PhotoKit collections.
@@ -62,14 +60,6 @@ final class AlbumImportService {
                     return
                 }
 
-                let isPersonAlbum = title.hasPrefix("P-")
-                let personName = isPersonAlbum
-                    ? String(title.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
-                    : ""
-                let personId: Int? = isPersonAlbum && !personName.isEmpty
-                    ? self.people.upsertPerson(name: personName)
-                    : nil
-
                 let isHighCardinality = collectionType == .smartAlbum
                     && Self.highCardinalitySmartSubtypes.contains(collection.assetCollectionSubtype)
 
@@ -81,8 +71,8 @@ final class AlbumImportService {
                     title: title,
                     collectionType: Self.collectionTypeLabel(collectionType),
                     collectionSubtype: String(describing: collection.assetCollectionSubtype),
-                    isPersonAlbum: isPersonAlbum,
-                    personId: personId.flatMap { $0 > 0 ? $0 : nil },
+                    isPersonAlbum: false,
+                    personId: nil,
                     isHighCardinality: isHighCardinality,
                     assetCount: assetCount,
                     indexedAt: now

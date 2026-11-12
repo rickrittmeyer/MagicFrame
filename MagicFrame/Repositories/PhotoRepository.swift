@@ -57,7 +57,8 @@ final class PhotoRepository {
         isScreenshot: Bool,
         aspectRatio: Double,
         orientation: String,
-        qualityScore: Int
+        qualityScore: Int,
+        duration: Double?
     ) {
         sync {
             upsertPhotoUnsafe(
@@ -75,7 +76,8 @@ final class PhotoRepository {
                 isScreenshot: isScreenshot,
                 aspectRatio: aspectRatio,
                 orientation: orientation,
-                qualityScore: qualityScore
+                qualityScore: qualityScore,
+                duration: duration
             )
         }
     }
@@ -93,6 +95,443 @@ final class PhotoRepository {
         }
 
         print("Soft delete check complete")
+    }
+
+    func fetchUnanalyzedPhotoIdsMatchingMonthDayRange(
+        start: String,
+        end: String
+    ) -> PhotoVisionTagMonthDaySelection {
+        sync {
+            fetchUnanalyzedPhotoIdsMatchingMonthDayRangeUnsafe(start: start, end: end)
+        }
+    }
+
+    func fetchUnanalyzedPhotoIdsMatchingDateSearch(
+        dateSearch: DateSearchDefinition,
+        floatingHoliday: FloatingHolidayDefinition?,
+        catalogHoliday: HolidayDefinition? = nil
+    ) -> PhotoVisionTagMonthDaySelection {
+        sync {
+            fetchUnanalyzedPhotoIdsMatchingDateSearchUnsafe(
+                dateSearch: dateSearch,
+                floatingHoliday: floatingHoliday,
+                catalogHoliday: catalogHoliday
+            )
+        }
+    }
+
+    func isVisionAnalyzedUnsafe(photoId: String) -> Bool {
+        let sql = """
+        SELECT COALESCE(visionAnalyzed, 0)
+        FROM photos
+        WHERE id = ?
+        LIMIT 1;
+        """
+
+        var statement: OpaquePointer?
+        var analyzed = false
+
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            let photoIdNS = photoId as NSString
+            sqlite3_bind_text(statement, 1, photoIdNS.utf8String, -1, nil)
+            if sqlite3_step(statement) == SQLITE_ROW {
+                analyzed = sqlite3_column_int(statement, 0) != 0
+            }
+        } else if let db {
+            print("isVisionAnalyzed prepare failed: \(String(cString: sqlite3_errmsg(db)))")
+        }
+
+        sqlite3_finalize(statement)
+        return analyzed
+    }
+
+    func markPhotoVisionAnalyzedUnsafe(photoId: String) {
+        let sql = """
+        UPDATE photos
+        SET visionAnalyzed = 1
+        WHERE id = ?;
+        """
+
+        var statement: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            let photoIdNS = photoId as NSString
+            sqlite3_bind_text(statement, 1, photoIdNS.utf8String, -1, nil)
+            if sqlite3_step(statement) != SQLITE_DONE {
+                print("Failed to mark photo vision analyzed: \(String(cString: sqlite3_errmsg(db)))")
+            }
+        } else if let db {
+            print("markPhotoVisionAnalyzed prepare failed: \(String(cString: sqlite3_errmsg(db)))")
+        }
+        sqlite3_finalize(statement)
+    }
+
+    /// Photos in an MM-DD range for **every year**, newest first.
+    ///
+    /// Matching uses `substr(effectiveDate, 6, 5)` so `08-12` hits 2005…2024 alike.
+    /// Newest-first avoids starving recent years when a wide range has thousands of older shots.
+    func fetchUnanalyzedPhotoIdsMatchingMonthDayRangeUnsafe(
+        start: String,
+        end: String
+    ) -> PhotoVisionTagMonthDaySelection {
+        let effectiveDateSQL = """
+        COALESCE(NULLIF(TRIM(captureDateOverride), ''), creationDate)
+        """
+        let monthDaySQL = "substr(\(effectiveDateSQL), 6, 5)"
+        let yearSQL = "CAST(substr(\(effectiveDateSQL), 1, 4) AS INTEGER)"
+        let rangePredicate: String
+        if start <= end {
+            rangePredicate = "\(monthDaySQL) >= ? AND \(monthDaySQL) <= ?"
+        } else {
+            rangePredicate = "\(monthDaySQL) >= ? OR \(monthDaySQL) <= ?"
+        }
+
+        // Require ISO-ish `YYYY-MM-DD…` so short/malformed dates never match by accident.
+        let baseWhere = """
+        isDeleted = 0
+          AND \(effectiveDateSQL) IS NOT NULL
+          AND length(\(effectiveDateSQL)) >= 10
+          AND substr(\(effectiveDateSQL), 5, 1) = '-'
+          AND substr(\(effectiveDateSQL), 8, 1) = '-'
+          AND (\(rangePredicate))
+        """
+
+        let countSQL = """
+        SELECT
+            COUNT(*) AS totalInRange,
+            SUM(CASE WHEN COALESCE(visionAnalyzed, 0) != 0 THEN 1 ELSE 0 END) AS alreadyAnalyzed
+        FROM photos
+        WHERE \(baseWhere);
+        """
+
+        let yearSQLQuery = """
+        SELECT \(yearSQL) AS y, COUNT(*) AS n
+        FROM photos
+        WHERE \(baseWhere)
+        GROUP BY y
+        ORDER BY y ASC;
+        """
+
+        let idsSQL = """
+        SELECT id
+        FROM photos
+        WHERE \(baseWhere)
+          AND COALESCE(visionAnalyzed, 0) = 0
+        ORDER BY \(effectiveDateSQL) DESC, id DESC;
+        """
+
+        let startNS = start as NSString
+        let endNS = end as NSString
+
+        var totalInRange = 0
+        var alreadyAnalyzed = 0
+        if let row = queryTwoInts(sql: countSQL, bindStart: startNS, bindEnd: endNS) {
+            totalInRange = row.0
+            alreadyAnalyzed = row.1
+        }
+
+        var photoCountByYear: [Int: Int] = [:]
+        var yearStatement: OpaquePointer?
+        if sqlite3_prepare_v2(db, yearSQLQuery, -1, &yearStatement, nil) == SQLITE_OK {
+            sqlite3_bind_text(yearStatement, 1, startNS.utf8String, -1, nil)
+            sqlite3_bind_text(yearStatement, 2, endNS.utf8String, -1, nil)
+            while sqlite3_step(yearStatement) == SQLITE_ROW {
+                let year = Int(sqlite3_column_int(yearStatement, 0))
+                let count = Int(sqlite3_column_int(yearStatement, 1))
+                if year > 0, count > 0 {
+                    photoCountByYear[year] = count
+                }
+            }
+        } else if let db {
+            print("Vision month-day year breakdown prepare failed: \(String(cString: sqlite3_errmsg(db)))")
+        }
+        sqlite3_finalize(yearStatement)
+
+        var photoIds: [String] = []
+        var idsStatement: OpaquePointer?
+        if sqlite3_prepare_v2(db, idsSQL, -1, &idsStatement, nil) == SQLITE_OK {
+            sqlite3_bind_text(idsStatement, 1, startNS.utf8String, -1, nil)
+            sqlite3_bind_text(idsStatement, 2, endNS.utf8String, -1, nil)
+            while sqlite3_step(idsStatement) == SQLITE_ROW {
+                if let cString = sqlite3_column_text(idsStatement, 0) {
+                    photoIds.append(String(cString: cString))
+                }
+            }
+        } else if let db {
+            print("Vision month-day id fetch prepare failed: \(String(cString: sqlite3_errmsg(db)))")
+        }
+        sqlite3_finalize(idsStatement)
+
+        return PhotoVisionTagMonthDaySelection(
+            photoIds: photoIds,
+            totalInRange: totalInRange,
+            alreadyAnalyzed: alreadyAnalyzed,
+            photoCountByYear: photoCountByYear
+        )
+    }
+
+    func fetchUnanalyzedPhotoIdsMatchingDateSearchUnsafe(
+        dateSearch: DateSearchDefinition,
+        floatingHoliday: FloatingHolidayDefinition?,
+        catalogHoliday: HolidayDefinition? = nil
+    ) -> PhotoVisionTagMonthDaySelection {
+        switch dateSearch.dateSearchType {
+        case .sameDateRangeEveryYear:
+            guard let start = dateSearch.rangeStartMonthDay,
+                  let end = dateSearch.rangeEndMonthDay else {
+                return emptyVisionSelection()
+            }
+            return fetchUnanalyzedPhotoIdsMatchingMonthDayRangeUnsafe(start: start, end: end)
+        case .allDates:
+            // Too broad for holiday Vision prep — skip.
+            return emptyVisionSelection()
+        case .absoluteRange, .sameDateEveryYear, .movingHoliday:
+            break
+        }
+
+        let effectiveDateSQL = """
+        COALESCE(NULLIF(TRIM(captureDateOverride), ''), creationDate)
+        """
+        let daySQL = "substr(\(effectiveDateSQL), 1, 10)"
+        let yearSQL = "CAST(substr(\(effectiveDateSQL), 1, 4) AS INTEGER)"
+
+        let yearsSQL = """
+        SELECT DISTINCT \(yearSQL) AS y
+        FROM photos
+        WHERE isDeleted = 0
+          AND \(effectiveDateSQL) IS NOT NULL
+          AND length(\(effectiveDateSQL)) >= 10
+          AND substr(\(effectiveDateSQL), 5, 1) = '-'
+          AND substr(\(effectiveDateSQL), 8, 1) = '-'
+        ORDER BY y ASC;
+        """
+
+        var years: [Int] = []
+        var yearStatement: OpaquePointer?
+        if sqlite3_prepare_v2(db, yearsSQL, -1, &yearStatement, nil) == SQLITE_OK {
+            while sqlite3_step(yearStatement) == SQLITE_ROW {
+                let year = Int(sqlite3_column_int(yearStatement, 0))
+                if year > 0 {
+                    years.append(year)
+                }
+            }
+        }
+        sqlite3_finalize(yearStatement)
+
+        let allowedDays: Set<String>
+        switch dateSearch.dateSearchType {
+        case .absoluteRange:
+            guard let start = dateSearch.absoluteStartDate,
+                  let end = dateSearch.absoluteEndDate else {
+                return emptyVisionSelection()
+            }
+            // Expand absolute range into day list via SQL filter instead of IN list.
+            return fetchUnanalyzedPhotoIdsMatchingAbsoluteRangeUnsafe(start: start, end: end)
+        case .sameDateEveryYear, .movingHoliday:
+            allowedDays = PictureSearchDateMatcher.allowedDayISOStrings(
+                years: years,
+                dateSearch: dateSearch,
+                floatingHoliday: floatingHoliday,
+                catalogHoliday: catalogHoliday
+            )
+        default:
+            return emptyVisionSelection()
+        }
+
+        guard !allowedDays.isEmpty else { return emptyVisionSelection() }
+
+        let sortedDays = allowedDays.sorted()
+        let dayNSStrings = sortedDays.map { $0 as NSString }
+        let placeholders = Array(repeating: "?", count: dayNSStrings.count).joined(separator: ", ")
+        let baseWhere = """
+        isDeleted = 0
+          AND \(effectiveDateSQL) IS NOT NULL
+          AND length(\(effectiveDateSQL)) >= 10
+          AND \(daySQL) IN (\(placeholders))
+        """
+
+        func bindDays(_ statement: OpaquePointer?) {
+            for (index, dayNS) in dayNSStrings.enumerated() {
+                sqlite3_bind_text(statement, Int32(index + 1), dayNS.utf8String, -1, nil)
+            }
+        }
+
+        let countSQL = """
+        SELECT
+            COUNT(*) AS totalInRange,
+            SUM(CASE WHEN COALESCE(visionAnalyzed, 0) != 0 THEN 1 ELSE 0 END) AS alreadyAnalyzed
+        FROM photos
+        WHERE \(baseWhere);
+        """
+
+        var totalInRange = 0
+        var alreadyAnalyzed = 0
+        var countStatement: OpaquePointer?
+        if sqlite3_prepare_v2(db, countSQL, -1, &countStatement, nil) == SQLITE_OK {
+            bindDays(countStatement)
+            if sqlite3_step(countStatement) == SQLITE_ROW {
+                totalInRange = Int(sqlite3_column_int(countStatement, 0))
+                alreadyAnalyzed = Int(sqlite3_column_int(countStatement, 1))
+            }
+        }
+        sqlite3_finalize(countStatement)
+
+        let yearBreakdownSQL = """
+        SELECT \(yearSQL) AS y, COUNT(*) AS n
+        FROM photos
+        WHERE \(baseWhere)
+        GROUP BY y
+        ORDER BY y ASC;
+        """
+        var photoCountByYear: [Int: Int] = [:]
+        var yearBreakStatement: OpaquePointer?
+        if sqlite3_prepare_v2(db, yearBreakdownSQL, -1, &yearBreakStatement, nil) == SQLITE_OK {
+            bindDays(yearBreakStatement)
+            while sqlite3_step(yearBreakStatement) == SQLITE_ROW {
+                let year = Int(sqlite3_column_int(yearBreakStatement, 0))
+                let count = Int(sqlite3_column_int(yearBreakStatement, 1))
+                if year > 0, count > 0 {
+                    photoCountByYear[year] = count
+                }
+            }
+        }
+        sqlite3_finalize(yearBreakStatement)
+
+        let idsSQL = """
+        SELECT id
+        FROM photos
+        WHERE \(baseWhere)
+          AND COALESCE(visionAnalyzed, 0) = 0
+        ORDER BY \(effectiveDateSQL) DESC, id DESC;
+        """
+        var photoIds: [String] = []
+        var idsStatement: OpaquePointer?
+        if sqlite3_prepare_v2(db, idsSQL, -1, &idsStatement, nil) == SQLITE_OK {
+            bindDays(idsStatement)
+            while sqlite3_step(idsStatement) == SQLITE_ROW {
+                if let cString = sqlite3_column_text(idsStatement, 0) {
+                    photoIds.append(String(cString: cString))
+                }
+            }
+        }
+        sqlite3_finalize(idsStatement)
+
+        return PhotoVisionTagMonthDaySelection(
+            photoIds: photoIds,
+            totalInRange: totalInRange,
+            alreadyAnalyzed: alreadyAnalyzed,
+            photoCountByYear: photoCountByYear
+        )
+    }
+
+    private func fetchUnanalyzedPhotoIdsMatchingAbsoluteRangeUnsafe(
+        start: String,
+        end: String
+    ) -> PhotoVisionTagMonthDaySelection {
+        let effectiveDateSQL = """
+        COALESCE(NULLIF(TRIM(captureDateOverride), ''), creationDate)
+        """
+        let daySQL = "substr(\(effectiveDateSQL), 1, 10)"
+        let yearSQL = "CAST(substr(\(effectiveDateSQL), 1, 4) AS INTEGER)"
+        let baseWhere = """
+        isDeleted = 0
+          AND \(effectiveDateSQL) IS NOT NULL
+          AND length(\(effectiveDateSQL)) >= 10
+          AND \(daySQL) >= ?
+          AND \(daySQL) <= ?
+        """
+
+        let countSQL = """
+        SELECT
+            COUNT(*) AS totalInRange,
+            SUM(CASE WHEN COALESCE(visionAnalyzed, 0) != 0 THEN 1 ELSE 0 END) AS alreadyAnalyzed
+        FROM photos
+        WHERE \(baseWhere);
+        """
+        let startNS = start as NSString
+        let endNS = end as NSString
+        var totalInRange = 0
+        var alreadyAnalyzed = 0
+        if let row = queryTwoInts(sql: countSQL, bindStart: startNS, bindEnd: endNS) {
+            totalInRange = row.0
+            alreadyAnalyzed = row.1
+        }
+
+        var photoCountByYear: [Int: Int] = [:]
+        let yearSQLQuery = """
+        SELECT \(yearSQL) AS y, COUNT(*) AS n
+        FROM photos
+        WHERE \(baseWhere)
+        GROUP BY y
+        ORDER BY y ASC;
+        """
+        var yearStatement: OpaquePointer?
+        if sqlite3_prepare_v2(db, yearSQLQuery, -1, &yearStatement, nil) == SQLITE_OK {
+            sqlite3_bind_text(yearStatement, 1, startNS.utf8String, -1, nil)
+            sqlite3_bind_text(yearStatement, 2, endNS.utf8String, -1, nil)
+            while sqlite3_step(yearStatement) == SQLITE_ROW {
+                let year = Int(sqlite3_column_int(yearStatement, 0))
+                let count = Int(sqlite3_column_int(yearStatement, 1))
+                if year > 0, count > 0 {
+                    photoCountByYear[year] = count
+                }
+            }
+        }
+        sqlite3_finalize(yearStatement)
+
+        let idsSQL = """
+        SELECT id
+        FROM photos
+        WHERE \(baseWhere)
+          AND COALESCE(visionAnalyzed, 0) = 0
+        ORDER BY \(effectiveDateSQL) DESC, id DESC;
+        """
+        var photoIds: [String] = []
+        var idsStatement: OpaquePointer?
+        if sqlite3_prepare_v2(db, idsSQL, -1, &idsStatement, nil) == SQLITE_OK {
+            sqlite3_bind_text(idsStatement, 1, startNS.utf8String, -1, nil)
+            sqlite3_bind_text(idsStatement, 2, endNS.utf8String, -1, nil)
+            while sqlite3_step(idsStatement) == SQLITE_ROW {
+                if let cString = sqlite3_column_text(idsStatement, 0) {
+                    photoIds.append(String(cString: cString))
+                }
+            }
+        }
+        sqlite3_finalize(idsStatement)
+
+        return PhotoVisionTagMonthDaySelection(
+            photoIds: photoIds,
+            totalInRange: totalInRange,
+            alreadyAnalyzed: alreadyAnalyzed,
+            photoCountByYear: photoCountByYear
+        )
+    }
+
+    private func emptyVisionSelection() -> PhotoVisionTagMonthDaySelection {
+        PhotoVisionTagMonthDaySelection(
+            photoIds: [],
+            totalInRange: 0,
+            alreadyAnalyzed: 0,
+            photoCountByYear: [:]
+        )
+    }
+
+    private func queryTwoInts(
+        sql: String,
+        bindStart: NSString,
+        bindEnd: NSString
+    ) -> (Int, Int)? {
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            if let db {
+                print("Vision month-day count prepare failed: \(String(cString: sqlite3_errmsg(db)))")
+            }
+            return nil
+        }
+        sqlite3_bind_text(statement, 1, bindStart.utf8String, -1, nil)
+        sqlite3_bind_text(statement, 2, bindEnd.utf8String, -1, nil)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return (0, 0) }
+        return (Int(sqlite3_column_int(statement, 0)), Int(sqlite3_column_int(statement, 1)))
     }
 
     func getRecentPhotos(limit: Int = 100) -> [IndexedPhoto] {
@@ -118,6 +557,235 @@ final class PhotoRepository {
 
         sqlite3_finalize(statement)
         return photos
+    }
+
+    /// Loads indexed photos for a picture browser, preserving `photoIds` order.
+    /// Frame / hidden flags come from any linked `photo_events` row.
+    func fetchPhotosForBrowser(photoIds: [String]) -> [(photo: IndexedPhoto, mediaType: Int)] {
+        sync { fetchPhotosForBrowserUnsafe(photoIds: photoIds) }
+    }
+
+    func fetchPhotosForBrowserUnsafe(photoIds: [String]) -> [(photo: IndexedPhoto, mediaType: Int)] {
+        guard !photoIds.isEmpty else { return [] }
+
+        let uniqueIds = Array(Set(photoIds))
+        let placeholders = Array(repeating: "?", count: uniqueIds.count).joined(separator: ", ")
+        let sql = """
+        SELECT p.id, p.creationDate, p.isFavorite, p.width, p.height, p.mediaSubtype,
+               p.latitude, p.longitude, p.isScreenshot, p.aspectRatio, p.orientation, p.qualityScore,
+               p.faceEyesOpenScore, p.faceSmileScore,
+               COALESCE((
+                   SELECT pe.includeInSlideshow
+                   FROM photo_events pe
+                   WHERE pe.photoId = p.id
+                   ORDER BY pe.includeInSlideshow DESC, pe.eventId ASC
+                   LIMIT 1
+               ), 0) AS showOnFrame,
+               COALESCE((
+                   SELECT pe.manuallyExcluded
+                   FROM photo_events pe
+                   WHERE pe.photoId = p.id
+                   ORDER BY pe.manuallyExcluded DESC, pe.eventId ASC
+                   LIMIT 1
+               ), 0) AS isHiddenInEvent,
+               COALESCE(p.mediaType, 0) AS mediaType
+        FROM photos p
+        WHERE p.isDeleted = 0
+          AND p.id IN (\(placeholders));
+        """
+
+        var statement: OpaquePointer?
+        var byId: [String: (photo: IndexedPhoto, mediaType: Int)] = [:]
+
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            for (index, photoId) in uniqueIds.enumerated() {
+                sqlite3_bind_text(statement, Int32(index + 1), (photoId as NSString).utf8String, -1, nil)
+            }
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let photo = readBrowserPhotoRow(from: statement)
+                let mediaType = Int(sqlite3_column_int(statement, 16))
+                byId[photo.id] = (photo, mediaType)
+            }
+        } else if let db {
+            print("fetchPhotosForBrowser failed: \(String(cString: sqlite3_errmsg(db)))")
+        }
+
+        sqlite3_finalize(statement)
+
+        return photoIds.compactMap { byId[$0] }
+    }
+
+    /// Every indexed photo for the All Photos grid, including the date it was imported.
+    func fetchAllPhotosForBrowser() -> [(photo: IndexedPhoto, mediaType: Int, indexedAt: String)] {
+        sync { fetchAllPhotosForBrowserUnsafe(year: nil) }
+    }
+
+    /// Photos whose capture date falls in `year` (All Media first paint / year chip).
+    func fetchPhotosForBrowserYear(_ year: Int) -> [(photo: IndexedPhoto, mediaType: Int, indexedAt: String)] {
+        sync { fetchAllPhotosForBrowserUnsafe(year: year) }
+    }
+
+    /// Distinct capture years newest-first for the All Media year bar.
+    func fetchDistinctPhotoYearsForBrowser() -> [Int] {
+        sync { fetchDistinctPhotoYearsForBrowserUnsafe() }
+    }
+
+    func countActivePhotosForBrowser() -> Int {
+        sync { countActivePhotosForBrowserUnsafe() }
+    }
+
+    func fetchAllPhotosForBrowserUnsafe(
+        year: Int?
+    ) -> [(photo: IndexedPhoto, mediaType: Int, indexedAt: String)] {
+        // One pass over photo_events instead of two correlated subqueries per photo.
+        // When scoped to a year, also limit the flags aggregate to that year's photos.
+        let yearFilter: String
+        let flagsYearFilter: String
+        if let year, year >= 1000, year <= 9999 {
+            yearFilter = """
+              AND p.creationDate >= '\(year)-01-01'
+              AND p.creationDate < '\(year + 1)-01-01'
+            """
+            flagsYearFilter = """
+              AND pe.photoId IN (
+                SELECT id FROM photos
+                WHERE isDeleted = 0
+                  AND creationDate >= '\(year)-01-01'
+                  AND creationDate < '\(year + 1)-01-01'
+              )
+            """
+        } else {
+            yearFilter = ""
+            flagsYearFilter = ""
+        }
+
+        let sql = """
+        SELECT p.id, p.creationDate, p.isFavorite, p.width, p.height, p.mediaSubtype,
+               p.latitude, p.longitude, p.isScreenshot, p.aspectRatio, p.orientation, p.qualityScore,
+               p.faceEyesOpenScore, p.faceSmileScore,
+               COALESCE(flags.showOnFrame, 0) AS showOnFrame,
+               COALESCE(flags.isHiddenInEvent, 0) AS isHiddenInEvent,
+               COALESCE(p.mediaType, 0) AS mediaType,
+               COALESCE(p.indexedAt, '') AS indexedAt
+        FROM photos p
+        LEFT JOIN (
+            SELECT
+                pe.photoId AS photoId,
+                MAX(COALESCE(pe.includeInSlideshow, 0)) AS showOnFrame,
+                MAX(COALESCE(pe.manuallyExcluded, 0)) AS isHiddenInEvent
+            FROM photo_events pe
+            WHERE 1 = 1
+              \(flagsYearFilter)
+            GROUP BY pe.photoId
+        ) AS flags ON flags.photoId = p.id
+        WHERE p.isDeleted = 0
+          \(yearFilter)
+        ORDER BY p.creationDate DESC, p.id DESC;
+        """
+
+        var statement: OpaquePointer?
+        var rows: [(photo: IndexedPhoto, mediaType: Int, indexedAt: String)] = []
+
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let photo = readBrowserPhotoRow(from: statement)
+                let mediaType = Int(sqlite3_column_int(statement, 16))
+                let indexedAt = sqlite3_column_text(statement, 17).map { String(cString: $0) } ?? ""
+                rows.append((photo, mediaType, indexedAt))
+            }
+        } else if let db {
+            print("fetchAllPhotosForBrowser failed: \(String(cString: sqlite3_errmsg(db)))")
+        }
+
+        sqlite3_finalize(statement)
+        return rows
+    }
+
+    private func fetchDistinctPhotoYearsForBrowserUnsafe() -> [Int] {
+        let sql = """
+        SELECT DISTINCT SUBSTR(creationDate, 1, 4) AS year
+        FROM photos
+        WHERE isDeleted = 0
+          AND LENGTH(creationDate) >= 4
+        ORDER BY year DESC;
+        """
+        var statement: OpaquePointer?
+        var years: [Int] = []
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            while sqlite3_step(statement) == SQLITE_ROW {
+                if let cString = sqlite3_column_text(statement, 0),
+                   let year = Int(String(cString: cString)),
+                   year >= 1000 {
+                    years.append(year)
+                }
+            }
+        }
+        sqlite3_finalize(statement)
+        return years
+    }
+
+    private func countActivePhotosForBrowserUnsafe() -> Int {
+        let sql = "SELECT COUNT(*) FROM photos WHERE isDeleted = 0;"
+        var statement: OpaquePointer?
+        var count = 0
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK,
+           sqlite3_step(statement) == SQLITE_ROW {
+            count = Int(sqlite3_column_int(statement, 0))
+        }
+        sqlite3_finalize(statement)
+        return count
+    }
+
+    func setPhotosFavorite(photoIds: [String], isFavorite: Bool) {
+        sync { setPhotosFavoriteUnsafe(photoIds: photoIds, isFavorite: isFavorite) }
+    }
+
+    func setPhotosFavoriteUnsafe(photoIds: [String], isFavorite: Bool) {
+        guard !photoIds.isEmpty else { return }
+
+        let sql = """
+        UPDATE photos
+        SET isFavorite = ?
+        WHERE id = ?;
+        """
+
+        var statement: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            for photoId in photoIds {
+                sqlite3_reset(statement)
+                sqlite3_clear_bindings(statement)
+                sqlite3_bind_int(statement, 1, isFavorite ? 1 : 0)
+                sqlite3_bind_text(statement, 2, (photoId as NSString).utf8String, -1, nil)
+                sqlite3_step(statement)
+            }
+        }
+        sqlite3_finalize(statement)
+    }
+
+    private func readBrowserPhotoRow(from statement: OpaquePointer?) -> IndexedPhoto {
+        let base = readIndexedPhotoRow(from: statement)
+        let showOnFrame = sqlite3_column_int(statement, 14) == 1
+        let isHiddenInEvent = sqlite3_column_int(statement, 15) == 1
+        return IndexedPhoto(
+            id: base.id,
+            creationDate: base.creationDate,
+            isFavorite: base.isFavorite,
+            width: base.width,
+            height: base.height,
+            mediaSubtype: base.mediaSubtype,
+            latitude: base.latitude,
+            longitude: base.longitude,
+            isScreenshot: base.isScreenshot,
+            aspectRatio: base.aspectRatio,
+            orientation: base.orientation,
+            qualityScore: base.qualityScore,
+            faceEyesOpenScore: base.faceEyesOpenScore,
+            faceSmileScore: base.faceSmileScore,
+            showOnFrame: showOnFrame,
+            isHiddenInEvent: isHiddenInEvent,
+            isSimilarGroupPick: false,
+            isVideo: sqlite3_column_int(statement, 16) == 2
+        )
     }
 
     func updateFaceMetrics(
@@ -590,7 +1258,8 @@ final class PhotoRepository {
         isScreenshot: Bool,
         aspectRatio: Double,
         orientation: String,
-        qualityScore: Int
+        qualityScore: Int,
+        duration: Double?
     ) {
         let now = ISO8601DateFormatter().string(from: Date())
 
@@ -599,10 +1268,10 @@ final class PhotoRepository {
         (
             id, creationDate, modificationDate, mediaType, mediaSubtype,
             width, height, isFavorite, isHidden, latitude, longitude,
-            isScreenshot, aspectRatio, orientation, qualityScore,
+            isScreenshot, aspectRatio, orientation, qualityScore, duration,
             isDeleted, deletedAt, lastSeenAt, indexedAt
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             creationDate = excluded.creationDate,
             modificationDate = excluded.modificationDate,
@@ -618,6 +1287,7 @@ final class PhotoRepository {
             aspectRatio = excluded.aspectRatio,
             orientation = excluded.orientation,
             qualityScore = excluded.qualityScore,
+            duration = COALESCE(excluded.duration, duration),
             isDeleted = 0,
             deletedAt = NULL,
             lastSeenAt = excluded.lastSeenAt,
@@ -653,8 +1323,13 @@ final class PhotoRepository {
             sqlite3_bind_double(statement, 13, aspectRatio)
             sqlite3_bind_text(statement, 14, (orientation as NSString).utf8String, -1, nil)
             sqlite3_bind_int(statement, 15, Int32(qualityScore))
-            sqlite3_bind_text(statement, 16, (now as NSString).utf8String, -1, nil)
+            if let duration {
+                sqlite3_bind_double(statement, 16, duration)
+            } else {
+                sqlite3_bind_null(statement, 16)
+            }
             sqlite3_bind_text(statement, 17, (now as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, 18, (now as NSString).utf8String, -1, nil)
 
             if sqlite3_step(statement) != SQLITE_DONE {
                 print("Failed to upsert photo: \(String(cString: sqlite3_errmsg(db)))")

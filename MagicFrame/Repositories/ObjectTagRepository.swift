@@ -1,6 +1,36 @@
 import Foundation
 import SQLite3
 
+struct VisionTagPhotoMatch: Identifiable, Hashable, Sendable {
+    let photoId: String
+    let objectKey: String
+    let confidence: Double
+
+    var id: String { photoId }
+}
+
+struct VisionTagName: Identifiable, Hashable, Sendable {
+    let objectKey: String
+    let photoCount: Int
+    let normalized: String
+
+    var id: String { objectKey }
+
+    init(objectKey: String, photoCount: Int) {
+        self.objectKey = objectKey
+        self.photoCount = photoCount
+        normalized = Self.normalized(objectKey)
+    }
+
+    static func normalized(_ value: String) -> String {
+        value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+    }
+}
+
 final class ObjectTagRepository {
 
     private let database: DatabaseManager
@@ -40,6 +70,170 @@ final class ObjectTagRepository {
             }
             sqlite3_finalize(statement)
         }
+    }
+
+    func searchPhotosByVisionTagUnsafe(
+        query: String,
+        limit: Int
+    ) -> [VisionTagPhotoMatch] {
+        let patterns = Self.likePatterns(from: query)
+        guard !patterns.isEmpty, limit > 0 else { return [] }
+
+        let likeClauses = Array(repeating: "LOWER(pot.objectKey) LIKE LOWER(?) ESCAPE '#'", count: patterns.count)
+            .joined(separator: "\n          OR ")
+        let sql = """
+        SELECT pot.photoId, pot.objectKey, pot.confidence
+        FROM photo_object_tags pot
+        JOIN photos p ON p.id = pot.photoId
+        WHERE p.isDeleted = 0
+          AND (
+            \(likeClauses)
+          )
+        ORDER BY pot.confidence DESC, p.creationDate DESC, pot.photoId ASC
+        LIMIT ?;
+        """
+
+        var statement: OpaquePointer?
+        var matches: [VisionTagPhotoMatch] = []
+        var seenPhotoIds = Set<String>()
+
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            for (index, pattern) in patterns.enumerated() {
+                sqlite3_bind_text(
+                    statement,
+                    Int32(index + 1),
+                    (pattern as NSString).utf8String,
+                    -1,
+                    nil
+                )
+            }
+            sqlite3_bind_int(statement, Int32(patterns.count + 1), Int32(limit * 4))
+
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let photoIdCString = sqlite3_column_text(statement, 0),
+                      let objectKeyCString = sqlite3_column_text(statement, 1) else {
+                    continue
+                }
+
+                let photoId = String(cString: photoIdCString)
+                guard seenPhotoIds.insert(photoId).inserted else { continue }
+
+                matches.append(
+                    VisionTagPhotoMatch(
+                        photoId: photoId,
+                        objectKey: String(cString: objectKeyCString),
+                        confidence: sqlite3_column_double(statement, 2)
+                    )
+                )
+
+                if matches.count >= limit {
+                    break
+                }
+            }
+        }
+
+        sqlite3_finalize(statement)
+        return matches
+    }
+
+    func searchPhotosByExactVisionTagUnsafe(
+        objectKey: String,
+        limit: Int
+    ) -> [VisionTagPhotoMatch] {
+        let trimmed = objectKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, limit > 0 else { return [] }
+
+        let sql = """
+        SELECT pot.photoId, pot.objectKey, pot.confidence
+        FROM photo_object_tags pot
+        JOIN photos p ON p.id = pot.photoId
+        WHERE p.isDeleted = 0
+          AND LOWER(pot.objectKey) = LOWER(?)
+        ORDER BY pot.confidence DESC, p.creationDate DESC, pot.photoId ASC
+        LIMIT ?;
+        """
+
+        var statement: OpaquePointer?
+        var matches: [VisionTagPhotoMatch] = []
+
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            sqlite3_bind_text(statement, 1, (trimmed as NSString).utf8String, -1, nil)
+            sqlite3_bind_int(statement, 2, Int32(limit))
+
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let photoIdCString = sqlite3_column_text(statement, 0),
+                      let objectKeyCString = sqlite3_column_text(statement, 1) else {
+                    continue
+                }
+
+                matches.append(
+                    VisionTagPhotoMatch(
+                        photoId: String(cString: photoIdCString),
+                        objectKey: String(cString: objectKeyCString),
+                        confidence: sqlite3_column_double(statement, 2)
+                    )
+                )
+            }
+        }
+
+        sqlite3_finalize(statement)
+        return matches
+    }
+
+    func fetchDistinctVisionTagNamesUnsafe() -> [VisionTagName] {
+        let sql = """
+        SELECT pot.objectKey, COUNT(DISTINCT pot.photoId)
+        FROM photo_object_tags pot
+        JOIN photos p ON p.id = pot.photoId
+        WHERE p.isDeleted = 0
+        GROUP BY pot.objectKey
+        ORDER BY COUNT(DISTINCT pot.photoId) DESC, pot.objectKey COLLATE NOCASE ASC;
+        """
+
+        var statement: OpaquePointer?
+        var tags: [VisionTagName] = []
+
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let objectKeyCString = sqlite3_column_text(statement, 0) else {
+                    continue
+                }
+                tags.append(
+                    VisionTagName(
+                        objectKey: String(cString: objectKeyCString),
+                        photoCount: Int(sqlite3_column_int(statement, 1))
+                    )
+                )
+            }
+        }
+
+        sqlite3_finalize(statement)
+        return tags
+    }
+
+    private static func likePatterns(from query: String) -> [String] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        let variants = [
+            trimmed,
+            trimmed.replacingOccurrences(of: " ", with: "_"),
+            trimmed.replacingOccurrences(of: "_", with: " "),
+            trimmed.replacingOccurrences(of: "-", with: " ")
+        ]
+
+        return Array(
+            Set(
+                variants.map { "%\(escapeLike($0))%" }
+            )
+        )
+    }
+
+    private static func escapeLike(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "#", with: "##")
+            .replacingOccurrences(of: "%", with: "#%")
+            .replacingOccurrences(of: "_", with: "#_")
     }
 
     func rebuildEventObjectTagsUnsafe(eventId: Int, updatedAt: String) {

@@ -75,4 +75,65 @@ final class DatabaseManager {
         bootstrapSchema(legacyHooks: legacyHooks)
         return true
     }
+
+    /// Writes a consistent single-file snapshot (WAL-safe) for Share / AirDrop.
+    func exportConsistentSnapshot() throws -> URL {
+        try queue.sync {
+            guard let source = connection else {
+                throw DatabaseExportError.notOpen
+            }
+
+            // Fold recent WAL pages into the main DB without blocking readers hard.
+            sqlite3_exec(source, "PRAGMA wal_checkpoint(PASSIVE);", nil, nil, nil)
+
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+            let stamp = formatter.string(from: Date())
+            let destination = FileManager.default.temporaryDirectory
+                .appendingPathComponent("MagicFrame-\(stamp).sqlite", isDirectory: false)
+
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try FileManager.default.removeItem(at: destination)
+            }
+
+            var destDB: OpaquePointer?
+            guard sqlite3_open(destination.path, &destDB) == SQLITE_OK, let destDB else {
+                throw DatabaseExportError.openFailed(destination.path)
+            }
+            defer { sqlite3_close(destDB) }
+
+            guard let backup = sqlite3_backup_init(destDB, "main", source, "main") else {
+                let message = String(cString: sqlite3_errmsg(destDB))
+                throw DatabaseExportError.backupFailed(message)
+            }
+
+            let step = sqlite3_backup_step(backup, -1)
+            let finish = sqlite3_backup_finish(backup)
+            guard step == SQLITE_DONE, finish == SQLITE_OK else {
+                let message = String(cString: sqlite3_errmsg(destDB))
+                throw DatabaseExportError.backupFailed(message)
+            }
+
+            print("Database export ready: \(destination.path)")
+            return destination
+        }
+    }
+}
+
+enum DatabaseExportError: LocalizedError {
+    case notOpen
+    case openFailed(String)
+    case backupFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .notOpen:
+            return "Database is not open."
+        case .openFailed(let path):
+            return "Could not create export file at \(path)."
+        case .backupFailed(let message):
+            return "Database backup failed: \(message)"
+        }
+    }
 }

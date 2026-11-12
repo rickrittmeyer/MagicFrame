@@ -12,14 +12,20 @@ struct HomeCategoryGridView: View {
     var body: some View {
         LazyVGrid(columns: columns, spacing: 12) {
             NavigationLink {
-                EventsLibraryScreen(filter: .allEvents, vm: vm)
+                PictureBrowserView(
+                    title: "All Media",
+                    loadsAllPhotos: true,
+                    sortOptions: [.dateTaken, .dateImported],
+                    usesNavigationTitle: true,
+                    enablesVideoFilter: true
+                )
             } label: {
                 HomeCategoryCard(
-                    title: "Collections",
-                    countLabel: countText(vm.homeCollectionsCount, singular: "collection"),
+                    title: "All Media",
                     systemImage: "photo.on.rectangle.angled",
                     tint: Color(red: 0.55, green: 0.45, blue: 0.85),
-                    isEnabled: true
+                    isEnabled: true,
+                    countLabel: countText(vm.homeAllPhotosCount, singular: "photo")
                 )
             }
             .buttonStyle(.plain)
@@ -29,10 +35,76 @@ struct HomeCategoryGridView: View {
             } label: {
                 HomeCategoryCard(
                     title: "Holidays",
-                    countLabel: countText(vm.homeChristmasCount, singular: "holiday"),
-                    systemImage: "tree.fill",
+                    systemImage: "gift.fill",
                     tint: Color(red: 0.35, green: 0.68, blue: 0.45),
                     isEnabled: true
+                )
+            }
+            .buttonStyle(.plain)
+
+            NavigationLink {
+                MilestonesLandingView(vm: vm)
+            } label: {
+                HomeCategoryCard(
+                    title: "Milestones",
+                    systemImage: "star.fill",
+                    tint: Color(red: 0.78, green: 0.32, blue: 0.48),
+                    isEnabled: true
+                )
+            }
+            .buttonStyle(.plain)
+
+            NavigationLink {
+                OutingsLandingView(vm: vm)
+            } label: {
+                HomeCategoryCard(
+                    title: "Outings",
+                    systemImage: "ticket.fill",
+                    tint: Color(red: 0.45, green: 0.4, blue: 0.7),
+                    isEnabled: true
+                )
+            }
+            .buttonStyle(.plain)
+
+            NavigationLink {
+                EventsLibraryScreen(filter: .trips, vm: vm)
+            } label: {
+                HomeCategoryCard(
+                    title: "Trips",
+                    systemImage: "suitcase.fill",
+                    tint: Color(red: 0.35, green: 0.55, blue: 0.9),
+                    isEnabled: true
+                )
+            }
+            .buttonStyle(.plain)
+
+            NavigationLink {
+                ActivitiesLandingView(vm: vm)
+            } label: {
+                HomeCategoryCard(
+                    title: "Activities",
+                    systemImage: "figure.run",
+                    tint: Color(red: 0.95, green: 0.55, blue: 0.25),
+                    isEnabled: true
+                )
+            }
+            .buttonStyle(.plain)
+
+            placeholderCard(
+                title: "Vibes",
+                systemImage: "sparkles",
+                tint: Color(red: 0.65, green: 0.4, blue: 0.85)
+            )
+
+            NavigationLink {
+                PeopleLandingView(vm: vm)
+            } label: {
+                HomeCategoryCard(
+                    title: "People",
+                    systemImage: "person.2.fill",
+                    tint: Color(red: 0.9, green: 0.45, blue: 0.55),
+                    isEnabled: true,
+                    countLabel: countText(vm.homePeopleCount, singular: "person")
                 )
             }
             .buttonStyle(.plain)
@@ -42,31 +114,13 @@ struct HomeCategoryGridView: View {
             } label: {
                 HomeCategoryCard(
                     title: "Locations",
-                    countLabel: countText(vm.homeLocationsCount, singular: "location"),
                     systemImage: "mappin.and.ellipse",
                     tint: Color(red: 0.25, green: 0.62, blue: 0.72),
-                    isEnabled: true
+                    isEnabled: true,
+                    countLabel: countText(vm.homeLocationsCount, singular: "location")
                 )
             }
             .buttonStyle(.plain)
-
-            placeholderCard(
-                title: "Trips",
-                systemImage: "suitcase.fill",
-                tint: Color(red: 0.35, green: 0.55, blue: 0.9)
-            )
-
-            placeholderCard(
-                title: "People",
-                systemImage: "person.2.fill",
-                tint: Color(red: 0.9, green: 0.45, blue: 0.55)
-            )
-
-            placeholderCard(
-                title: "Activities",
-                systemImage: "figure.run",
-                tint: Color(red: 0.95, green: 0.55, blue: 0.25)
-            )
         }
     }
 
@@ -74,10 +128,10 @@ struct HomeCategoryGridView: View {
     private func placeholderCard(title: String, systemImage: String, tint: Color) -> some View {
         HomeCategoryCard(
             title: title,
-            countLabel: "Coming soon",
             systemImage: systemImage,
             tint: tint,
-            isEnabled: false
+            isEnabled: false,
+            countLabel: "Coming soon"
         )
     }
 
@@ -85,7 +139,13 @@ struct HomeCategoryGridView: View {
         if count == 1 {
             return "1 \(singular)"
         }
-        let plural = singular + (singular.hasSuffix("s") ? "" : "s")
+        let plural: String
+        switch singular {
+        case "person":
+            plural = "people"
+        default:
+            plural = singular.hasSuffix("s") ? singular : singular + "s"
+        }
         return "\(count.formatted()) \(plural)"
     }
 }

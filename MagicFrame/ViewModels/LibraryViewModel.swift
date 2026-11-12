@@ -5,31 +5,127 @@ import Photos
 struct EventListDisplayItem: Identifiable {
     let event: IndexedEvent
     let slideshowPhotoIds: [String]
+    /// True when any still/video in this event (or a trip child day) has includeInSlideshow.
+    let hasOnFramePhotos: Bool
+    /// Score bar on cover photos: away over home, scores right-aligned.
+    let gameCoverScoreBoard: GameCoverScoreBoard?
+    /// Suggested list title when the user has not edited the name: "Home vs Away".
+    let gameSuggestedName: String?
+    /// League for Sport sort (sporting events with a linked game result).
+    let gameLeague: SportsLeague?
+    /// Stable team sort key: alphabetically ordered home/away display names.
+    let gameTeamSortKey: String?
 
     var id: Int { event.eventId }
 
-    init(event: IndexedEvent, slideshowPhotoIds: [String] = []) {
+    init(
+        event: IndexedEvent,
+        slideshowPhotoIds: [String] = [],
+        hasOnFramePhotos: Bool = false,
+        gameCoverScoreBoard: GameCoverScoreBoard? = nil,
+        gameSuggestedName: String? = nil,
+        gameLeague: SportsLeague? = nil,
+        gameTeamSortKey: String? = nil
+    ) {
         self.event = event
         self.slideshowPhotoIds = slideshowPhotoIds
+        self.hasOnFramePhotos = hasOnFramePhotos
+        self.gameCoverScoreBoard = gameCoverScoreBoard
+        self.gameSuggestedName = gameSuggestedName
+        self.gameLeague = gameLeague
+        self.gameTeamSortKey = gameTeamSortKey
+    }
+
+    func withSlideshowPhotoIds(_ ids: [String]) -> EventListDisplayItem {
+        EventListDisplayItem(
+            event: event,
+            slideshowPhotoIds: ids,
+            hasOnFramePhotos: hasOnFramePhotos,
+            gameCoverScoreBoard: gameCoverScoreBoard,
+            gameSuggestedName: gameSuggestedName,
+            gameLeague: gameLeague,
+            gameTeamSortKey: gameTeamSortKey
+        )
+    }
+
+    func withEvent(_ event: IndexedEvent) -> EventListDisplayItem {
+        EventListDisplayItem(
+            event: event,
+            slideshowPhotoIds: slideshowPhotoIds,
+            hasOnFramePhotos: hasOnFramePhotos,
+            gameCoverScoreBoard: gameCoverScoreBoard,
+            gameSuggestedName: gameSuggestedName,
+            gameLeague: gameLeague,
+            gameTeamSortKey: gameTeamSortKey
+        )
+    }
+
+    func withHasOnFramePhotos(_ hasOnFramePhotos: Bool) -> EventListDisplayItem {
+        EventListDisplayItem(
+            event: event,
+            slideshowPhotoIds: slideshowPhotoIds,
+            hasOnFramePhotos: hasOnFramePhotos,
+            gameCoverScoreBoard: gameCoverScoreBoard,
+            gameSuggestedName: gameSuggestedName,
+            gameLeague: gameLeague,
+            gameTeamSortKey: gameTeamSortKey
+        )
     }
 }
 
+enum EventListSectionPresentation: Equatable, Sendable {
+    /// Collapsible year banner (Collections / Holidays).
+    case yearAccordion
+    /// Always-visible rows; optional `headerTitle` divider (Weddings).
+    case flatAlwaysVisible
+}
+
 struct EventYearSection: Identifiable {
+    /// Year for accordion sections, or a stable sentinel id for flat sections.
     let year: Int
     let items: [EventListDisplayItem]
+    var presentation: EventListSectionPresentation = .yearAccordion
+    /// Shown above flat sections (e.g. "Possible Weddings"). Nil = no header.
+    var headerTitle: String? = nil
 
     var id: Int { year }
 
     var eventCount: Int { items.count }
 
     var photoCount: Int {
-        items.reduce(0) { $0 + $1.event.photoCount }
+        items.reduce(0) { $0 + $1.event.photoCount + $1.event.videoCount }
     }
+
+    static let confirmedMilestoneSectionId = -1_000_001
+    static let possibleMilestoneSectionId = -1_000_002
+    static let confirmedHolidaySectionId = -1_000_003
+    static let possibleHolidaySectionId = -1_000_004
+    static let confirmedOutingSectionId = -1_000_005
+    static let possibleOutingSectionId = -1_000_006
 }
 
 struct EventListScrollTarget: Equatable {
     let eventId: Int
     let requestID: UUID
+}
+
+struct WeddingCoupleConfirmRequest: Identifiable {
+    let displayEventId: Int
+    let event: IndexedEvent
+    let people: [MilestonePersonPickerItem]
+
+    var id: Int { displayEventId }
+}
+
+struct SimilarEventPeoplePickRequest: Identifiable {
+    let displayEventId: Int
+    let event: IndexedEvent
+    let alternative: SimilarEventTagAlternative
+    let people: [MilestonePersonPickerItem]
+
+    var id: Int { displayEventId }
+
+    var needsCouple: Bool { alternative.possibleNumberOfEventMainPeople >= 2 }
 }
 
 @MainActor
@@ -45,16 +141,24 @@ final class LibraryViewModel: ObservableObject {
     /// Expanded year accordion in the events library (survives list row updates).
     @Published var expandedListYear: Int?
     @Published var activeEventListFilter: EventListFilter = .allEvents
-    @Published var homeCollectionsCount: Int = 0
-    @Published var homeChristmasCount: Int = 0
-    @Published var occasionLandingItems: [OccasionLandingItem] = []
-    @Published var isLoadingOccasionLanding = false
-    @Published var hasLoadedOccasionLanding = false
-    @Published var isLoadingOccasionLandingCounts = false
-    @Published var occasionFrameSnapshot: OccasionFrameLandingSnapshot?
-    @Published var isLoadingOccasionFrame = false
+    @Published var homeAllPhotosCount: Int = 0
+    @Published var homePeopleCount: Int = 0
     @Published var homeLocationsCount: Int = 0
+    /// When set (e.g. while browsing Christmas photos), the Events tab opens that holiday’s events.
+    @Published var eventsTabFilter: EventListFilter = .allEvents
+    @Published var holidayLandingItems: [HolidayLandingItem] = []
+    @Published var isLoadingHolidayLanding = false
+    @Published var hasLoadedHolidayLanding = false
+    @Published var milestoneLandingItems: [TagCategoryLandingItem] = []
+    @Published var outingLandingItems: [TagCategoryLandingItem] = []
+    @Published var activityLandingItems: [TagCategoryLandingItem] = []
+    @Published var peopleLandingItems: [PeopleRepository.PersonRecord] = []
+    @Published var isLoadingPeopleLanding = false
     @Published var eventListScrollTarget: EventListScrollTarget?
+    @Published var pendingWeddingCoupleConfirm: WeddingCoupleConfirmRequest?
+    @Published var pendingSimilarEventAlternatives: SimilarEventAlternativesRequest?
+    /// After choosing a similar-event alternative that needs main people.
+    @Published var pendingSimilarEventPeoplePick: SimilarEventPeoplePickRequest?
     @Published var recentPhotos: [IndexedPhoto] = []
 
     @Published var isSyncingEvents: Bool = false
@@ -125,12 +229,16 @@ final class LibraryViewModel: ObservableObject {
     private var isShowingGeocodeProgress = false
     private var geocodeBannerMessage: String?
     private var slideshowLoadTask: Task<Void, Never>?
+    private var eventListEnrichmentTask: Task<Void, Never>?
+    /// Populated only when the Events on Frame filter needs it (or after an explicit refresh).
+    private var onFrameEventIdsCache: Set<Int>?
     private var eventDateRepairTask: Task<Void, Never>?
     private var holidayLandingVisionTask: Task<Void, Never>?
+    private var visionTagScanTask: Task<Void, Never>?
     private var holidayYearExpandTask: Task<Void, Never>?
     private var activeHolidayVisionYear: Int?
     private var activeHolidayVisionScopeKey: String?
-    private var occasionLandingRefreshTask: Task<Void, Never>?
+    private var holidayLandingRefreshTask: Task<Void, Never>?
     private var lastStatusPublish = Date.distantPast
     private var cancellables = Set<AnyCancellable>()
     private var pipelineTask: Task<Void, Never>?
@@ -153,24 +261,51 @@ final class LibraryViewModel: ObservableObject {
         NotificationCenter.default.publisher(for: .eventSyncProgressChanged)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] notification in
-                guard let self,
-                      let progress = notification.object as? EventSyncProgress else {
-                    return
-                }
-                self.handleEventSyncProgress(progress)
+                self?.handleEventSyncProgress(notification)
             }
             .store(in: &cancellables)
     }
 
-    private func handleEventSyncProgress(_ progress: EventSyncProgress) {
+    private func handleEventSyncProgress(_ notification: Notification) {
         guard !isShowingGeocodeProgress else { return }
+        let info = notification.userInfo
 
-        if let statusMessage = progress.statusMessage {
-            publishStatusThrottled(statusMessage)
+        if let statusMessage = info?["statusMessage"] as? String {
+            publishStatusThrottled(
+                statusMessage,
+                force: Self.notificationBool(info?["forcePublish"])
+            )
             return
         }
 
+        if let progress = notification.object as? EventSyncProgress {
+            if let statusMessage = progress.statusMessage {
+                publishStatusThrottled(statusMessage, force: progress.forcePublish)
+            } else {
+                publishStatusThrottled(progress.displayStatus)
+            }
+            return
+        }
+
+        let progress = EventSyncProgress(
+            processed: Self.notificationInt(info?["processed"]),
+            total: Self.notificationInt(info?["total"]),
+            remainingUnassigned: Self.notificationInt(info?["remainingUnassigned"]),
+            isRebuild: Self.notificationBool(info?["isRebuild"])
+        )
         publishStatusThrottled(progress.displayStatus)
+    }
+
+    private static func notificationInt(_ value: Any?) -> Int {
+        if let number = value as? NSNumber { return number.intValue }
+        if let int = value as? Int { return int }
+        return 0
+    }
+
+    private static func notificationBool(_ value: Any?) -> Bool {
+        if let number = value as? NSNumber { return number.boolValue }
+        if let bool = value as? Bool { return bool }
+        return false
     }
 
     private func publishStatusThrottled(_ text: String, force: Bool = false) {
@@ -204,97 +339,322 @@ final class LibraryViewModel: ObservableObject {
         }
     }
 
-    func cancelOccasionLandingRefresh() {
-        occasionLandingRefreshTask?.cancel()
-        occasionLandingRefreshTask = nil
-        isLoadingOccasionLandingCounts = false
+    func focusEventsTabOnChristmas() {
+        focusEventsTabOnHoliday(tagValue: "Christmas")
+    }
+
+    func focusEventsTabOnHoliday(tagValue: String) {
+        eventsTabFilter = .holidayTag(value: tagValue)
+    }
+
+    func focusEventsTabOnMilestone(_ filter: EventListFilter) {
+        eventsTabFilter = filter
+    }
+
+    func focusEventsTabOnOuting(_ filter: EventListFilter) {
+        eventsTabFilter = filter
+    }
+
+    func clearEventsTabFocus() {
+        eventsTabFilter = .allEvents
+    }
+
+    func cancelHolidayLandingRefresh() {
+        holidayLandingRefreshTask?.cancel()
+        holidayLandingRefreshTask = nil
     }
 
     /// Fire-and-forget refresh for Holidays landing (cancellable when navigating away).
-    func scheduleOccasionLandingRefresh() {
-        occasionLandingRefreshTask?.cancel()
-        occasionLandingRefreshTask = Task(priority: .utility) { [weak self] in
-            await self?.refreshOccasionLandingItemsAsync()
+    func scheduleHolidayLandingRefresh() {
+        holidayLandingRefreshTask?.cancel()
+        holidayLandingRefreshTask = Task(priority: .utility) { [weak self] in
+            await self?.refreshHolidayLandingItemsAsync()
         }
     }
 
-    func refreshOccasionLandingItems() async {
-        occasionLandingRefreshTask?.cancel()
-        await refreshOccasionLandingItemsAsync()
+    func refreshHolidayLandingItems() async {
+        holidayLandingRefreshTask?.cancel()
+        await refreshHolidayLandingItemsAsync()
     }
 
-    private func refreshOccasionLandingItemsAsync() async {
-        isLoadingOccasionLanding = true
-        defer { isLoadingOccasionLanding = false }
+    private func refreshHolidayLandingItemsAsync() async {
+        isLoadingHolidayLanding = true
+        defer { isLoadingHolidayLanding = false }
 
         let catalog = await Task.detached(priority: .utility) { [backgroundDatabase] in
-            backgroundDatabase.fetchOccasionLandingCatalogItems()
+            backgroundDatabase.fetchHolidayLandingCatalogItems()
         }.value
 
         guard !Task.isCancelled else { return }
 
-        let cached = await Task.detached(priority: .utility) { [backgroundDatabase] in
-            backgroundDatabase.applyCachedOccasionLandingMetrics(to: catalog)
-        }.value
-
-        guard !Task.isCancelled else { return }
-
-        occasionLandingItems = cached.items
-        hasLoadedOccasionLanding = true
-
-        guard !cached.staleTagValues.isEmpty else { return }
-
-        isLoadingOccasionLandingCounts = true
-        defer { isLoadingOccasionLandingCounts = false }
-
-        let staleItems = cached.staleTagValues.compactMap { tagValue in
-            occasionLandingItems.first(where: { $0.tagValue == tagValue })
-        }
-        guard !staleItems.isEmpty else { return }
-
-        let requests = staleItems.map {
-            OccasionLandingMetricsRequest(
-                occasionKey: $0.occasionKey,
-                tagValue: $0.tagValue,
-                occasionType: $0.occasionType,
-                displayName: $0.name
-            )
-        }
-
-        let metricsByTagValue = await Task.detached(priority: .utility) { [backgroundDatabase] in
-            backgroundDatabase.countOccasionLandingMetricsBatch(requests: requests)
-        }.value
-
-        guard !Task.isCancelled else { return }
-
-        for item in staleItems {
-            guard let metrics = metricsByTagValue[item.tagValue],
-                  let index = occasionLandingItems.firstIndex(where: { $0.tagValue == item.tagValue }) else {
-                continue
-            }
-
-            occasionLandingItems[index] = item.withCounts(
-                collection: metrics.collections,
-                onFrame: metrics.onFramePhotos
-            )
-        }
+        holidayLandingItems = catalog
+        hasLoadedHolidayLanding = true
     }
 
     func refreshHomeCategoryCounts() async {
         let counts = await Task.detached(priority: .utility) { [backgroundDatabase] in
             (
-                collections: backgroundDatabase.countListEvents(includeHidden: false, filter: .allEvents),
-                christmas: backgroundDatabase.countListEvents(
-                    includeHidden: false,
-                    filter: .christmas
-                ),
+                photos: backgroundDatabase.countActivePhotos(),
+                people: backgroundDatabase.fetchAllPeople().count,
                 locations: backgroundDatabase.countLocations()
             )
         }.value
 
-        homeCollectionsCount = counts.collections
-        homeChristmasCount = counts.christmas
+        homeAllPhotosCount = counts.photos
+        homePeopleCount = counts.people
         homeLocationsCount = counts.locations
+    }
+
+    func refreshMilestoneLandingItems() async {
+        milestoneLandingItems = TagCategoryLandingCatalog.milestones()
+    }
+
+    func refreshOutingLandingItems() async {
+        outingLandingItems = TagCategoryLandingCatalog.outings()
+    }
+
+    func refreshActivityLandingItems() async {
+        activityLandingItems = TagCategoryLandingCatalog.activities()
+    }
+
+    @Published var unnamedFaceClusters: [PersonClusterRecord] = []
+    @Published var isLoadingFaceClusters = false
+    @Published var faceRecognitionScannedCount: Int = 0
+    @Published var faceRecognitionRemainingCount: Int = 0
+    @Published var faceRecognitionTotalCount: Int = 0
+    @Published var faceRecognitionFacesDetectedCount: Int = 0
+    @Published var faceRecognitionClustersIdentifiedCount: Int = 0
+    @Published var isFaceRecognitionScanning: Bool = false
+
+    private var faceRecognitionProgressTask: Task<Void, Never>?
+
+    func refreshPeopleLandingItems() async {
+        isLoadingPeopleLanding = true
+        defer { isLoadingPeopleLanding = false }
+
+        peopleLandingItems = await Task.detached(priority: .utility) { [backgroundDatabase] in
+            backgroundDatabase.fetchAllPeople()
+        }.value
+    }
+
+    func refreshUnnamedFaceClusters() async {
+        isLoadingFaceClusters = true
+        defer { isLoadingFaceClusters = false }
+        unnamedFaceClusters = await Task.detached(priority: .utility) { [backgroundDatabase] in
+            backgroundDatabase.fetchUnnamedFaceClusters()
+        }.value
+    }
+
+    func enqueueFaceRecognitionScanTapped(forceRescan: Bool = false) {
+        FaceCircleAvatar.clearCache()
+        unnamedFaceClusters = []
+        let summary = backgroundDatabase.enqueueFaceRecognitionScan(forceRescan: forceRescan)
+        refreshFaceRecognitionProgressCounts()
+        if let skipped = summary.skippedReason, summary.enqueuedCount == 0 {
+            publishStatusThrottled(skipped, force: true)
+            isFaceRecognitionScanning = false
+        } else {
+            publishStatusThrottled(
+                "Queued \(summary.enqueuedCount.formatted()) face scans · "
+                    + "\(faceRecognitionScannedCount.formatted()) of \(faceRecognitionTotalCount.formatted()) photos done"
+                    + " · leave People while scanning",
+                force: true
+            )
+            startFaceRecognitionProgressMonitoring()
+        }
+    }
+
+    func cancelFaceRecognitionScanTapped() {
+        faceRecognitionProgressTask?.cancel()
+        faceRecognitionProgressTask = nil
+        isFaceRecognitionScanning = false
+        FaceCircleAvatar.clearCache()
+        let restored = backgroundDatabase.cancelFaceRecognitionScan(restoreScannedVersions: true)
+        refreshFaceRecognitionProgressCounts()
+        publishStatusThrottled(
+            restored > 0
+                ? "Canceled face scan · restored \(restored.formatted()) already-scanned photos"
+                : "Canceled face scan queue",
+            force: true
+        )
+        Task { await refreshUnnamedFaceClusters() }
+    }
+
+    func resetAllFaceRecognitionDataTapped() async {
+        faceRecognitionProgressTask?.cancel()
+        faceRecognitionProgressTask = nil
+        isFaceRecognitionScanning = false
+        FaceCircleAvatar.clearCache()
+        publishStatusThrottled("Resetting face recognition…", force: true)
+        await Task.detached(priority: .utility) { [backgroundDatabase] in
+            backgroundDatabase.resetAllFaceRecognitionData()
+        }.value
+        unnamedFaceClusters = []
+        peopleLandingItems = []
+        refreshFaceRecognitionProgressCounts()
+        publishStatusThrottled(
+            "Face recognition reset · run Picture Searches / open events to detect faces, then rebuild clusters before naming",
+            force: true
+        )
+        await refreshPeopleLandingItems()
+        await refreshUnnamedFaceClusters()
+    }
+
+    func refreshFaceRecognitionProgressCounts() {
+        applyFaceRecognitionProgress(backgroundDatabase.faceRecognitionProgress())
+    }
+
+    /// Repairs “0 photos scanned” after an accidental force-rescan cleared version stamps.
+    func repairFaceRecognitionProgressIfNeeded() {
+        let before = backgroundDatabase.faceRecognitionProgress()
+        guard before.photosScanned == 0, before.facesDetected > 0 else {
+            applyFaceRecognitionProgress(before)
+            return
+        }
+        _ = backgroundDatabase.restoreFaceRecognitionVersionsForScannedPhotos()
+        applyFaceRecognitionProgress(backgroundDatabase.faceRecognitionProgress())
+    }
+
+    func resumeFaceRecognitionProgressMonitoringIfNeeded() {
+        guard !isFaceRecognitionScanning else { return }
+        let pendingJobs = backgroundDatabase.pendingFaceRecognitionJobCount()
+        guard pendingJobs > 0 else { return }
+        startFaceRecognitionProgressMonitoring()
+    }
+
+    private func applyFaceRecognitionProgress(_ progress: FaceRecognitionProgress) {
+        faceRecognitionScannedCount = progress.photosScanned
+        faceRecognitionRemainingCount = progress.photosRemaining
+        faceRecognitionTotalCount = progress.photosTotal
+        faceRecognitionFacesDetectedCount = progress.facesDetected
+        faceRecognitionClustersIdentifiedCount = progress.clustersIdentified
+    }
+
+    private func startFaceRecognitionProgressMonitoring() {
+        faceRecognitionProgressTask?.cancel()
+        isFaceRecognitionScanning = true
+        FaceCircleAvatar.clearCache()
+        faceRecognitionProgressTask = Task { [weak self] in
+            guard let self else { return }
+            var ticks = 0
+            while !Task.isCancelled {
+                let progress = await Task.detached(priority: .utility) { [backgroundDatabase] in
+                    backgroundDatabase.faceRecognitionProgress()
+                }.value
+                let pendingJobs = backgroundDatabase.pendingFaceRecognitionJobCount()
+
+                applyFaceRecognitionProgress(progress)
+
+                let line =
+                    "Face recognition \(progress.photosScanned.formatted()) of \(progress.photosTotal.formatted()) photos"
+                    + " · \(progress.facesDetected.formatted()) faces"
+                    + " · \(progress.clustersIdentified.formatted()) clusters"
+                    + (pendingJobs > 0 ? " · \(pendingJobs.formatted()) queued" : "")
+                publishStatusThrottled(line)
+
+                ticks += 1
+                if ticks % 8 == 0 {
+                    FaceCircleAvatar.clearCache()
+                }
+
+                if pendingJobs == 0 {
+                    isFaceRecognitionScanning = false
+                    FaceCircleAvatar.clearCache()
+                    // Do NOT auto-consolidate here — pairwise merge jetsams after large batches.
+                    // User should tap Rebuild clusters when idle.
+                    publishStatusThrottled(
+                        "Face recognition idle · \(progress.photosScanned.formatted()) of \(progress.photosTotal.formatted()) photos"
+                            + " · \(progress.facesDetected.formatted()) faces"
+                            + " · \(progress.clustersIdentified.formatted()) clusters"
+                            + " · tap Rebuild clusters when ready",
+                        force: true
+                    )
+                    // Keep the People grid empty of heavy avatars until the user asks.
+                    unnamedFaceClusters = []
+                    break
+                }
+
+                try? await Task.sleep(for: .milliseconds(1_000))
+            }
+            if !Task.isCancelled {
+                isFaceRecognitionScanning = false
+            }
+        }
+    }
+
+    func nameFaceCluster(
+        clusterId: Int,
+        displayName: String,
+        firstName: String?,
+        lastName: String?,
+        maidenName: String?
+    ) {
+        let personId = backgroundDatabase.nameFaceCluster(
+            clusterId: clusterId,
+            displayName: displayName,
+            firstName: firstName,
+            lastName: lastName,
+            maidenName: maidenName
+        )
+        if personId > 0 {
+            publishStatusThrottled("Named \(displayName)", force: true)
+        }
+        Task {
+            await refreshPeopleLandingItems()
+            await refreshUnnamedFaceClusters()
+            refreshLibraryCounts()
+        }
+    }
+
+    func mergeFaceCluster(clusterId: Int, intoPersonId personId: Int) {
+        backgroundDatabase.mergeFaceCluster(clusterId: clusterId, intoPersonId: personId)
+        Task {
+            await refreshPeopleLandingItems()
+            await refreshUnnamedFaceClusters()
+            refreshLibraryCounts()
+        }
+    }
+
+    func ignoreFaceCluster(clusterId: Int) {
+        backgroundDatabase.ignoreFaceCluster(clusterId: clusterId)
+        Task { await refreshUnnamedFaceClusters() }
+    }
+
+    func consolidateFaceClustersTapped() async {
+        let merged = await Task.detached(priority: .utility) { [backgroundDatabase] in
+            backgroundDatabase.consolidateUnnamedFaceClusters()
+        }.value
+        if merged > 0 {
+            publishStatusThrottled(
+                "Combined \(merged.formatted()) duplicate face cluster\(merged == 1 ? "" : "s")",
+                force: true
+            )
+        } else {
+            publishStatusThrottled("No similar face clusters to combine", force: true)
+        }
+        await refreshUnnamedFaceClusters()
+    }
+
+    func rebuildFaceClustersTapped() async {
+        publishStatusThrottled("Rebuilding face clusters…", force: true)
+        FaceCircleAvatar.clearCache()
+        unnamedFaceClusters = []
+        let clusterCount = await Task.detached(priority: .utility) { [backgroundDatabase] in
+            backgroundDatabase.rebuildUnnamedFaceClusters()
+        }.value
+        FaceCircleAvatar.clearCache()
+        // Separate pass after rebuild frees its working set — never combine in one go.
+        try? await Task.sleep(for: .milliseconds(300))
+        let merged = await Task.detached(priority: .utility) { [backgroundDatabase] in
+            backgroundDatabase.consolidateUnnamedFaceClusters()
+        }.value
+        FaceCircleAvatar.clearCache()
+        var message = "Rebuilt \(clusterCount.formatted()) face cluster\(clusterCount == 1 ? "" : "s")"
+        if merged > 0 {
+            message += " · combined \(merged.formatted()) near-duplicates"
+        }
+        publishStatusThrottled(message, force: true)
+        await refreshUnnamedFaceClusters()
     }
 
     private func runStartupPipeline() async {
@@ -383,10 +743,12 @@ final class LibraryViewModel: ObservableObject {
     /// Call when a collection screen appears so the list shows a loading state immediately.
     func beginEventListLoad(for filter: EventListFilter) {
         slideshowLoadTask?.cancel()
+        eventListEnrichmentTask?.cancel()
         if filter != activeEventListFilter {
             events = []
             eventSections = []
             expandedListYear = nil
+            onFrameEventIdsCache = nil
         }
         activeEventListFilter = filter
         if case .holidayTag(let tagValue) = filter {
@@ -408,8 +770,11 @@ final class LibraryViewModel: ObservableObject {
             beginEventListLoad(for: listFilter)
         }
         let includeHidden = showHiddenEvents
+        eventListEnrichmentTask?.cancel()
+        onFrameEventIdsCache = nil
 
         let loadStart = CFAbsoluteTimeGetCurrent()
+        // Paint first: event rows + covers only. Game scores, on-frame flags, and slideshow picks follow.
         let payload = await Task.detached(priority: .utility) { [backgroundDatabase, includeHidden, listFilter] in
             let loaded = backgroundDatabase.getEventsForList(
                 includeHidden: includeHidden,
@@ -418,7 +783,10 @@ final class LibraryViewModel: ObservableObject {
             )
             let sections = LibraryViewModel.buildEventSections(
                 from: loaded,
-                slideshowIdsByEvent: [:]
+                slideshowIdsByEvent: [:],
+                onFrameEventIds: [],
+                gameResultsByEventId: [:],
+                listFilter: listFilter
             )
             return (loaded, sections)
         }.value
@@ -449,19 +817,105 @@ final class LibraryViewModel: ObservableObject {
         let title = listFilter.navigationTitle
         setBaseStatus("\(events.count.formatted()) \(title.lowercased())")
 
-        if loadSlideshowIds, !events.isEmpty {
-            scheduleSlideshowLoad()
-        } else {
-            reloadSlideshowPhotosForExpandedYearIfNeeded()
+        let enrichmentEventIds = events.map(\.eventId)
+        eventListEnrichmentTask = Task(priority: .utility) { [weak self] in
+            await self?.enrichEventListAfterPaint(
+                eventIds: enrichmentEventIds,
+                loadSlideshowIds: loadSlideshowIds
+            )
         }
     }
 
-    /// Re-fetches slideshow picks for the expanded year when a background reload cleared them.
+    /// Loads saved game scoreboards after the list is visible, then slideshow preview picks.
+    private func enrichEventListAfterPaint(
+        eventIds: [Int],
+        loadSlideshowIds: Bool
+    ) async {
+        guard !eventIds.isEmpty else { return }
+
+        let gameResults = await Task.detached(priority: .utility) { [backgroundDatabase] in
+            backgroundDatabase.fetchEventGameResults(eventIds: eventIds)
+        }.value
+        guard !Task.isCancelled else { return }
+
+        if !gameResults.isEmpty {
+            await MainActor.run {
+                mergeGameResults(gameResults)
+            }
+        }
+
+        guard !Task.isCancelled else { return }
+
+        if loadSlideshowIds {
+            await loadSlideshowPhotosChunked()
+        } else {
+            await MainActor.run {
+                reloadSlideshowPhotosForExpandedYearIfNeeded()
+            }
+        }
+    }
+
+    /// Scans which list events have on-frame photos. Used when the Events on Frame filter is selected.
+    func ensureOnFrameEventFlagsLoaded() async {
+        if onFrameEventIdsCache != nil { return }
+        let eventIds = events.map(\.eventId)
+        guard !eventIds.isEmpty else {
+            onFrameEventIdsCache = []
+            return
+        }
+
+        let ids = await Task.detached(priority: .utility) { [backgroundDatabase] in
+            backgroundDatabase.listEventIdsWithOnFramePhotos(among: eventIds)
+        }.value
+        guard !Task.isCancelled else { return }
+
+        onFrameEventIdsCache = ids
+        mergeOnFrameFlags(ids)
+    }
+
+    private func mergeGameResults(_ gameResultsByEventId: [Int: EventGameResult]) {
+        guard !gameResultsByEventId.isEmpty else { return }
+        eventSections = eventSections.map { section in
+            EventYearSection(
+                year: section.year,
+                items: section.items.map { item in
+                    guard let game = gameResultsByEventId[item.event.eventId] else { return item }
+                    return EventListDisplayItem(
+                        event: item.event,
+                        slideshowPhotoIds: item.slideshowPhotoIds,
+                        hasOnFramePhotos: item.hasOnFramePhotos,
+                        gameCoverScoreBoard: game.coverScoreBoard,
+                        gameSuggestedName: game.suggestedEventName,
+                        gameLeague: game.league,
+                        gameTeamSortKey: game.teamSortKey
+                    )
+                },
+                presentation: section.presentation,
+                headerTitle: section.headerTitle
+            )
+        }
+    }
+
+    private func mergeOnFrameFlags(_ onFrameEventIds: Set<Int>) {
+        eventSections = eventSections.map { section in
+            EventYearSection(
+                year: section.year,
+                items: section.items.map { item in
+                    let flag = onFrameEventIds.contains(item.event.eventId)
+                    guard item.hasOnFramePhotos != flag else { return item }
+                    return item.withHasOnFramePhotos(flag)
+                },
+                presentation: section.presentation,
+                headerTitle: section.headerTitle
+            )
+        }
+    }
+
+    /// Re-fetches slideshow picks for the expanded year after a list reload.
+    /// Always reloads when a year is expanded — cover seeds alone must not skip framed picks.
     func reloadSlideshowPhotosForExpandedYearIfNeeded() {
         guard let year = expandedListYear else { return }
         guard activeHolidayVisionConfig == nil else { return }
-        let items = eventSections.first(where: { $0.year == year })?.items ?? []
-        guard items.contains(where: { $0.slideshowPhotoIds.isEmpty }) else { return }
         loadSlideshowPhotosForYear(year)
     }
 
@@ -564,22 +1018,52 @@ final class LibraryViewModel: ObservableObject {
                     guard let ids = slideshowIdsByEvent[item.event.eventId], !ids.isEmpty else {
                         return item
                     }
-                    return EventListDisplayItem(event: item.event, slideshowPhotoIds: ids)
-                }
+                    return item.withSlideshowPhotoIds(ids)
+                },
+                presentation: section.presentation,
+                headerTitle: section.headerTitle
             )
         }
     }
 
     nonisolated private static func buildEventSections(
         from events: [IndexedEvent],
-        slideshowIdsByEvent: [Int: [String]]
+        slideshowIdsByEvent: [Int: [String]],
+        onFrameEventIds: Set<Int> = [],
+        gameResultsByEventId: [Int: EventGameResult] = [:],
+        listFilter: EventListFilter = .allEvents
     ) -> [EventYearSection] {
         let items = events.map { event in
-            EventListDisplayItem(
+            let game = gameResultsByEventId[event.eventId]
+            let ids = slideshowIdsByEvent[event.eventId] ?? []
+            let slideshowIds: [String] = {
+                if !ids.isEmpty { return ids }
+                if let coverPhotoId = event.coverPhotoId, !coverPhotoId.isEmpty {
+                    return [coverPhotoId]
+                }
+                return []
+            }()
+            return EventListDisplayItem(
                 event: event,
-                slideshowPhotoIds: slideshowIdsByEvent[event.eventId] ?? []
+                slideshowPhotoIds: slideshowIds,
+                hasOnFramePhotos: onFrameEventIds.contains(event.eventId),
+                gameCoverScoreBoard: game?.coverScoreBoard,
+                gameSuggestedName: game?.suggestedEventName,
+                gameLeague: game?.league,
+                gameTeamSortKey: game?.teamSortKey
             )
         }
+
+        if case .milestoneTag(let tagValue) = listFilter {
+            return buildMilestoneFlatSections(from: items, tagValue: tagValue)
+        }
+        if case .eventTypeTag(let tagValue) = listFilter {
+            return buildOutingFlatSections(from: items, tagValue: tagValue)
+        }
+        if case .holidayTag(let tagValue) = listFilter {
+            return buildHolidayFlatSections(from: items, tagValue: tagValue)
+        }
+
         let grouped = Dictionary(grouping: items) { item in
             item.event.eventYear ?? 0
         }
@@ -595,6 +1079,104 @@ final class LibraryViewModel: ObservableObject {
             }
     }
 
+    /// User milestones first (by date), then AI under “Possible …” (by score). No year dividers.
+    nonisolated private static func buildMilestoneFlatSections(
+        from items: [EventListDisplayItem],
+        tagValue: String
+    ) -> [EventYearSection] {
+        buildConfirmedPossibleFlatSections(
+            from: items,
+            confirmedSectionId: EventYearSection.confirmedMilestoneSectionId,
+            possibleSectionId: EventYearSection.possibleMilestoneSectionId,
+            possibleHeader: tagValue == "Wedding" ? "Possible Weddings" : "Possible \(tagValue)",
+            isUserConfirmed: { $0.event.milestoneTag(matching: tagValue)?.source == .user },
+            sort: {
+                IndexedEvent.compareMilestoneTaggedListOrder($0.event, $1.event, tagValue: tagValue)
+            }
+        )
+    }
+
+    /// Confirmed holiday tags first, then AI under “Possible {Holiday} Events”.
+    nonisolated private static func buildHolidayFlatSections(
+        from items: [EventListDisplayItem],
+        tagValue: String
+    ) -> [EventYearSection] {
+        buildConfirmedPossibleFlatSections(
+            from: items,
+            confirmedSectionId: EventYearSection.confirmedHolidaySectionId,
+            possibleSectionId: EventYearSection.possibleHolidaySectionId,
+            possibleHeader: "Possible \(tagValue) Events",
+            isUserConfirmed: { $0.event.holidayTag(matching: tagValue)?.source == .user },
+            sort: {
+                IndexedEvent.compareHolidayTaggedListOrder($0.event, $1.event, tagValue: tagValue)
+            }
+        )
+    }
+
+    /// Confirmed outing event types first, then AI under “Possible …”.
+    nonisolated private static func buildOutingFlatSections(
+        from items: [EventListDisplayItem],
+        tagValue: String
+    ) -> [EventYearSection] {
+        let possibleHeader: String = {
+            switch tagValue {
+            case "Concert": return "Possible Concerts"
+            case "Play": return "Possible Plays"
+            case "Sporting event": return "Possible Sporting Events"
+            default: return "Possible \(tagValue)"
+            }
+        }()
+        return buildConfirmedPossibleFlatSections(
+            from: items,
+            confirmedSectionId: EventYearSection.confirmedOutingSectionId,
+            possibleSectionId: EventYearSection.possibleOutingSectionId,
+            possibleHeader: possibleHeader,
+            isUserConfirmed: { $0.event.eventTypeTag(matching: tagValue)?.source == .user },
+            sort: {
+                IndexedEvent.compareEventTypeTaggedListOrder(
+                    $0.event,
+                    $1.event,
+                    tagValue: tagValue
+                )
+            }
+        )
+    }
+
+    nonisolated private static func buildConfirmedPossibleFlatSections(
+        from items: [EventListDisplayItem],
+        confirmedSectionId: Int,
+        possibleSectionId: Int,
+        possibleHeader: String,
+        isUserConfirmed: (EventListDisplayItem) -> Bool,
+        sort: (EventListDisplayItem, EventListDisplayItem) -> Bool
+    ) -> [EventYearSection] {
+        let userItems = items.filter(isUserConfirmed).sorted(by: sort)
+        let aiItems = items.filter { !isUserConfirmed($0) }.sorted(by: sort)
+
+        var sections: [EventYearSection] = []
+        if !userItems.isEmpty {
+            sections.append(
+                EventYearSection(
+                    year: confirmedSectionId,
+                    items: userItems,
+                    presentation: .flatAlwaysVisible,
+                    headerTitle: nil
+                )
+            )
+        }
+        if !aiItems.isEmpty {
+            sections.append(
+                EventYearSection(
+                    year: possibleSectionId,
+                    items: aiItems,
+                    presentation: .flatAlwaysVisible,
+                    headerTitle: possibleHeader
+                )
+            )
+        }
+        return sections
+    }
+
     func resumeBackgroundWork() async {
         // Intentionally idle — geocoding is user-triggered from Locations/Developer.
     }
@@ -606,6 +1188,8 @@ final class LibraryViewModel: ObservableObject {
         slideshowLoadTask = nil
         eventDateRepairTask?.cancel()
         eventDateRepairTask = nil
+        visionTagScanTask?.cancel()
+        visionTagScanTask = nil
         database.stopGeocoding()
         isSyncingEvents = false
         isMaintainingEvents = false
@@ -659,21 +1243,25 @@ final class LibraryViewModel: ObservableObject {
             Self.enumeratePhotoLibrary(database: db) { count in
                 guard count == 1 || count % 1000 == 0 else { return }
                 Task { @MainActor in
-                    self?.publishStatusThrottled("Indexed \(count.formatted()) photos…")
+                    self?.publishStatusThrottled("Indexed \(count.formatted()) items…")
                 }
             }
         }.value
 
         await Task.detached(priority: .utility) {
             db.runPostIndexMetadataEnrichment()
-            db.importPeopleFromAlbums()
-            db.rebuildEventPeople()
         }.value
 
-        setBaseStatus("Indexed \(indexedCount.formatted()) photos — building events…")
+        await db.importMissingPhotoExif { [weak self] message in
+            Task { @MainActor in
+                self?.publishStatusThrottled(message, force: true)
+            }
+        }
+
+        setBaseStatus("Indexed \(indexedCount.formatted()) items — building events…")
         await performEventSync(forceMaintenance: true)
         await reloadEventsAsync()
-        setBaseStatus("Indexed \(indexedCount.formatted()) photos — \(events.count.formatted()) events")
+        setBaseStatus("Indexed \(indexedCount.formatted()) items — \(events.count.formatted()) events")
     }
 
     private nonisolated static func enumeratePhotoLibrary(
@@ -684,9 +1272,10 @@ final class LibraryViewModel: ObservableObject {
             ?? Date.distantPast
         let options = PHFetchOptions()
         options.predicate = NSPredicate(
-            format: "creationDate >= %@ AND mediaType == %d",
+            format: "creationDate >= %@ AND (mediaType == %d OR mediaType == %d)",
             startDate as NSDate,
-            PHAssetMediaType.image.rawValue
+            PHAssetMediaType.image.rawValue,
+            PHAssetMediaType.video.rawValue
         )
 
         let assets = PHAsset.fetchAssets(with: options)
@@ -738,7 +1327,8 @@ final class LibraryViewModel: ObservableObject {
                 isScreenshot: isScreenshot,
                 aspectRatio: aspectRatio,
                 orientation: orientation,
-                qualityScore: qualityScore
+                qualityScore: qualityScore,
+                duration: asset.mediaType == .video ? asset.duration : nil
             )
 
             count += 1
@@ -903,11 +1493,21 @@ final class LibraryViewModel: ObservableObject {
 
     func syncEventsTapped() {
         Task {
-            let unassignedBefore = database.countUnassignedPhotosForEvents()
+            publishStatusThrottled("Syncing events…", force: true)
+            let unassignedBefore = await Task.detached(priority: .background) { [backgroundDatabase] in
+                backgroundDatabase.countUnassignedPhotosForEvents()
+            }.value
             await performEventSync(forceMaintenance: false)
             if unassignedBefore >= Self.fullMaintenanceUnassignedThreshold {
                 await runEventMaintenance()
+            } else {
+                isSyncingEvents = true
+                publishStatusThrottled("Joining no-GPS events…", force: true)
+                await Task.detached(priority: .background) { [backgroundDatabase] in
+                    backgroundDatabase.joinTimeOnlyEventsToSameDayLocatedEvents()
+                }.value
             }
+            isSyncingEvents = false
             await reloadEventsAsync(loadSlideshowIds: true)
         }
     }
@@ -1022,9 +1622,46 @@ final class LibraryViewModel: ObservableObject {
         }
     }
 
+    /// Consistent SQLite snapshot for Share Sheet / AirDrop (does not write to Mac Desktop).
+    func exportDatabaseForSharing() async -> URL? {
+        publishStatusThrottled("Preparing database export…", force: true)
+        do {
+            let url = try await Task.detached(priority: .utility) {
+                try DatabaseManager.shared.exportConsistentSnapshot()
+            }.value
+            publishStatusThrottled("Database ready to share — AirDrop to your Mac", force: true)
+            return url
+        } catch {
+            publishStatusThrottled(
+                "Database export failed: \(error.localizedDescription)",
+                force: true
+            )
+            return nil
+        }
+    }
+
     func geocodeNextLocationsBatch() {
         database.startGeocodingEventLocations(limit: 40)
         publishStatusThrottled("Geocoding 40 recent locations…", force: true)
+    }
+
+    func relinkEventLocationsTapped() {
+        guard !isMaintainingEvents, !isSyncingEvents else { return }
+
+        Task {
+            isMaintainingEvents = true
+            publishStatusThrottled("Linking event locations from photo GPS…", force: true)
+
+            let db = backgroundDatabase
+            await Task.detached(priority: .background) {
+                db.relinkEventLocationsFromPhotos()
+            }.value
+
+            isMaintainingEvents = false
+            await reloadEventsAsync()
+            refreshLibraryCounts()
+            publishStatusThrottled("Event locations relinked. Run Geocode if names are empty.", force: true)
+        }
     }
 
     /// Re-imports PhotoKit albums + filename metadata for indexed photos (no full re-index).
@@ -1067,35 +1704,7 @@ final class LibraryViewModel: ObservableObject {
         publishStatusThrottled("\(counts.summaryLine). \(counts.detailLine)", force: true)
     }
 
-    func showOccasionScoringCountsTapped() {
-        let counts = backgroundDatabase.occasionScoringCounts()
-        publishStatusThrottled("\(counts.summaryLine). \(counts.detailLine)", force: true)
-    }
 
-    func scoreHolidayOccasionsTapped() {
-        Task {
-            isMaintainingEvents = true
-            defer { isMaintainingEvents = false }
-
-            publishStatusThrottled("Scoring holiday occasions for events…", force: true)
-
-            let result = await Task.detached(priority: .utility) { [backgroundDatabase] in
-                backgroundDatabase.scoreAllHolidayOccasions()
-            }.value
-
-            publishStatusThrottled(
-                "\(result.scoring.summaryLine). \(result.tags.summaryLine). \(result.tags.detailLine)",
-                force: true
-            )
-
-            await reloadEventsAsync(
-                filter: activeEventListFilter,
-                loadSlideshowIds: false
-            )
-            await refreshHomeCategoryCounts()
-            await refreshOccasionLandingItems()
-        }
-    }
 
     func christmasObjectKeysForVisionDebug() -> [String] {
         backgroundDatabase.christmasObjectKeysForVisionDebug()
@@ -1109,6 +1718,84 @@ final class LibraryViewModel: ObservableObject {
             assetIdentifier: assetIdentifier,
             objectKeys: objectKeys
         )
+    }
+
+    func tagPhotosWithVisionTagTapped(startMonthDay: String, endMonthDay: String) {
+        guard let range = PhotoVisionTagQuery.normalizedRange(
+            start: startMonthDay,
+            end: endMonthDay
+        ) else {
+            publishStatusThrottled("Use a range like 12/1 – 12/31", force: true)
+            return
+        }
+
+        visionTagScanTask?.cancel()
+        visionTagScanTask = Task {
+            isMaintainingEvents = true
+            defer {
+                isMaintainingEvents = false
+                visionTagScanTask = nil
+            }
+
+            publishStatusThrottled(
+                "Finding photos for \(range.displayText) (all years)…",
+                force: true
+            )
+
+            let selection = await Task.detached(priority: .utility) { [backgroundDatabase] in
+                backgroundDatabase.fetchUnanalyzedPhotoIdsMatchingMonthDayRange(
+                    start: range.start,
+                    end: range.end
+                )
+            }.value
+
+            guard !Task.isCancelled else { return }
+
+            let selectionLine = "\(range.displayText): \(selection.summaryLine)"
+            print(selectionLine)
+            if !selection.photoCountByYear.isEmpty {
+                let yearBreakdown = selection.photoCountByYear.keys.sorted().map { year in
+                    "\(year)=\(selection.photoCountByYear[year] ?? 0)"
+                }.joined(separator: ", ")
+                print("Vision tag years: \(yearBreakdown)")
+            }
+
+            guard !selection.photoIds.isEmpty else {
+                if selection.totalInRange == 0 {
+                    publishStatusThrottled(
+                        "No photos for \(range.displayText) in any year.",
+                        force: true
+                    )
+                } else {
+                    publishStatusThrottled(
+                        "All \(selection.totalInRange.formatted()) photos for \(range.displayText) "
+                            + "(\(selection.yearSpanText)) already tagged.",
+                        force: true
+                    )
+                }
+                return
+            }
+
+            publishStatusThrottled(
+                "Tagging \(selection.unanalyzedCount.formatted()) photos for \(range.displayText) "
+                    + "· \(selection.yearSpanText) (newest first)…",
+                force: true
+            )
+
+            let report = await backgroundDatabase.scanPhotosWithVisionTags(
+                photoIds: selection.photoIds
+            ) { current, total in
+                Task { @MainActor in
+                    self.publishStatusThrottled(
+                        "Vision tags \(current.formatted()) of \(total.formatted())…"
+                    )
+                }
+            }
+
+            let message = "\(report.summaryLine) · \(range.displayText) · \(selection.yearSpanText)"
+            print(message)
+            publishStatusThrottled(message, force: true)
+        }
     }
 
     func cancelHolidayLandingVisionScans(reason: String = "left holiday collection") {
@@ -1326,7 +2013,7 @@ final class LibraryViewModel: ObservableObject {
                 loadSlideshowIds: false
             )
             await refreshHomeCategoryCounts()
-            await refreshOccasionLandingItems()
+            await refreshHolidayLandingItems()
         }
     }
 
@@ -1349,20 +2036,6 @@ final class LibraryViewModel: ObservableObject {
         }
     }
 
-    func showTopHolidayOccasionScoresTapped(limit: Int = 25) {
-        let matches = backgroundDatabase.debugPrintTopHolidayOccasionScores(limit: limit)
-        if let top = matches.first {
-            publishStatusThrottled(
-                "Top holiday: \(top.occasionKey) \(top.year) · \(String(format: "%.2f", top.totalScore)) (\(top.confidence ?? "—")) on event \(top.eventId). See console for top \(limit).",
-                force: true
-            )
-        } else {
-            publishStatusThrottled(
-                "No holiday occasion scores yet — run Score Holiday Occasions first.",
-                force: true
-            )
-        }
-    }
 
     func runMetadataAssignmentTapped() {
         Task {
@@ -1468,45 +2141,69 @@ final class LibraryViewModel: ObservableObject {
         guard let index = events.firstIndex(where: { $0.eventId == eventId }) else {
             return
         }
+        setEventsOnFrame(eventIds: [eventId], show: !events[index].showOnFrame)
+    }
 
-        let event = events[index]
-        let newValue = !event.showOnFrame
-
-        database.setEventShowOnFrame(eventId: eventId, show: newValue)
-
-        events[index] = IndexedEvent(
-            eventId: event.eventId,
-            name: event.name,
-            startDate: event.startDate,
-            endDate: event.endDate,
-            photoCount: event.photoCount,
-            latitude: event.latitude,
-            longitude: event.longitude,
-            city: event.city,
-            state: event.state,
-            placeName: event.placeName,
-            people: event.people,
-            coverPhotoId: event.coverPhotoId,
-            showOnFrame: newValue,
-            userEditedName: event.userEditedName,
-            locationNickname: event.locationNickname,
-            locationId: event.locationId,
-            parentEventId: event.parentEventId,
-            isTripEvent: event.isTripEvent,
-            eventType: event.eventType,
-            activityType: event.activityType,
-            milestoneType: event.milestoneType,
-            holidayType: event.holidayType,
-            attributeTags: event.attributeTags,
-            eventMainPerson: event.eventMainPerson,
-            eventMainPerson2: event.eventMainPerson2,
-            weddingDate: event.weddingDate,
-            tripType: event.tripType,
-            childEventName: event.childEventName,
-            userEditedChildEventName: event.userEditedChildEventName,
-            isUserHidden: event.isUserHidden
-        )
+    func setEventsOnFrame(eventIds: Set<Int>, show: Bool) {
+        guard !eventIds.isEmpty else { return }
+        for eventId in eventIds {
+            database.setEventShowOnFrame(eventId: eventId, show: show)
+            if let index = events.firstIndex(where: { $0.eventId == eventId }),
+               let updated = database.getEvent(eventId: eventId) {
+                events[index] = updated
+            }
+        }
         rebuildEventSections()
+    }
+
+    func setEventsHidden(eventIds: Set<Int>, hidden: Bool) {
+        guard !eventIds.isEmpty else { return }
+        for eventId in eventIds {
+            database.setEventUserHidden(eventId: eventId, hidden: hidden)
+        }
+        // Leave the current list mode; drop rows that no longer belong here.
+        events.removeAll { eventIds.contains($0.eventId) }
+        rebuildEventSections()
+        setBaseStatus(
+            showHiddenEvents
+                ? "Showing \(events.count) hidden events"
+                : "Showing \(events.count) events"
+        )
+    }
+
+    func setEventsFavorite(eventIds: Set<Int>, isFavorite: Bool) {
+        guard !eventIds.isEmpty else { return }
+        for eventId in eventIds {
+            database.setEventFavorite(eventId: eventId, isFavorite: isFavorite)
+            if let index = events.firstIndex(where: { $0.eventId == eventId }),
+               let updated = database.getEvent(eventId: eventId) {
+                events[index] = updated
+            }
+        }
+        eventSections = eventSections.map { section in
+            EventYearSection(
+                year: section.year,
+                items: section.items.map { item in
+                    guard eventIds.contains(item.event.eventId),
+                          let updated = events.first(where: { $0.eventId == item.event.eventId }) else {
+                        return item
+                    }
+                    return item.withEvent(updated)
+                },
+                presentation: section.presentation,
+                headerTitle: section.headerTitle
+            )
+        }
+    }
+
+    /// Photo IDs among `photoIds` that are marked favorite (for Favorites event-list filter).
+    func favoritePhotoIds(among photoIds: [String]) -> Set<String> {
+        guard !photoIds.isEmpty else { return [] }
+        let unique = Array(Set(photoIds))
+        return Set(
+            database.fetchPhotosForBrowser(photoIds: unique)
+                .compactMap { $0.photo.isFavorite ? $0.photo.id : nil }
+        )
     }
 
     func hideEvent(eventId: Int) {
@@ -1544,24 +2241,225 @@ final class LibraryViewModel: ObservableObject {
     }
 
     func confirmAIAttributeTag(displayEventId: Int, tag: EventAttributeTag) {
+        if tag.category == .milestoneType,
+           tag.tagValue.compare("Wedding", options: .caseInsensitive) == .orderedSame {
+            beginConfirmWedding(displayEventId: displayEventId, tag: tag)
+            return
+        }
+
         for eventId in tag.actionEventIds(displayEventId: displayEventId) {
             database.confirmAIAttributeTag(eventId: eventId, field: tag.category)
         }
         refreshEvent(eventId: displayEventId)
         Task {
             await refreshHomeCategoryCounts()
-            await refreshOccasionLandingItems()
+            await refreshHolidayLandingItems()
+        }
+    }
+
+    /// Flips Wedding milestone AI → user, then presents Bride/Groom picker.
+    func beginConfirmWedding(displayEventId: Int, tag: EventAttributeTag) {
+        for eventId in tag.actionEventIds(displayEventId: displayEventId) {
+            database.confirmAIAttributeTag(eventId: eventId, field: tag.category)
+        }
+        refreshEvent(eventId: displayEventId)
+
+        guard let event = database.getEvent(eventId: displayEventId)
+            ?? events.first(where: { $0.eventId == displayEventId }) else {
+            return
+        }
+
+        let people = EventMilestonePersonPickerOrdering.items(
+            eventPeople: database.fetchEventPeople(
+                eventId: event.eventId,
+                includeChildEvents: true
+            ),
+            allPeople: database.fetchAllPeople()
+        )
+        pendingWeddingCoupleConfirm = WeddingCoupleConfirmRequest(
+            displayEventId: displayEventId,
+            event: event,
+            people: people
+        )
+
+        Task {
+            await refreshHomeCategoryCounts()
+            await refreshHolidayLandingItems()
+        }
+    }
+
+    func completeWeddingCoupleConfirm(
+        displayEventId: Int,
+        bride: MilestonePersonPickerItem,
+        groom: MilestonePersonPickerItem,
+        weddingDate: Date
+    ) {
+        pendingWeddingCoupleConfirm = nil
+
+        database.replaceUserEventMainPeople(
+            eventId: displayEventId,
+            names: [bride.name, groom.name]
+        )
+
+        let weddingDateISO = EventDateParser.dateOnlyISO(from: weddingDate)
+        database.updateWeddingDate(eventId: displayEventId, weddingDate: weddingDateISO)
+        _ = database.propagateAnniversaryTagsFromWedding(
+            sourceEventId: displayEventId,
+            person1: bride.name,
+            person2: groom.name,
+            weddingDateISO: weddingDateISO
+        )
+        database.updateWeddingCoverPhotoForEvent(eventId: displayEventId)
+
+        if let event = database.getEvent(eventId: displayEventId), !event.userEditedName {
+            let template = database.fetchEventNameTemplate(
+                tagCategory: EventAttributeField.milestoneType.tagCategory,
+                tagValue: "Wedding"
+            )
+            if let suggested = MilestoneEventNaming.suggestCoupleEventName(
+                person1: bride.name,
+                person2: groom.name,
+                milestoneType: "Wedding",
+                weddingDateISO: weddingDateISO,
+                eventStartDate: event.startDate,
+                nameTemplate: template
+            ) {
+                _ = database.updateEventName(
+                    eventId: displayEventId,
+                    name: suggested,
+                    userEdited: false
+                )
+            }
+        }
+
+        refreshEvent(eventId: displayEventId)
+        Task {
+            await refreshHomeCategoryCounts()
+            await reloadEventsAsync(
+                filter: activeEventListFilter,
+                loadSlideshowIds: false,
+                preserveListWhileLoading: true
+            )
         }
     }
 
     func rejectAIAttributeTag(displayEventId: Int, tag: EventAttributeTag) {
+        removeAttributeTag(displayEventId: displayEventId, tag: tag)
+    }
+
+    /// Removes any event tag (AI or user). If `similar_event_tags` has rows for that
+    /// category/value, offers alternatives; otherwise removal is done.
+    func removeAttributeTag(displayEventId: Int, tag: EventAttributeTag) {
         for eventId in tag.actionEventIds(displayEventId: displayEventId) {
-            database.rejectAIAttributeTag(eventId: eventId, field: tag.category)
+            database.removeEventAttributeTag(eventId: eventId, tag: tag)
         }
         refreshEvent(eventId: displayEventId)
+        presentSimilarEventAlternativesIfNeeded(displayEventId: displayEventId, removedTag: tag)
+
         Task {
             await refreshHomeCategoryCounts()
-            await refreshOccasionLandingItems()
+            await refreshHolidayLandingItems()
+        }
+    }
+
+    private func presentSimilarEventAlternativesIfNeeded(
+        displayEventId: Int,
+        removedTag: EventAttributeTag
+    ) {
+        let alternatives = database.fetchSimilarEventAlternatives(
+            tagCategory: removedTag.category.tagCategory,
+            tagValue: removedTag.tagValue
+        )
+        guard !alternatives.isEmpty else { return }
+        guard let event = database.getEvent(eventId: displayEventId)
+            ?? events.first(where: { $0.eventId == displayEventId }) else {
+            return
+        }
+        pendingSimilarEventAlternatives = SimilarEventAlternativesRequest(
+            displayEventId: displayEventId,
+            event: event,
+            rejectedTag: removedTag,
+            alternatives: alternatives
+        )
+    }
+
+    func applySimilarEventAlternative(
+        displayEventId: Int,
+        alternative: SimilarEventTagAlternative
+    ) {
+        pendingSimilarEventAlternatives = nil
+
+        // Write exactly possibleTagCategory + possibleTagValue from similar_event_tags.
+        database.applySimilarEventUserTag(
+            eventId: displayEventId,
+            tagCategory: alternative.possibleTagCategory,
+            tagValue: alternative.possibleTagValue
+        )
+
+        let peopleNeeded = max(0, alternative.possibleNumberOfEventMainPeople)
+        guard peopleNeeded > 0,
+              let event = database.getEvent(eventId: displayEventId)
+                ?? events.first(where: { $0.eventId == displayEventId }) else {
+            refreshEvent(eventId: displayEventId)
+            return
+        }
+
+        // 1 → Senior/Junior Prom, Christening, Confirmation; 2 → Engagement Party.
+        let people = EventMilestonePersonPickerOrdering.items(
+            eventPeople: database.fetchEventPeople(
+                eventId: event.eventId,
+                includeChildEvents: true
+            ),
+            allPeople: database.fetchAllPeople()
+        )
+        pendingSimilarEventPeoplePick = SimilarEventPeoplePickRequest(
+            displayEventId: displayEventId,
+            event: event,
+            alternative: alternative,
+            people: people
+        )
+        refreshEvent(eventId: displayEventId)
+    }
+
+    func completeSimilarEventPeoplePick(
+        displayEventId: Int,
+        person1: MilestonePersonPickerItem,
+        person2: MilestonePersonPickerItem?
+    ) {
+        let tagValue = pendingSimilarEventPeoplePick?.alternative.possibleTagValue
+        pendingSimilarEventPeoplePick = nil
+        var names = [person1.name]
+        if let person2 {
+            names.append(person2.name)
+        }
+        database.replaceUserEventMainPeople(eventId: displayEventId, names: names)
+
+        if let tagValue,
+           let event = database.getEvent(eventId: displayEventId),
+           !event.userEditedName,
+           let template = database.fetchEventNameTemplate(
+               tagCategory: EventAttributeField.milestoneType.tagCategory,
+               tagValue: tagValue
+           ),
+           let suggested = MilestoneEventNaming.suggestTemplatedEventName(
+               nameTemplate: template,
+               person1: person1.name,
+               person2: person2?.name
+           ) {
+            _ = database.updateEventName(
+                eventId: displayEventId,
+                name: suggested,
+                userEdited: false
+            )
+        }
+
+        refreshEvent(eventId: displayEventId)
+        Task {
+            await reloadEventsAsync(
+                filter: activeEventListFilter,
+                loadSlideshowIds: false,
+                preserveListWhileLoading: true
+            )
         }
     }
 
@@ -1609,13 +2507,29 @@ final class LibraryViewModel: ObservableObject {
     private func rebuildEventSections() {
         let preservedSlideshowIds = slideshowIdsFromCurrentSections()
         let fromDatabase = database.getSlideshowPhotoIds(for: events)
+        let eventIds = events.map(\.eventId)
+        let onFrameEventIds = onFrameEventIdsCache ?? onFrameIdsFromCurrentSections()
+        let gameResults = database.fetchEventGameResults(eventIds: eventIds)
         eventSections = Self.buildEventSections(
             from: events,
             slideshowIdsByEvent: mergedSlideshowIds(
                 preserved: preservedSlideshowIds,
                 fromDatabase: fromDatabase
-            )
+            ),
+            onFrameEventIds: onFrameEventIds,
+            gameResultsByEventId: gameResults,
+            listFilter: activeEventListFilter
         )
+    }
+
+    private func onFrameIdsFromCurrentSections() -> Set<Int> {
+        var ids = Set<Int>()
+        for section in eventSections {
+            for item in section.items where item.hasOnFramePhotos {
+                ids.insert(item.event.eventId)
+            }
+        }
+        return ids
     }
 
     private func slideshowIdsFromCurrentSections() -> [Int: [String]] {
@@ -1654,135 +2568,12 @@ final class LibraryViewModel: ObservableObject {
                     guard let ids = preserved[item.event.eventId], !ids.isEmpty else {
                         return item
                     }
-                    return EventListDisplayItem(event: item.event, slideshowPhotoIds: ids)
-                }
+                    return item.withSlideshowPhotoIds(ids)
+                },
+                presentation: section.presentation,
+                headerTitle: section.headerTitle
             )
         }
     }
 
-    // MARK: - Occasion frame landing (Mother's / Father's Day)
-
-    func refreshOccasionFrameLanding(for item: OccasionLandingItem) async {
-        isLoadingOccasionFrame = true
-        defer { isLoadingOccasionFrame = false }
-
-        let snapshot = await Task.detached(priority: .utility) { [backgroundDatabase] in
-            backgroundDatabase.fetchOccasionFrameLandingSnapshot(
-                occasionKey: item.occasionKey,
-                tagValue: item.tagValue,
-                name: item.name,
-                nextOccurrence: item.nextOccurrence,
-                occasionType: item.occasionType
-            )
-        }.value
-
-        occasionFrameSnapshot = snapshot
-        updateOccasionLandingCounts(for: item, snapshot: snapshot)
-    }
-
-    func removePhotoFromOccasionFrame(photoId: String, occasionKey: String) {
-        database.setPhotoOccasionOnFrame(
-            photoId: photoId,
-            occasionKey: occasionKey,
-            isOnFrame: false
-        )
-
-        if var snapshot = occasionFrameSnapshot, snapshot.occasionKey == occasionKey {
-            snapshot = OccasionFrameLandingSnapshot(
-                occasionKey: snapshot.occasionKey,
-                name: snapshot.name,
-                tagValue: snapshot.tagValue,
-                nextOccurrence: snapshot.nextOccurrence,
-                collectionCount: snapshot.collectionCount,
-                onFramePhotoIds: snapshot.onFramePhotoIds.filter { $0 != photoId }
-            )
-            occasionFrameSnapshot = snapshot
-            if let item = occasionLandingItems.first(where: { $0.occasionKey == occasionKey }) {
-                updateOccasionLandingCounts(for: item, snapshot: snapshot)
-            }
-        }
-    }
-
-    func addPhotosToOccasionFrame(
-        photoIds: [String],
-        occasionKey: String,
-        source: PhotoOccasionSource
-    ) {
-        guard !photoIds.isEmpty else { return }
-
-        for photoId in photoIds {
-            database.linkPhotoToOccasion(
-                photoId: photoId,
-                occasionKey: occasionKey,
-                source: source,
-                personId: nil,
-                isOnFrame: true
-            )
-        }
-
-        if let item = occasionLandingItems.first(where: { $0.occasionKey == occasionKey }) {
-            Task {
-                await refreshOccasionFrameLanding(for: item)
-                await refreshOccasionLandingItems()
-            }
-        }
-    }
-
-    func saveOccasionPeopleSubjects(
-        occasionKey: String,
-        parentPersonId: Int,
-        childPersonIds: [Int],
-        parentRole: OccasionSubjectRole
-    ) {
-        let subjects: [(personId: Int, role: OccasionSubjectRole)] =
-            [(parentPersonId, parentRole)]
-            + childPersonIds.map { ($0, .child) }
-
-        database.saveOccasionSubjects(
-            occasionKey: occasionKey,
-            subjects: subjects
-        )
-    }
-
-    func searchOccasionPeoplePhotos(
-        parentPersonId: Int,
-        childPersonIds: [Int],
-        exactPeopleOnly: Bool
-    ) -> [String] {
-        database.searchPhotosWithPeople(
-            requiredPersonId: parentPersonId,
-            includingAnyOfPersonIds: childPersonIds,
-            exactPeopleOnly: exactPeopleOnly
-        )
-    }
-
-    func searchOccasionPersonPhotos(personId: Int, exactPeopleOnly: Bool) -> [String] {
-        database.searchPhotosWithPerson(personId: personId, exactPeopleOnly: exactPeopleOnly)
-    }
-
-    func fetchOccasionPersonId(occasionKey: String) -> Int? {
-        database.fetchOccasionPersonId(occasionKey: occasionKey)
-    }
-
-    func fetchAllPeople() -> [PeopleRepository.PersonRecord] {
-        database.fetchAllPeople()
-    }
-
-    func fetchOccasionSubjects(occasionKey: String) -> [OccasionSubject] {
-        database.fetchOccasionSubjects(occasionKey: occasionKey)
-    }
-
-    private func updateOccasionLandingCounts(
-        for item: OccasionLandingItem,
-        snapshot: OccasionFrameLandingSnapshot
-    ) {
-        guard let index = occasionLandingItems.firstIndex(where: { $0.occasionKey == item.occasionKey }) else {
-            return
-        }
-
-        occasionLandingItems[index] = item.withCounts(
-            collection: snapshot.collectionCount,
-            onFrame: snapshot.onFramePhotoIds.count
-        )
-    }
 }

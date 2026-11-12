@@ -16,7 +16,6 @@ enum DevDatabaseTools {
         print("events rows: \(countRows("events", database: database))")
         print("people rows: \(countRows("people", database: database))")
         print("photo_people rows: \(countRows("photo_people", database: database))")
-        print("event_people rows: \(countRows("event_people", database: database))")
         print("events with city rows: \(countRows("events WHERE city IS NOT NULL AND city != ''", database: database))")
         debugMetadataCounts(database: database)
         debugMetadataAssignmentCounts(database: database)
@@ -66,23 +65,6 @@ enum DevDatabaseTools {
         print("photo_text_metadata rows: \(counts.textMetadataRows)")
         print("indexed photos with album membership: \(counts.photosWithAlbumMembership)")
         print("indexed photos with text metadata: \(counts.photosWithTextMetadata)")
-    }
-
-    static func debugPrintTopHolidayOccasionScores(
-        database: DatabaseManager,
-        limit: Int = 25
-    ) -> [OccasionScoringTopMatch] {
-        let matches = AppContainer.shared.occasionScoring.topHolidayMatches(limit: limit)
-        print("---- TOP \(limit) HOLIDAY OCCASION SCORES ----")
-        if matches.isEmpty {
-            print("(none — run Score Holiday Occasions first)")
-        } else {
-            for match in matches {
-                print(match.consoleLine)
-            }
-        }
-        print("----------------------------------------")
-        return matches
     }
 
     static func debugEventDateDiagnostics(database: DatabaseManager) {

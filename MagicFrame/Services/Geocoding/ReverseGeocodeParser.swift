@@ -11,12 +11,14 @@ enum ReverseGeocodeParser {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    private static func mapItemAddressRepresentations(_ mapItem: MKMapItem) -> MKAddressRepresentations? {
-        (mapItem as NSObject).value(forKey: "addressRepresentations") as? MKAddressRepresentations
+    /// Avoids referencing `MKAddressRepresentations` (iOS 26+) in the type signature.
+    private static func mapItemAddressRepresentations(_ mapItem: MKMapItem) -> NSObject? {
+        (mapItem as NSObject).value(forKey: "addressRepresentations") as? NSObject
     }
 
-    private static func mapItemAddress(_ mapItem: MKMapItem) -> MKAddress? {
-        (mapItem as NSObject).value(forKey: "address") as? MKAddress
+    /// Avoids referencing `MKAddress` (iOS 26+) in the type signature.
+    private static func mapItemAddress(_ mapItem: MKMapItem) -> NSObject? {
+        (mapItem as NSObject).value(forKey: "address") as? NSObject
     }
 
     static func geocodedCity(from mapItem: MKMapItem) -> String? {
@@ -85,7 +87,8 @@ enum ReverseGeocodeParser {
             return placeName
         }
 
-        if let reps = mapItemAddressRepresentations(mapItem),
+        if #available(iOS 26.0, *),
+           let reps = mapItemAddressRepresentations(mapItem) as? MKAddressRepresentations,
            let fullAddress = reps.fullAddress(includingRegion: false, singleLine: true),
            !fullAddress.isEmpty {
             return fullAddress

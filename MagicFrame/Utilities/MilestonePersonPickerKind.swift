@@ -25,7 +25,7 @@ enum MilestonePersonPickerKind: String, Identifiable, Sendable {
 
     var firstPersonStepTitle: String {
         switch self {
-        case .wedding: return "Who is getting married?"
+        case .wedding: return "Who is the Bride?"
         case .anniversary: return "Who is the first person?"
         default: return navigationTitle
         }
@@ -33,7 +33,7 @@ enum MilestonePersonPickerKind: String, Identifiable, Sendable {
 
     var secondPersonStepTitle: String {
         switch self {
-        case .wedding: return "Who is the other person?"
+        case .wedding: return "Who is the Groom?"
         case .anniversary: return "Who is the second person?"
         default: return navigationTitle
         }

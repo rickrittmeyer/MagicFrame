@@ -47,12 +47,19 @@ final class EventDetailViewModel: ObservableObject {
     @Published private(set) var analyzingFaceMetricsPhotoIds: Set<String> = []
     @Published private(set) var objectRecognitionStatus: String?
     @Published private(set) var visionLabelDebugStatus: String?
-    @Published private(set) var holidayScorecards: [AITagScoringDetail] = []
-    @Published private(set) var holidayScorecardRevision = 0
-    @Published private(set) var aiTagScoringSaveStatus: String?
+    @Published private(set) var gameResult: EventGameResult?
+    @Published private(set) var gameLookupStatus: String?
+    @Published private(set) var isLookingUpGameScore = false
+    @Published var gameLookupCandidates: [SportsGameCandidate] = []
+    @Published var showGameLookupCandidates = false
+    @Published private(set) var locationGeocodeStatus: String?
+    @Published var pendingSimilarEventAlternatives: SimilarEventAlternativesRequest?
+    @Published var pendingSimilarEventPeoplePick: SimilarEventPeoplePickRequest?
     private var faceAnalysisTask: Task<Void, Never>?
+    private var similarGroupRefineTask: Task<Void, Never>?
     private var objectRecognitionTask: Task<Void, Never>?
     private var visionLabelDebugTask: Task<Void, Never>?
+    private var locationGeocodeTask: Task<Void, Never>?
     private var birthDateISOByPersonName: [String: String] = [:]
     private let database: any MagicFrameDatabase
 
@@ -72,10 +79,20 @@ final class EventDetailViewModel: ObservableObject {
         self.eventName = freshEvent.name
         self.userEditedName = freshEvent.userEditedName
         syncClassification(from: freshEvent)
+        self.gameResult = self.database.fetchEventGameResult(eventId: freshEvent.eventId)
+    }
+
+    var canLookupGameScore: Bool {
+        let type = eventType?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return type == "Sporting event" || gameResult != nil
     }
 
     var photoCount: Int {
-        photos.count
+        photos.filter { !$0.isVideo }.count
+    }
+
+    var videoCount: Int {
+        photos.filter(\.isVideo).count
     }
 
     var visiblePhotoCount: Int {
@@ -121,13 +138,36 @@ final class EventDetailViewModel: ObservableObject {
     }
 
     var suggestedName: String? {
+        if let gameResult {
+            return gameResult.suggestedEventName
+        }
+
         let resolvedMilestoneType = event.resolvedAttributeValue(for: .milestoneType) ?? milestoneType
         let resolvedMainPerson = event.resolvedAttributeValue(for: .mainPerson) ?? eventMainPerson
         let resolvedMainPerson2 = event.resolvedAttributeValue(for: .secondaryMainPerson) ?? eventMainPerson2
+        let mainPeople = event.orderedMainPersonNames
+        let person1 = mainPeople.first
+            ?? resolvedMainPerson?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let person2 = mainPeople.count > 1
+            ? mainPeople[1]
+            : resolvedMainPerson2?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let resolvedMilestoneType,
+           let template = database.fetchEventNameTemplate(
+               tagCategory: EventAttributeField.milestoneType.tagCategory,
+               tagValue: resolvedMilestoneType
+           ),
+           let templated = MilestoneEventNaming.suggestTemplatedEventName(
+               nameTemplate: template,
+               person1: person1,
+               person2: person2
+           ) {
+            return templated
+        }
 
         if MilestoneEventNaming.isCoupleMilestone(resolvedMilestoneType),
-           let person1 = resolvedMainPerson?.trimmingCharacters(in: .whitespacesAndNewlines),
-           let person2 = resolvedMainPerson2?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let person1,
+           let person2,
            !person1.isEmpty,
            !person2.isEmpty,
            let milestoneName = MilestoneEventNaming.suggestCoupleEventName(
@@ -142,7 +182,7 @@ final class EventDetailViewModel: ObservableObject {
 
         if MilestoneEventNaming.isPersonMilestone(resolvedMilestoneType),
            !MilestoneEventNaming.isCoupleMilestone(resolvedMilestoneType),
-           let person = resolvedMainPerson?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let person = person1,
            !person.isEmpty {
             let birthISO = birthDateISOByPersonName[person.lowercased()]
             if let milestoneName = MilestoneEventNaming.suggestEventName(
@@ -173,8 +213,26 @@ final class EventDetailViewModel: ObservableObject {
         guard trimmedEventName != name else { return false }
 
         let resolvedMilestoneType = event.resolvedAttributeValue(for: .milestoneType) ?? milestoneType
-        let resolvedMainPerson = event.resolvedAttributeValue(for: .mainPerson) ?? eventMainPerson
-        let resolvedMainPerson2 = event.resolvedAttributeValue(for: .secondaryMainPerson) ?? eventMainPerson2
+        let mainPeople = event.orderedMainPersonNames
+        let resolvedMainPerson = mainPeople.first
+            ?? event.resolvedAttributeValue(for: .mainPerson)
+            ?? eventMainPerson
+        let resolvedMainPerson2 = mainPeople.count > 1
+            ? mainPeople[1]
+            : (event.resolvedAttributeValue(for: .secondaryMainPerson) ?? eventMainPerson2)
+
+        if let resolvedMilestoneType,
+           let template = database.fetchEventNameTemplate(
+               tagCategory: EventAttributeField.milestoneType.tagCategory,
+               tagValue: resolvedMilestoneType
+           ) {
+            let hasPerson1 = resolvedMainPerson?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            let needsPerson2 = template.nameTemplate.contains("{person2}")
+            let hasPerson2 = resolvedMainPerson2?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            if hasPerson1, !needsPerson2 || hasPerson2 {
+                return true
+            }
+        }
 
         if MilestoneEventNaming.isCoupleMilestone(resolvedMilestoneType),
            resolvedMainPerson?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
@@ -197,39 +255,46 @@ final class EventDetailViewModel: ObservableObject {
     }
 
     func loadPhotos() {
-        if event.isTripContainer {
-            tripSections = database.getTripSections(
-                for: event.eventId,
-                includeHidden: showHiddenPhotos
-            )
-            photos = tripSections.flatMap(\.photos)
-        } else {
-            tripSections = []
-            photos = database.getPhotosForEvent(
-                eventId: event.eventId,
-                includeHidden: showHiddenPhotos
-            )
-        }
-
+        reloadPhotoCollections()
         rebuildDisplayItems()
         selectedPhotoIds = selectedPhotoIds.intersection(Set(photos.map(\.id)))
         syncTripChildEventNameDrafts()
-        analyzeFaceMetricsForStacksIfNeeded()
+        // Face metrics wait until visual refine finishes — otherwise mega metadata
+        // stacks (shared import timestamps) thrash: refine ↔ face reload ↔ regroup.
+        refineSimilarGroupsWithVisualSimilarityIfNeeded()
         runObjectRecognitionIfNeeded()
+        enqueueFaceRecognitionIfNeeded()
+        ensureLocationGeocodedIfNeeded()
     }
 
-    func loadHolidayScorecards() {
-        rescoreCurrentEventHolidayScores()
-        holidayScorecards = database.fetchHolidayScorecards(
-            eventId: event.eventId,
-            includesDescendantPhotos: event.isTripContainer
-        )
-        holidayScorecardRevision += 1
+    func cancelLocationGeocode() {
+        locationGeocodeTask?.cancel()
+        locationGeocodeTask = nil
+        locationGeocodeStatus = nil
     }
 
-    private func rescoreCurrentEventHolidayScores() {
-        database.scoreHolidayEvent(eventId: event.eventId)
-        refreshEvent(notifyList: false)
+    private func ensureLocationGeocodedIfNeeded() {
+        locationGeocodeTask?.cancel()
+
+        let eventId = event.eventId
+        let alreadyHasPlace =
+            !(event.placeName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            || !(event.city?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+
+        locationGeocodeTask = Task { [weak self] in
+            guard let self else { return }
+            if !alreadyHasPlace {
+                self.locationGeocodeStatus = "Looking up location…"
+            }
+
+            let didUpdate = await database.ensureEventLocationGeocoded(eventId: eventId)
+            guard !Task.isCancelled else { return }
+
+            if didUpdate {
+                self.refreshEvent(notifyList: true)
+            }
+            self.locationGeocodeStatus = nil
+        }
     }
 
     func syncTripChildEventNameDrafts() {
@@ -269,6 +334,13 @@ final class EventDetailViewModel: ObservableObject {
         }
     }
 
+    func cancelObjectRecognition() {
+        objectRecognitionTask?.cancel()
+        objectRecognitionTask = nil
+        objectRecognitionStatus = nil
+        cancelLocationGeocode()
+    }
+
     private func runObjectRecognitionIfNeeded() {
         objectRecognitionTask?.cancel()
 
@@ -279,46 +351,49 @@ final class EventDetailViewModel: ObservableObject {
         objectRecognitionTask = Task { [weak self] in
             guard let self else { return }
 
-            let summary = database.enqueueEventObjectRecognitionJobs(
+            // Full Tag Photos–style classify for gaps only (`visionAnalyzed = 0`).
+            // Already analyzed photos are skipped; does not use photo_vision_scans.
+            let report = await database.scanEventPhotosWithVisionTags(
                 eventId: eventId,
-                includeHiddenPhotos: includeHidden,
-                forceRescan: false,
-                forcedOccasionKey: nil,
-                priority: 100,
-                scopeKey: nil
-            )
+                includeHiddenPhotos: includeHidden
+            ) { current, total in
+                Task { @MainActor [weak self] in
+                    guard let self, !Task.isCancelled else { return }
+                    self.objectRecognitionStatus =
+                        "Tagging photos… \(current.formatted())/\(total.formatted())"
+                }
+            }
 
             guard !Task.isCancelled else { return }
 
-            if summary.enqueuedCount == 0 {
+            if report.photosScanned == 0 && report.photosFailed == 0 {
                 self.objectRecognitionStatus = nil
-                _ = summary.skippedReason
                 return
             }
 
-            while !Task.isCancelled {
-                let pending = database.visionJobPendingCount(scopeKey: nil, eventId: eventId)
-                if pending == 0 { break }
-
-                let coordinator = AppDependencies.container.visionJobCoordinator
-                if coordinator.snapshot.activeEventId == eventId,
-                   let statusText = coordinator.snapshot.statusText {
-                    self.objectRecognitionStatus = statusText
-                }
-
-                try? await Task.sleep(for: .milliseconds(250))
-            }
-
-            guard !Task.isCancelled else { return }
-
-            self.objectRecognitionStatus = "Object scan complete."
+            let completeMessage = report.stoppedEarly
+                ? "Vision tagging cancelled."
+                : "Vision tags: \(report.photosScanned.formatted()) scanned · "
+                    + "\(report.tagsWritten.formatted()) labels."
+            self.objectRecognitionStatus = completeMessage
             self.refreshEvent()
-            self.loadHolidayScorecards()
 
             try? await Task.sleep(for: .seconds(4))
-            if self.objectRecognitionStatus == "Object scan complete." {
+            if self.objectRecognitionStatus == completeMessage {
                 self.objectRecognitionStatus = nil
             }
+        }
+    }
+
+    /// Seeds face detect+embed for unscanned photos in this event (no live matching).
+    private func enqueueFaceRecognitionIfNeeded() {
+        let eventId = event.eventId
+        let includeHidden = showHiddenPhotos
+        Task.detached(priority: .utility) { [database] in
+            _ = database.enqueueFaceRecognitionForEvent(
+                eventId: eventId,
+                includeHidden: includeHidden
+            )
         }
     }
 
@@ -332,7 +407,8 @@ final class EventDetailViewModel: ObservableObject {
                 .flatMap { $0.group.photos.map(\.id) }
             database.clearFaceMetrics(forPhotoIds: stackPhotoIds)
             database.setFaceMetricsAlgorithmVersion(PhotoFaceAnalyzer.algorithmVersion)
-            reloadPhotosPreservingAnalysisState()
+            reloadPhotoCollections()
+            refreshDisplayItemsPreservingGroups()
         }
 
         var photoIdsNeedingAnalysis: [String] = []
@@ -404,17 +480,47 @@ final class EventDetailViewModel: ObservableObject {
             }
 
             guard !Task.isCancelled else { return }
-            reloadPhotosPreservingAnalysisState()
+            // Refresh scores in place — do not metadata-regroup or re-run visual refine.
+            reloadPhotoCollections()
+            refreshDisplayItemsPreservingGroups()
+            selectedPhotoIds = selectedPhotoIds.intersection(Set(photos.map(\.id)))
         }.value
     }
 
-    private func reloadPhotosPreservingAnalysisState() {
+    /// Loads trip day sections when present; otherwise falls back to flat event photos.
+    /// Many `isTripEvent` rows have photos on the parent and zero child days — list previews
+    /// still show `coverPhotoId`/slideshow, but day-only loading left detail empty.
+    private func reloadPhotoCollections() {
         if event.isTripContainer {
-            tripSections = database.getTripSections(
+            var sections = database.getTripSections(
                 for: event.eventId,
                 includeHidden: showHiddenPhotos
             )
-            photos = tripSections.flatMap(\.photos)
+            let allLinked = database.getPhotosForEvent(
+                eventId: event.eventId,
+                includeHidden: showHiddenPhotos
+            )
+
+            if sections.isEmpty {
+                tripSections = []
+                photos = allLinked
+                return
+            }
+
+            let childPhotoIds = Set(sections.flatMap { $0.photos.map(\.id) })
+            let parentOnly = allLinked.filter { !childPhotoIds.contains($0.id) }
+            if !parentOnly.isEmpty {
+                let parentSection = TripEventSection(
+                    dayNumber: 1,
+                    childEventName: "Trip photos",
+                    subEventId: event.eventId,
+                    photos: parentOnly
+                )
+                sections.insert(parentSection, at: 0)
+            }
+
+            tripSections = sections
+            photos = sections.flatMap(\.photos)
         } else {
             tripSections = []
             photos = database.getPhotosForEvent(
@@ -422,13 +528,10 @@ final class EventDetailViewModel: ObservableObject {
                 includeHidden: showHiddenPhotos
             )
         }
-
-        rebuildDisplayItems()
-        selectedPhotoIds = selectedPhotoIds.intersection(Set(photos.map(\.id)))
     }
 
     private func rebuildDisplayItems() {
-        if event.isTripContainer {
+        if event.isTripContainer, !tripSections.isEmpty {
             tripPhotoDisplaySections = tripSections.map { section in
                 TripPhotoDisplaySection(
                     section: section,
@@ -439,6 +542,85 @@ final class EventDetailViewModel: ObservableObject {
         } else {
             tripPhotoDisplaySections = []
             photoDisplayItems = EventSimilarPhotoGrouper.displayItems(from: photos)
+        }
+    }
+
+    /// Keep current stack membership; swap in fresher `IndexedPhoto` rows (face scores, etc.).
+    private func refreshDisplayItemsPreservingGroups() {
+        let byId = Dictionary(uniqueKeysWithValues: photos.map { ($0.id, $0) })
+
+        func refreshItems(_ items: [EventPhotoDisplayItem]) -> [EventPhotoDisplayItem] {
+            items.map { item in
+                let refreshedPhotos = item.group.photos.map { byId[$0.id] ?? $0 }
+                let group = SimilarPhotoGroup(id: item.group.id, photos: refreshedPhotos)
+                let picks = group.pickedPhotoIds(from: refreshedPhotos)
+                return EventPhotoDisplayItem(
+                    group: group,
+                    representative: group.displayPhoto(picks: picks)
+                )
+            }
+        }
+
+        if event.isTripContainer, !tripPhotoDisplaySections.isEmpty {
+            tripPhotoDisplaySections = tripPhotoDisplaySections.map { section in
+                TripPhotoDisplaySection(
+                    section: section.section,
+                    displayItems: refreshItems(section.displayItems)
+                )
+            }
+            photoDisplayItems = []
+        } else if !photoDisplayItems.isEmpty {
+            photoDisplayItems = refreshItems(photoDisplayItems)
+            tripPhotoDisplaySections = []
+        } else {
+            rebuildDisplayItems()
+        }
+    }
+
+    /// After metadata burst grouping, split stacks whose images are not visually alike.
+    private func refineSimilarGroupsWithVisualSimilarityIfNeeded() {
+        similarGroupRefineTask?.cancel()
+        faceAnalysisTask?.cancel()
+
+        let hasCandidateStacks = allDisplayItems.contains(where: \.isStack)
+        guard hasCandidateStacks else {
+            analyzeFaceMetricsForStacksIfNeeded()
+            return
+        }
+
+        let useTripSections = event.isTripContainer && !tripSections.isEmpty
+        let tripSnapshot = tripSections
+        let flatSnapshot = photos
+        let eventId = event.eventId
+
+        similarGroupRefineTask = Task { [weak self] in
+            guard let self else { return }
+
+            if useTripSections {
+                var refinedSections: [TripPhotoDisplaySection] = []
+                refinedSections.reserveCapacity(tripSnapshot.count)
+                for section in tripSnapshot {
+                    if Task.isCancelled { return }
+                    let items = await Task.detached(priority: .utility) {
+                        await EventSimilarPhotoGrouper.refinedDisplayItems(from: section.photos)
+                    }.value
+                    refinedSections.append(
+                        TripPhotoDisplaySection(section: section, displayItems: items)
+                    )
+                }
+                guard !Task.isCancelled, self.event.eventId == eventId else { return }
+                self.tripPhotoDisplaySections = refinedSections
+                self.photoDisplayItems = []
+                self.analyzeFaceMetricsForStacksIfNeeded()
+            } else {
+                let items = await Task.detached(priority: .utility) {
+                    await EventSimilarPhotoGrouper.refinedDisplayItems(from: flatSnapshot)
+                }.value
+                guard !Task.isCancelled, self.event.eventId == eventId else { return }
+                self.photoDisplayItems = items
+                self.tripPhotoDisplaySections = []
+                self.analyzeFaceMetricsForStacksIfNeeded()
+            }
         }
     }
 
@@ -522,7 +704,16 @@ final class EventDetailViewModel: ObservableObject {
                 allPeople: database.fetchAllPeople(),
                 eventDate: eventDate
             )
-        case .graduation, .baptism, .wedding, .anniversary:
+        case .wedding:
+            // Event people first (by photo count), then the rest of the library.
+            return EventMilestonePersonPickerOrdering.items(
+                eventPeople: database.fetchEventPeople(
+                    eventId: event.eventId,
+                    includeChildEvents: true
+                ),
+                allPeople: database.fetchAllPeople()
+            )
+        case .graduation, .baptism, .anniversary:
             return coupleMilestonePersonItems()
         }
     }
@@ -554,73 +745,102 @@ final class EventDetailViewModel: ObservableObject {
         setEventMainPerson(person.name)
     }
 
-    func showAITagScoringDetail(for tag: EventAttributeTag) {
-        aiTagScoringSaveStatus = nil
-        loadHolidayScorecards()
-    }
-
-    func saveOccasionDateScoringSettings(
-        occasionId: Int,
-        edit: OccasionDateScoringEdit
-    ) {
-        database.updateOccasionDateScoringSettings(
-            occasionId: occasionId,
-            edit: edit
-        )
-        rescoreCurrentEventAfterRuleChange(
-            statusMessage: "Saved. This event was re-scored with the new date window."
-        )
-    }
-
-    func saveOccasionObjectScoringRules(
-        occasionId: Int,
-        rules: [EditableObjectScoringRule]
-    ) {
-        let candidateCount = database.saveObjectScoringRules(
-            occasionId: occasionId,
-            rules: rules
-        )
-        rescoreCurrentEventAfterRuleChange(
-            statusMessage: candidateCount > 0
-                ? "Saved. \(candidateCount) \(candidateCount == 1 ? "event" : "events") queued for object re-scan (including this one)."
-                : "Saved. Object rules updated and this event was re-scored."
-        )
-        loadPhotos()
-    }
-
-    private func rescoreCurrentEventAfterRuleChange(statusMessage: String) {
-        rescoreCurrentEventHolidayScores()
-        holidayScorecards = database.fetchHolidayScorecards(
-            eventId: event.eventId,
-            includesDescendantPhotos: event.isTripContainer
-        )
-        holidayScorecardRevision += 1
-        aiTagScoringSaveStatus = statusMessage
-    }
-
     func assignCoupleMilestone(
         person1: MilestonePersonPickerItem,
         person2: MilestonePersonPickerItem,
         weddingDate selectedDate: Date
     ) {
-        setAttribute(.mainPerson, value: person1.name)
-        setAttribute(.secondaryMainPerson, value: person2.name)
+        let isWedding = (milestoneType ?? event.resolvedAttributeValue(for: .milestoneType))?
+            .caseInsensitiveCompare("Wedding") == .orderedSame
+
+        if isWedding {
+            // Bride then Groom — both under eventMainPerson.
+            database.replaceUserEventMainPeople(
+                eventId: event.eventId,
+                names: [person1.name, person2.name]
+            )
+            eventMainPerson = person1.name
+            eventMainPerson2 = person2.name
+        } else {
+            setAttribute(.mainPerson, value: person1.name)
+            setAttribute(.secondaryMainPerson, value: person2.name)
+        }
 
         let weddingDateISO = EventDateParser.dateOnlyISO(from: selectedDate)
         database.updateWeddingDate(eventId: event.eventId, weddingDate: weddingDateISO)
         weddingDate = weddingDateISO
 
-        if milestoneType?.caseInsensitiveCompare("Wedding") == .orderedSame {
+        if isWedding {
             _ = database.propagateAnniversaryTagsFromWedding(
                 sourceEventId: event.eventId,
                 person1: person1.name,
                 person2: person2.name,
                 weddingDateISO: weddingDateISO
             )
+            database.updateWeddingCoverPhotoForEvent(eventId: event.eventId)
+            applyWeddingSuggestedNameIfAllowed(bride: person1.name, groom: person2.name)
         }
 
         refreshEvent()
         notifyEventUpdated()
+    }
+
+    /// Confirm AI Wedding milestone (source → user), then caller presents Bride/Groom picker.
+    func confirmAIWeddingMilestoneTag(_ tag: EventAttributeTag) {
+        guard tag.isAIDerived,
+              tag.category == .milestoneType,
+              tag.tagValue.compare("Wedding", options: .caseInsensitive) == .orderedSame else {
+            confirmAIAttributeTag(tag)
+            return
+        }
+        for eventId in tag.actionEventIds(displayEventId: event.eventId) {
+            database.confirmAIAttributeTag(eventId: eventId, field: tag.category)
+        }
+        refreshEvent()
+        notifyEventUpdated()
+    }
+
+    private func applyWeddingSuggestedNameIfAllowed(bride: String, groom: String) {
+        guard !userEditedName else { return }
+        let template = database.fetchEventNameTemplate(
+            tagCategory: EventAttributeField.milestoneType.tagCategory,
+            tagValue: "Wedding"
+        )
+        guard let name = MilestoneEventNaming.suggestCoupleEventName(
+            person1: bride,
+            person2: groom,
+            milestoneType: "Wedding",
+            weddingDateISO: weddingDate,
+            eventStartDate: event.startDate,
+            nameTemplate: template
+        ) else {
+            return
+        }
+        eventName = name
+        userEditedName = false
+        _ = saveEventName()
+    }
+
+    private func applyTemplatedSuggestedNameIfAllowed(
+        tagValue: String,
+        person1: String,
+        person2: String?
+    ) {
+        guard !userEditedName else { return }
+        guard let template = database.fetchEventNameTemplate(
+            tagCategory: EventAttributeField.milestoneType.tagCategory,
+            tagValue: tagValue
+        ),
+        let name = MilestoneEventNaming.suggestTemplatedEventName(
+            nameTemplate: template,
+            person1: person1,
+            person2: person2
+        ) else {
+            return
+        }
+        eventName = name
+        userEditedName = false
+        _ = saveEventName()
     }
 
     func setEventType(_ value: String?) {
@@ -653,9 +873,84 @@ final class EventDetailViewModel: ObservableObject {
     }
 
     func rejectAIAttributeTag(_ tag: EventAttributeTag) {
-        guard tag.isAIDerived else { return }
+        removeAttributeTag(tag)
+    }
+
+    /// Removes any event tag (AI or user). Offers `similar_event_tags` alternatives when present.
+    func removeAttributeTag(_ tag: EventAttributeTag) {
         for eventId in tag.actionEventIds(displayEventId: event.eventId) {
-            database.rejectAIAttributeTag(eventId: eventId, field: tag.category)
+            database.removeEventAttributeTag(eventId: eventId, tag: tag)
+        }
+        refreshEvent()
+        notifyEventUpdated()
+        presentSimilarEventAlternativesIfNeeded(removedTag: tag)
+    }
+
+    private func presentSimilarEventAlternativesIfNeeded(removedTag: EventAttributeTag) {
+        let alternatives = database.fetchSimilarEventAlternatives(
+            tagCategory: removedTag.category.tagCategory,
+            tagValue: removedTag.tagValue
+        )
+        guard !alternatives.isEmpty else { return }
+        pendingSimilarEventAlternatives = SimilarEventAlternativesRequest(
+            displayEventId: event.eventId,
+            event: event,
+            rejectedTag: removedTag,
+            alternatives: alternatives
+        )
+    }
+
+    func applySimilarEventAlternative(_ alternative: SimilarEventTagAlternative) {
+        pendingSimilarEventAlternatives = nil
+
+        // Write exactly possibleTagCategory + possibleTagValue from similar_event_tags.
+        database.applySimilarEventUserTag(
+            eventId: event.eventId,
+            tagCategory: alternative.possibleTagCategory,
+            tagValue: alternative.possibleTagValue
+        )
+
+        if alternative.possibleNumberOfEventMainPeople > 0 {
+            let people = EventMilestonePersonPickerOrdering.items(
+                eventPeople: database.fetchEventPeople(
+                    eventId: event.eventId,
+                    includeChildEvents: true
+                ),
+                allPeople: database.fetchAllPeople()
+            )
+            pendingSimilarEventPeoplePick = SimilarEventPeoplePickRequest(
+                displayEventId: event.eventId,
+                event: event,
+                alternative: alternative,
+                people: people
+            )
+        }
+
+        refreshEvent()
+        notifyEventUpdated()
+    }
+
+    func completeSimilarEventPeoplePick(
+        person1: MilestonePersonPickerItem,
+        person2: MilestonePersonPickerItem?
+    ) {
+        let tagValue = pendingSimilarEventPeoplePick?.alternative.possibleTagValue
+            ?? event.resolvedAttributeValue(for: .milestoneType)
+            ?? milestoneType
+        pendingSimilarEventPeoplePick = nil
+        var names = [person1.name]
+        if let person2 {
+            names.append(person2.name)
+        }
+        database.replaceUserEventMainPeople(eventId: event.eventId, names: names)
+        eventMainPerson = person1.name
+        eventMainPerson2 = person2?.name
+        if let tagValue {
+            applyTemplatedSuggestedNameIfAllowed(
+                tagValue: tagValue,
+                person1: person1.name,
+                person2: person2?.name
+            )
         }
         refreshEvent()
         notifyEventUpdated()
@@ -751,13 +1046,13 @@ final class EventDetailViewModel: ObservableObject {
     }
 
     private func syncClassification(from event: IndexedEvent) {
-        eventType = event.eventType
-        activityType = event.activityType
-        tripType = event.tripType
-        milestoneType = event.resolvedAttributeValue(for: .milestoneType) ?? event.milestoneType
-        holidayType = event.displayHolidayLabel ?? event.holidayType
-        eventMainPerson = event.resolvedAttributeValue(for: .mainPerson) ?? event.eventMainPerson
-        eventMainPerson2 = event.resolvedAttributeValue(for: .secondaryMainPerson) ?? event.eventMainPerson2
+        eventType = event.resolvedAttributeValue(for: .eventType)
+        activityType = event.resolvedAttributeValue(for: .activityType)
+        tripType = event.resolvedAttributeValue(for: .tripType)
+        milestoneType = event.resolvedAttributeValue(for: .milestoneType)
+        holidayType = event.resolvedAttributeValue(for: .holidayType)
+        eventMainPerson = event.resolvedAttributeValue(for: .mainPerson)
+        eventMainPerson2 = event.resolvedAttributeValue(for: .secondaryMainPerson)
         weddingDate = event.weddingDate
     }
 
@@ -782,20 +1077,45 @@ final class EventDetailViewModel: ObservableObject {
     func setSelectedPhotosOnFrame(_ show: Bool) {
         guard !selectedPhotoIds.isEmpty else { return }
 
+        let photoIds = Array(selectedPhotoIds)
+        var writes: [(photoId: String, show: Bool)] = []
+        var similarGroupPicks: [(groupPhotoIds: [String], pickedPhotoIds: [String])] = []
+        var localUpdates: [String: (showOnFrame: Bool, isSimilarGroupPick: Bool?)] = [:]
+        var clearCropFocusPhotoIds: [String] = []
+
         if show {
-            for photoId in selectedPhotoIds {
-                let group = similarGroup(containingPhotoId: photoId)
-                setPhotoOnFrame(photoId: photoId, show: true, in: group)
+            for photoId in photoIds {
+                writes.append((photoId: photoId, show: true))
+                localUpdates[photoId] = (true, nil)
+                clearCropFocusPhotoIds.append(photoId)
+
+                if let group = similarGroup(containingPhotoId: photoId), group.isStack {
+                    for sibling in group.photos where sibling.id != photoId {
+                        writes.append((photoId: sibling.id, show: false))
+                        localUpdates[sibling.id] = (false, false)
+                    }
+                    localUpdates[photoId] = (true, true)
+                    similarGroupPicks.append(
+                        (
+                            groupPhotoIds: group.photos.map(\.id),
+                            pickedPhotoIds: [photoId]
+                        )
+                    )
+                }
             }
         } else {
-            database.setPhotosShowOnFrame(
-                photoIds: Array(selectedPhotoIds),
-                show: false
-            )
-            loadPhotos()
-            refreshEvent()
+            for photoId in photoIds {
+                writes.append((photoId: photoId, show: false))
+                localUpdates[photoId] = (false, nil)
+            }
         }
 
+        applyLocalOnFrameFlags(localUpdates)
+        persistOnFrameChangesInBackground(
+            writes: writes,
+            similarGroupPicks: similarGroupPicks,
+            clearCropFocusPhotoIds: clearCropFocusPhotoIds
+        )
         cancelPhotoSelection()
     }
 
@@ -865,9 +1185,96 @@ final class EventDetailViewModel: ObservableObject {
 
         event = updated
         syncClassification(from: updated)
+        gameResult = database.fetchEventGameResult(eventId: event.eventId)
         if notifyList {
             notifyEventUpdated()
         }
+    }
+
+    @MainActor
+    func findGameScore() async {
+        guard !isLookingUpGameScore else { return }
+        isLookingUpGameScore = true
+        gameLookupStatus = "Looking up games…"
+        gameLookupCandidates = []
+        defer { isLookingUpGameScore = false }
+
+        var placeName = event.placeName
+        var city = event.city
+        var state = event.state
+        var latitude = event.latitude
+        var longitude = event.longitude
+
+        if let locationId = event.locationId,
+           let location = database.getLocation(locationId: locationId) {
+            if placeName?.isEmpty != false {
+                placeName = location.placeName ?? location.nickname
+            }
+            if city?.isEmpty != false { city = location.city }
+            if state?.isEmpty != false { state = location.state }
+            if latitude == nil { latitude = location.latitude }
+            if longitude == nil { longitude = location.longitude }
+        }
+
+        do {
+            let result = try await database.lookupSportsGameCandidates(
+                eventDateISO: event.startDate,
+                placeName: placeName,
+                city: city,
+                state: state,
+                latitude: latitude,
+                longitude: longitude
+            )
+            gameLookupCandidates = result.candidates
+            if result.candidates.count == 1, let only = result.candidates.first {
+                saveGameCandidate(only)
+                gameLookupStatus = "Saved \(only.coverScoreLine)"
+            } else {
+                showGameLookupCandidates = true
+                gameLookupStatus = "\(result.candidates.count) matching games"
+            }
+        } catch {
+            gameLookupStatus = error.localizedDescription
+        }
+    }
+
+    func saveGameCandidate(_ candidate: SportsGameCandidate) {
+        let now = ISO8601DateFormatter().string(from: Date())
+        let saved = EventGameResult(
+            eventId: event.eventId,
+            stadiumId: candidate.stadiumId,
+            league: candidate.league,
+            espnEventId: candidate.espnEventId,
+            homeTeam: candidate.homeTeam,
+            awayTeam: candidate.awayTeam,
+            homeScore: candidate.homeScore,
+            awayScore: candidate.awayScore,
+            gameDateISO: candidate.gameDateISO,
+            venueName: candidate.venueName,
+            summaryLine: candidate.summaryLine,
+            source: "espn",
+            updatedAt: now
+        )
+        database.saveEventGameResult(saved)
+        gameResult = saved
+        showGameLookupCandidates = false
+        gameLookupStatus = "Saved \(saved.coverScoreLine)"
+        applyGameSuggestedNameIfAllowed(saved.suggestedEventName)
+    }
+
+    func clearSavedGameScore() {
+        database.clearEventGameResult(eventId: event.eventId)
+        gameResult = nil
+        gameLookupStatus = "Cleared game score"
+    }
+
+    private func applyGameSuggestedNameIfAllowed(_ name: String) {
+        guard !userEditedName else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        eventName = trimmed
+        userEditedName = false
+        _ = saveEventName()
     }
 
     func applySuggestedName() {
@@ -925,34 +1332,81 @@ final class EventDetailViewModel: ObservableObject {
     func setPhotoOnFrame(photoId: String, show: Bool, in group: SimilarPhotoGroup? = nil) {
         guard photos.contains(where: { $0.id == photoId }) else { return }
 
-        let owningEventId = database.getEventIdForPhoto(photoId: photoId) ?? event.eventId
+        var writes: [(photoId: String, show: Bool)] = [(photoId: photoId, show: show)]
+        var similarGroupPicks: [(groupPhotoIds: [String], pickedPhotoIds: [String])] = []
+        var localUpdates: [String: (showOnFrame: Bool, isSimilarGroupPick: Bool?)] = [
+            photoId: (show, nil)
+        ]
 
         if show, let group, group.isStack {
             for sibling in group.photos where sibling.id != photoId {
-                let siblingEventId = database.getEventIdForPhoto(photoId: sibling.id) ?? owningEventId
-                database.setPhotoShowOnFrame(
-                    photoId: sibling.id,
-                    eventId: siblingEventId,
-                    show: false
-                )
+                writes.append((photoId: sibling.id, show: false))
+                localUpdates[sibling.id] = (false, false)
             }
-
-            database.setSimilarGroupPicks(
-                groupPhotoIds: group.photos.map(\.id),
-                pickedPhotoIds: [photoId]
+            localUpdates[photoId] = (true, true)
+            similarGroupPicks.append(
+                (
+                    groupPhotoIds: group.photos.map(\.id),
+                    pickedPhotoIds: [photoId]
+                )
             )
         }
 
-        database.setPhotoShowOnFrame(
-            photoId: photoId,
-            eventId: owningEventId,
-            show: show
+        applyLocalOnFrameFlags(localUpdates)
+        persistOnFrameChangesInBackground(
+            writes: writes,
+            similarGroupPicks: similarGroupPicks,
+            clearCropFocusPhotoIds: show ? [photoId] : []
         )
+    }
 
-        database.clearCropFocus(photoId: photoId)
+    private func applyLocalOnFrameFlags(
+        _ updates: [String: (showOnFrame: Bool, isSimilarGroupPick: Bool?)]
+    ) {
+        guard !updates.isEmpty else { return }
 
-        loadPhotos()
-        notifyEventUpdated()
+        func mapped(_ photo: IndexedPhoto) -> IndexedPhoto {
+            guard let update = updates[photo.id] else { return photo }
+            return photo.withShowOnFrame(
+                update.showOnFrame,
+                isSimilarGroupPick: update.isSimilarGroupPick
+            )
+        }
+
+        photos = photos.map(mapped)
+        if event.isTripContainer {
+            tripSections = tripSections.map { section in
+                TripEventSection(
+                    dayNumber: section.dayNumber,
+                    childEventName: section.childEventName,
+                    subEventId: section.subEventId,
+                    photos: section.photos.map(mapped)
+                )
+            }
+        }
+        // Preserve visually refined stacks — do not metadata-regroup.
+        refreshDisplayItemsPreservingGroups()
+    }
+
+    private func persistOnFrameChangesInBackground(
+        writes: [(photoId: String, show: Bool)],
+        similarGroupPicks: [(groupPhotoIds: [String], pickedPhotoIds: [String])],
+        clearCropFocusPhotoIds: [String]
+    ) {
+        let defaultEventId = event.eventId
+        let database = AppDependencies.container.photoDatabase
+
+        Task {
+            await Task.detached(priority: .utility) {
+                database.persistPhotoOnFrameChanges(
+                    defaultEventId: defaultEventId,
+                    writes: writes,
+                    similarGroupPicks: similarGroupPicks,
+                    clearCropFocusPhotoIds: clearCropFocusPhotoIds
+                )
+            }.value
+            notifyEventUpdated()
+        }
     }
 
     private func applyLocalPhotoUpdate(_ updated: IndexedPhoto) {
@@ -977,7 +1431,8 @@ final class EventDetailViewModel: ObservableObject {
             }
         }
 
-        rebuildDisplayItems()
+        // Preserve visually refined stacks — do not metadata-regroup.
+        refreshDisplayItemsPreservingGroups()
     }
 
     func logVisionLabelsForPhoto(_ photo: IndexedPhoto) {

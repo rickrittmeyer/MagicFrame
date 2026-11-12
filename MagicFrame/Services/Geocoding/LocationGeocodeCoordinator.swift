@@ -18,6 +18,7 @@ protocol LocationGeocodeStore: AnyObject {
 }
 
 /// Throttled, sequential reverse-geocoding queue for location rows.
+@available(iOS 26.0, *)
 final class LocationGeocodeCoordinator {
 
     static let shared = LocationGeocodeCoordinator()

@@ -6,6 +6,7 @@ struct EventSyncProgress {
     let remainingUnassigned: Int
     var statusMessage: String?
     var isRebuild: Bool = false
+    var forcePublish: Bool = false
 
     var displayStatus: String {
         if let statusMessage {

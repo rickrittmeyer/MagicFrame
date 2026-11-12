@@ -41,17 +41,27 @@ enum PhotoObjectVisionAnalyzer: Sendable {
         limit: Int = 25,
         minimumObservationConfidence: Float = 0.01
     ) async -> [VisionClassification] {
-        guard limit > 0,
-              let cgImage = await PhotoAssetImageLoader.loadCGImage(assetIdentifier: assetIdentifier) else {
-            return []
+        guard limit > 0 else { return [] }
+        let classifications = await allClassifications(
+            assetIdentifier: assetIdentifier,
+            minimumObservationConfidence: minimumObservationConfidence
+        )
+        return Array((classifications ?? []).prefix(limit))
+    }
+
+    /// All scene/object labels from `VNClassifyImageRequest`. `nil` if the asset image cannot be loaded.
+    nonisolated static func allClassifications(
+        assetIdentifier: String,
+        minimumObservationConfidence: Float = 0.01
+    ) async -> [VisionClassification]? {
+        guard let cgImage = await PhotoAssetImageLoader.loadCGImage(assetIdentifier: assetIdentifier) else {
+            return nil
         }
 
         return await Task.detached(priority: .utility) {
-            let observations = classifyObservations(cgImage: cgImage)
-            return observations
+            classifyObservations(cgImage: cgImage)
                 .filter { $0.confidence >= minimumObservationConfidence }
                 .sorted { $0.confidence > $1.confidence }
-                .prefix(limit)
                 .map {
                     VisionClassification(
                         identifier: $0.identifier,

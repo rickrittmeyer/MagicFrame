@@ -5,6 +5,7 @@ enum VisionJobType: String, Codable, Sendable {
     case objectEventFinalize
     case faceMetricsScan
     case faceCropScan
+    case faceRecognitionScan
 }
 
 enum VisionJobStatus: String, Codable, Sendable {

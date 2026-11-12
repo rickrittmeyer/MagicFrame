@@ -6,23 +6,48 @@ struct EventAttributeTagChip: View {
     var showsCategoryIcon: Bool = false
     var showsScore: Bool = false
     var onConfirmAI: (() -> Void)?
-    var onRemoveAI: (() -> Void)?
+    /// Remove this tag (AI reject or user delete). Triggers similar-event alternatives when configured.
+    var onRemove: (() -> Void)?
     var onShowScoreDetails: (() -> Void)?
     var onTap: (() -> Void)?
 
-    @State private var isShowingAIActionDialog = false
+    @State private var isShowingActionDialog = false
+
+    /// Back-compat for call sites still using `onRemoveAI`.
+    init(
+        tag: EventAttributeTag,
+        showsCategoryIcon: Bool = false,
+        showsScore: Bool = false,
+        onConfirmAI: (() -> Void)? = nil,
+        onRemoveAI: (() -> Void)? = nil,
+        onRemove: (() -> Void)? = nil,
+        onShowScoreDetails: (() -> Void)? = nil,
+        onTap: (() -> Void)? = nil
+    ) {
+        self.tag = tag
+        self.showsCategoryIcon = showsCategoryIcon
+        self.showsScore = showsScore
+        self.onConfirmAI = onConfirmAI
+        self.onRemove = onRemove ?? onRemoveAI
+        self.onShowScoreDetails = onShowScoreDetails
+        self.onTap = onTap
+    }
+
+    private var showsActionDialog: Bool {
+        onConfirmAI != nil || onRemove != nil || (showsScore && onShowScoreDetails != nil)
+    }
 
     var body: some View {
         Group {
-            if tag.isAIDerived, onConfirmAI != nil || onRemoveAI != nil {
+            if showsActionDialog {
                 Button {
-                    isShowingAIActionDialog = true
+                    isShowingActionDialog = true
                 } label: {
                     chipLabel
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("\(tag.tagValue) \(tag.category.menuTitle) tag, AI suggested")
-                .accessibilityHint("Opens confirm or remove options")
+                .accessibilityLabel(accessibilityTitle)
+                .accessibilityHint("Opens tag actions")
             } else if let onTap {
                 Button {
                     onTap()
@@ -30,37 +55,51 @@ struct EventAttributeTagChip: View {
                     chipLabel
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("\(tag.tagValue) \(tag.category.menuTitle) tag")
-                .accessibilityHint("Opens birthday person picker")
+                .accessibilityLabel(accessibilityTitle)
+                .accessibilityHint("Opens tag options")
             } else {
                 chipLabel
-                    .accessibilityLabel("\(tag.tagValue) \(tag.category.menuTitle) tag")
+                    .accessibilityLabel(accessibilityTitle)
             }
         }
         .confirmationDialog(
             tag.tagValue,
-            isPresented: $isShowingAIActionDialog,
+            isPresented: $isShowingActionDialog,
             titleVisibility: .visible
         ) {
-            if let onConfirmAI {
+            if tag.isAIDerived, let onConfirmAI {
                 Button("Confirm") {
                     onConfirmAI()
                 }
             }
-            if let onRemoveAI {
-                Button("Remove", role: .destructive) {
-                    onRemoveAI()
+            if let onTap, !tag.isAIDerived {
+                Button("Edit") {
+                    onTap()
                 }
             }
-            if showsScore, let onShowScoreDetails {
+            if let onRemove {
+                Button("Remove", role: .destructive) {
+                    onRemove()
+                }
+            }
+            if showsScore, tag.isAIDerived, let onShowScoreDetails {
                 Button("Score breakdown") {
                     onShowScoreDetails()
                 }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Keep this \(tag.category.menuTitle.lowercased()) tag or remove it and stop auto-tagging.")
+            if tag.isAIDerived {
+                Text("Keep this \(tag.category.menuTitle.lowercased()) tag or remove it and stop auto-tagging.")
+            } else {
+                Text("Remove this \(tag.category.menuTitle.lowercased()) tag, or edit it.")
+            }
         }
+    }
+
+    private var accessibilityTitle: String {
+        let source = tag.isAIDerived ? "AI suggested" : "user"
+        return "\(tag.tagValue) \(tag.category.menuTitle) tag, \(source)"
     }
 
     private var chipLabel: some View {

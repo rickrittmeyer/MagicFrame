@@ -19,10 +19,7 @@ protocol EventClusteringHost: AnyObject {
     func updateEventLocationFromRepresentativePoint(eventId: Int)
     func flushPendingGeocodeEnqueues()
     func updateCoverPhotoForEvent(eventId: Int)
-    func rebuildEventPeople()
     func getEvent(eventId: Int) -> IndexedEvent?
-    /// Re-scores holiday occasions after event sync maintenance (caller on database queue).
-    func rescoreHolidayTagsForSyncedEventsUnsafe(eventIds: Set<Int>, scoreAllEvents: Bool)
 }
 
 final class EventClusteringService {
@@ -39,6 +36,7 @@ final class EventClusteringService {
     private var lastProgressPost = Date.distantPast
     private var homeCandidatesCache: [CachedHomeCandidate]?
     private var syncSessionTouchedEventIds = Set<Int>()
+    private var sameDayLocatedEventCache: [EventRepository.SameDayLocatedEvent]?
 
     private var db: OpaquePointer? { database.connection }
 
@@ -110,7 +108,6 @@ final class EventClusteringService {
     func clusterEventsByTime() {
     let deleteSQL = """
     DELETE FROM photo_events;
-    DELETE FROM event_people;
     DELETE FROM events;
     DELETE FROM sqlite_sequence WHERE name = 'events';
     """
@@ -314,6 +311,10 @@ final class EventClusteringService {
             "Time-only no-GPS assignment batch: \(photos.count) photos"
             + " (\(remainingBefore.formatted()) unassigned total)"
         )
+        postEventSyncStatus(
+            "Assigning no-GPS photos… \(remainingBefore.formatted()) left",
+            force: true
+        )
 
         assignPhotosToEvents(photos, maxTouchedEvents: nil, tryGPSMatch: false)
 
@@ -336,7 +337,9 @@ final class EventClusteringService {
     ) -> Int? {
         let eventId: Int?
 
-        if let existingId = events.findTimeOnlyMatchingEvent(
+        if let locatedId = sameDayLocatedEventId(for: photo.date) {
+            eventId = locatedId
+        } else if let existingId = events.findTimeOnlyMatchingEvent(
             photoDate: photo.date,
             maxGapSeconds: maxGapSeconds
         ) {
@@ -403,6 +406,23 @@ final class EventClusteringService {
     }
 
 
+    /// Recreates `events.locationId` from photo GPS without rebuilding events.
+    func relinkEventLocationsFromPhotos() {
+        sync {
+            postEventSyncStatus("Linking event locations…")
+            refreshAllEventLocationLinks()
+            host.snapEventsNearDesignatedHomesUnsafe()
+
+            let linked = host.countRows("events WHERE isDeleted = 0 AND locationId IS NOT NULL")
+            let total = host.countRows("events WHERE isDeleted = 0")
+            print("Relinked event locations: \(linked)/\(total) events have locationId")
+            postEventSyncStatus(
+                "Linked locations on \(linked.formatted()) of \(total.formatted()) events"
+            )
+        }
+        host.flushPendingGeocodeEnqueues()
+    }
+
     func finishEventRebuild() {
     sync {
         runPostSyncMaintenance()
@@ -431,7 +451,6 @@ final class EventClusteringService {
     func clearAllEventDataPreservingLocations() {
     let sql = """
     DELETE FROM photo_events;
-    DELETE FROM event_people;
     DELETE FROM events;
     DELETE FROM sqlite_sequence WHERE name = 'events';
     UPDATE photos
@@ -469,18 +488,28 @@ final class EventClusteringService {
             break
         }
 
-        if tryGPSMatch, let eventId = findMatchingEvent(for: photo) {
-            events.attachPhotoToEvent(
-                photoId: photo.id,
-                eventId: eventId,
-                assignmentConfidence: 1.0,
-                assignmentMethod: .gpsMatch
-            )
-            events.markPhotoEventAssigned(photoId: photo.id)
-            events.expandEventDatesAfterAttach(eventId: eventId, photoDate: photo.date)
-            touchedEventIds.insert(eventId)
-            openTimeClusterEventId = nil
-            openTimeClusterLastDate = nil
+        if tryGPSMatch, photo.latitude != nil, photo.longitude != nil {
+            let eventId: Int?
+            if let matchedId = findMatchingEvent(for: photo) {
+                eventId = matchedId
+            } else {
+                let createdId = createEventFromPhoto(photo)
+                eventId = createdId > 0 ? createdId : nil
+            }
+
+            if let eventId {
+                events.attachPhotoToEvent(
+                    photoId: photo.id,
+                    eventId: eventId,
+                    assignmentConfidence: 1.0,
+                    assignmentMethod: .gpsMatch
+                )
+                events.markPhotoEventAssigned(photoId: photo.id)
+                events.expandEventDatesAfterAttach(eventId: eventId, photoDate: photo.date)
+                touchedEventIds.insert(eventId)
+                openTimeClusterEventId = nil
+                openTimeClusterLastDate = nil
+            }
         } else if let eventId = assignPhotoToTimeCluster(
             photo,
             openEventId: openTimeClusterEventId,
@@ -542,25 +571,30 @@ final class EventClusteringService {
     DispatchQueue.main.async {
         NotificationCenter.default.post(
             name: .eventSyncProgressChanged,
-            object: progress
+            object: nil,
+            userInfo: [
+                "processed": processed,
+                "total": total,
+                "remainingUnassigned": remainingUnassigned,
+                "isRebuild": isRebuild
+            ]
         )
     }
     }
 
 
-    func postEventSyncStatus(_ message: String, isRebuild: Bool = false) {
-    let progress = EventSyncProgress(
-        processed: 0,
-        total: 0,
-        remainingUnassigned: 0,
-        statusMessage: message,
-        isRebuild: isRebuild || isRebuildContext
-    )
+    func postEventSyncStatus(_ message: String, isRebuild: Bool = false, force: Bool = false) {
+    let rebuild = isRebuild || isRebuildContext
 
     DispatchQueue.main.async {
         NotificationCenter.default.post(
             name: .eventSyncProgressChanged,
-            object: progress
+            object: nil,
+            userInfo: [
+                "statusMessage": message,
+                "forcePublish": force,
+                "isRebuild": rebuild
+            ]
         )
     }
     }
@@ -618,6 +652,9 @@ final class EventClusteringService {
     func runPostSyncMaintenance() {
     refreshAllEventLocationLinks()
 
+    postEventSyncStatus("Joining no-GPS photos to same-day events…")
+    mergeTimeOnlyEventsIntoSameDayLocatedEvents()
+
     postEventSyncStatus("Merging nearby events…")
 
     mergeNearbyEventsSameDay(maxDistanceMiles: host.eventTuningUnsafe().sameDayEventMergeMiles)
@@ -658,7 +695,6 @@ final class EventClusteringService {
     postEventSyncStatus("Cleaning up events…")
     events.restoreDeletedTripContainers()
     events.cleanupEmptyEvents()
-    host.rebuildEventPeople()
 
     postEventSyncStatus("Updating cover photos…")
     events.updateAllEventCoverPhotosUnsafe()
@@ -667,12 +703,6 @@ final class EventClusteringService {
         events.repairEventDateSummaries()
     }
 
-    postEventSyncStatus("Scoring holiday occasions…")
-    let touchedEventIds = syncSessionTouchedEventIds
-    host.rescoreHolidayTagsForSyncedEventsUnsafe(
-        eventIds: touchedEventIds,
-        scoreAllEvents: isRebuildContext
-    )
     syncSessionTouchedEventIds.removeAll()
     }
 
@@ -1133,6 +1163,113 @@ final class EventClusteringService {
     sqlite3_finalize(statement)
     }
 
+    /// Runs the same-day join on its own, so Sync Events can fold existing no-GPS events
+    /// without the full trip and location maintenance pass.
+    func joinTimeOnlyEventsToSameDayLocatedEvents() {
+        sync {
+            mergeTimeOnlyEventsIntoSameDayLocatedEvents()
+        }
+    }
+
+    /// Folds automatic no-GPS events into the GPS event on the same local day.
+    /// A renamed time-only event is left as the user arranged it.
+    private func mergeTimeOnlyEventsIntoSameDayLocatedEvents() {
+        let sql = """
+        SELECT eventId, startDate
+        FROM events
+        WHERE isDeleted = 0
+          AND COALESCE(clusteredByTimeOnly, 0) = 1
+          AND COALESCE(userEditedName, 0) = 0
+          AND COALESCE(isUserHidden, 0) = 0
+          AND parentEventId IS NULL
+          AND TRIM(COALESCE(startDate, '')) != '';
+        """
+
+        var statement: OpaquePointer?
+        var sources: [(eventId: Int, startDate: Date)] = []
+
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let eventId = Int(sqlite3_column_int(statement, 0))
+                guard let startCString = sqlite3_column_text(statement, 1) else { continue }
+                let startString = String(cString: startCString)
+                guard let startDate = iso8601Formatter.date(from: startString) else {
+                    continue
+                }
+                sources.append((eventId, startDate))
+            }
+        } else {
+            print(
+                "Failed to list time-only events: \(String(cString: sqlite3_errmsg(db)))"
+            )
+        }
+        sqlite3_finalize(statement)
+
+        let total = sources.count
+        guard total > 0 else {
+            postEventSyncStatus("No separate no-GPS events to join", force: true)
+            return
+        }
+
+        postEventSyncStatus(
+            "Joining no-GPS events… 0 of \(total.formatted())",
+            force: true
+        )
+        if sameDayLocatedEventCache == nil {
+            sameDayLocatedEventCache = events.fetchSameDayLocatedEvents()
+        }
+        let locatedEvents = sameDayLocatedEventCache ?? []
+
+        var merged = 0
+        var touched = Set<Int>()
+
+        for (index, source) in sources.enumerated() {
+            let checked = index + 1
+            if checked == 1 || checked == total || checked % 25 == 0 {
+                postEventSyncStatus(
+                    "Joining no-GPS events… \(checked.formatted()) of \(total.formatted())",
+                    force: true
+                )
+            }
+
+            guard let targetId = events.bestSameDayLocatedEvent(
+                photoDate: source.startDate,
+                in: locatedEvents
+            ),
+                  targetId != source.eventId else {
+                continue
+            }
+
+            mergePhotos(from: source.eventId, into: targetId)
+            softDeleteEvent(eventId: source.eventId)
+            touched.insert(targetId)
+            merged += 1
+        }
+
+        for (index, eventId) in touched.enumerated() {
+            events.updateEventSummary(eventId: eventId)
+            let updated = index + 1
+            postEventSyncStatus(
+                "Updating events… \(updated.formatted()) of \(touched.count.formatted())",
+                force: updated == touched.count
+            )
+        }
+
+        let finished = "Joined \(merged.formatted()) of \(total.formatted()) no-GPS events"
+        postEventSyncStatus(finished, force: true)
+        print(finished)
+    }
+
+    private func sameDayLocatedEventId(for date: Date) -> Int? {
+        if sameDayLocatedEventCache == nil {
+            sameDayLocatedEventCache = events.fetchSameDayLocatedEvents()
+        }
+        return events.bestSameDayLocatedEvent(
+            photoDate: date,
+            in: sameDayLocatedEventCache ?? []
+        )
+    }
+
 
     func mergeNearbyEventsSameDay(maxDistanceMiles: Double) {
     var candidates = fetchEventsForMerge()
@@ -1561,7 +1698,6 @@ final class EventClusteringService {
     }
 
     events.updateTripParentSummary(parentEventId: parentEventId)
-    host.rebuildEventPeople()
     }
 
 

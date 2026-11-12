@@ -111,6 +111,12 @@ final class EventLocationCoordinator {
         guard locationId > 0 else { return }
 
         events.setEventLocationId(eventId: eventId, locationId: locationId)
+        events.setEventCentroid(
+            eventId: eventId,
+            latitude: coordinates.latitude,
+            longitude: coordinates.longitude,
+            clearTimeOnlyFlag: true
+        )
         events.clearEventLocationFields(eventId: eventId)
 
         if previousLocationId == locationId,
@@ -161,13 +167,14 @@ final class EventLocationCoordinator {
         guard let db = database.connection else { return nil }
 
         let sql = """
-        SELECT p.latitude, p.longitude
+        SELECT COALESCE(p.userLatitude, p.latitude),
+               COALESCE(p.userLongitude, p.longitude)
         FROM events e
         JOIN photos p ON p.id = e.coverPhotoId
         WHERE e.eventId = ?
           AND p.isDeleted = 0
-          AND p.latitude IS NOT NULL
-          AND p.longitude IS NOT NULL;
+          AND COALESCE(p.userLatitude, p.latitude) IS NOT NULL
+          AND COALESCE(p.userLongitude, p.longitude) IS NOT NULL;
         """
 
         var statement: OpaquePointer?
@@ -191,13 +198,15 @@ final class EventLocationCoordinator {
         guard let db = database.connection else { return [] }
 
         let sql = """
-        SELECT p.latitude, p.longitude, p.qualityScore
+        SELECT COALESCE(p.userLatitude, p.latitude),
+               COALESCE(p.userLongitude, p.longitude),
+               p.qualityScore
         FROM photos p
         JOIN photo_events pe ON p.id = pe.photoId
         WHERE pe.eventId = ?
           AND p.isDeleted = 0
-          AND p.latitude IS NOT NULL
-          AND p.longitude IS NOT NULL;
+          AND COALESCE(p.userLatitude, p.latitude) IS NOT NULL
+          AND COALESCE(p.userLongitude, p.longitude) IS NOT NULL;
         """
 
         var statement: OpaquePointer?

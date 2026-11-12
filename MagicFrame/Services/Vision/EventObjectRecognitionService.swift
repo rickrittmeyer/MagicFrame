@@ -78,28 +78,21 @@ final class EventObjectRecognitionService {
 
     private let database: DatabaseManager
     private let events: EventRepository
-    private let occasions: OccasionRepository
     private let objectTags: ObjectTagRepository
     private let eventTags: EventTagRepository
-    private let occasionScoring: OccasionScoringService
     private let planner: EventObjectRecognitionPlanner
 
     init(
         database: DatabaseManager,
         events: EventRepository,
-        occasions: OccasionRepository,
         objectTags: ObjectTagRepository,
-        eventTags: EventTagRepository,
-        occasionScoring: OccasionScoringService,
-        tuning: @escaping () -> EventTuningSettings
+        eventTags: EventTagRepository
     ) {
         self.database = database
         self.events = events
-        self.occasions = occasions
         self.objectTags = objectTags
         self.eventTags = eventTags
-        self.occasionScoring = occasionScoring
-        self.planner = EventObjectRecognitionPlanner(occasions: occasions, tuning: tuning)
+        self.planner = EventObjectRecognitionPlanner(eventTags: eventTags)
     }
 
     func runIfNeeded(
@@ -154,7 +147,6 @@ final class EventObjectRecognitionService {
         let createdAt = ISO8601DateFormatter().string(from: Date())
         var detectionsWritten = 0
         var photosScanned = 0
-        var stoppedEarly = false
         let categoryLabel = prepared.plans.map(\.category.displayName).joined(separator: ", ")
         let occasionKeys = prepared.plans.map(\.category.occasionKey)
 
@@ -186,63 +178,28 @@ final class EventObjectRecognitionService {
 
             photosScanned += 1
 
-            let shouldStop = database.sync { () -> (Bool, Int) in
-                objectTags.markPhotoVisionScannedUnsafe(
+            let written = database.sync { () -> Int in
+                let result = applyPhotoScanResultUnsafe(
+                    eventId: eventId,
                     photoId: photo.id,
-                    algorithmVersion: PhotoObjectVisionAnalyzer.algorithmVersion,
+                    detections: detections,
+                    occasionKeys: occasionKeys,
                     scannedAt: createdAt
                 )
-
-                var newDetections = 0
-                if !detections.isEmpty {
-                    newDetections = detections.count
-                    objectTags.upsertPhotoObjectTagsUnsafe(
-                        photoId: photo.id,
-                        detections: detections,
-                        source: "vision_v\(PhotoObjectVisionAnalyzer.algorithmVersion)",
-                        createdAt: createdAt
-                    )
-                }
-
-                objectTags.rebuildEventObjectTagsUnsafe(eventId: eventId, updatedAt: createdAt)
-                occasionScoring.scoreHolidayOccasionsOnDatabaseQueueUnsafe(
-                    eventId: eventId,
-                    occasionKeys: occasionKeys
-                )
-
-                let qualifies = occasionScoring.qualifiesForPostObjectHolidayTagOnDatabaseQueueUnsafe(
-                    eventId: eventId,
-                    occasionKeys: occasionKeys
-                )
-                return (qualifies, newDetections)
+                return result.detectionCount
             }
-            detectionsWritten += shouldStop.1
-
-            if shouldStop.0 {
-                database.sync {
-                    eventTags.markObjectRecognitionCompletedUnsafe(
-                        eventId: eventId,
-                        completedAt: createdAt,
-                        algorithmVersion: PhotoObjectVisionAnalyzer.algorithmVersion
-                    )
-                    occasionScoring.scoreHolidayEventOnDatabaseQueueUnsafe(eventId: eventId)
-                }
-                stoppedEarly = true
-                break
-            }
+            detectionsWritten += written
 
             await Task.yield()
         }
 
-        if !stoppedEarly {
-            database.sync {
-                eventTags.markObjectRecognitionCompletedUnsafe(
-                    eventId: eventId,
-                    completedAt: createdAt,
-                    algorithmVersion: PhotoObjectVisionAnalyzer.algorithmVersion
-                )
-                occasionScoring.scoreHolidayEventOnDatabaseQueueUnsafe(eventId: eventId)
-            }
+        database.sync {
+            finalizeEventObjectRecognitionUnsafe(
+                eventId: eventId,
+                occasionKeys: occasionKeys,
+                completedAt: createdAt,
+                stoppedEarly: false
+            )
         }
 
         return EventObjectRecognitionResult(
@@ -250,7 +207,7 @@ final class EventObjectRecognitionService {
             photosScanned: photosScanned,
             detectionsWritten: detectionsWritten,
             skippedReason: nil,
-            stoppedEarly: stoppedEarly,
+            stoppedEarly: false,
             scanCompleted: true
         )
     }
@@ -294,25 +251,7 @@ final class EventObjectRecognitionService {
         }
 
         objectTags.rebuildEventObjectTagsUnsafe(eventId: eventId, updatedAt: scannedAt)
-        occasionScoring.scoreHolidayOccasionsOnDatabaseQueueUnsafe(
-            eventId: eventId,
-            occasionKeys: occasionKeys
-        )
-
-        let qualifies = occasionScoring.qualifiesForPostObjectHolidayTagOnDatabaseQueueUnsafe(
-            eventId: eventId,
-            occasionKeys: occasionKeys
-        )
-        if qualifies {
-            finalizeEventObjectRecognitionUnsafe(
-                eventId: eventId,
-                occasionKeys: occasionKeys,
-                completedAt: scannedAt,
-                stoppedEarly: true
-            )
-            return (true, newDetections)
-        }
-
+        _ = occasionKeys
         return (false, newDetections)
     }
 
@@ -327,7 +266,6 @@ final class EventObjectRecognitionService {
             completedAt: completedAt,
             algorithmVersion: PhotoObjectVisionAnalyzer.algorithmVersion
         )
-        occasionScoring.scoreHolidayEventOnDatabaseQueueUnsafe(eventId: eventId)
         _ = stoppedEarly
         _ = occasionKeys
     }
@@ -352,8 +290,6 @@ final class EventObjectRecognitionService {
             )
         }
 
-        occasionScoring.scoreHolidayEventOnDatabaseQueueUnsafe(eventId: eventId)
-
         var plans = planner.planCategoriesUnsafe(eventId: eventId)
         if plans.isEmpty,
            let forcedOccasionKey,
@@ -363,7 +299,7 @@ final class EventObjectRecognitionService {
         guard !plans.isEmpty else {
             return PreparedRun(
                 shouldRun: false,
-                skippedReason: "No holiday metadata pass qualified for object detection.",
+                skippedReason: "No holiday tag or forced category for object detection.",
                 plans: [],
                 photos: [],
                 targetObjectKeys: [],
@@ -400,7 +336,6 @@ final class EventObjectRecognitionService {
                 completedAt: completedAt,
                 algorithmVersion: PhotoObjectVisionAnalyzer.algorithmVersion
             )
-            occasionScoring.scoreHolidayEventOnDatabaseQueueUnsafe(eventId: eventId)
             return PreparedRun(
                 shouldRun: false,
                 skippedReason: nil,

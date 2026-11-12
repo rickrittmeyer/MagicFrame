@@ -4,6 +4,7 @@ struct MilestonePersonPickerSheet: View {
 
     let kind: MilestonePersonPickerKind
     let items: [MilestonePersonPickerItem]
+    var titleOverride: String? = nil
     let onSelect: (MilestonePersonPickerItem) -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -40,7 +41,7 @@ struct MilestonePersonPickerSheet: View {
                     }
                 }
             }
-            .navigationTitle(kind.navigationTitle)
+            .navigationTitle(titleOverride ?? kind.navigationTitle)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {

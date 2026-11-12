@@ -16,7 +16,8 @@ protocol PhotoRepositoryProtocol: AnyObject {
         isScreenshot: Bool,
         aspectRatio: Double,
         orientation: String,
-        qualityScore: Int
+        qualityScore: Int,
+        duration: Double?
     )
     func markPhotosDeletedIfMissing(currentIds: Set<String>)
     func getRecentPhotos(limit: Int) -> [IndexedPhoto]

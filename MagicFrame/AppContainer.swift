@@ -9,29 +9,38 @@ final class AppContainer {
     let metadata: AppMetadataStore
     let photos: PhotoRepository
     let people: PeopleRepository
-    let peopleImport: PeopleImportService
     let albums: AlbumRepository
     let photoTextMetadata: PhotoTextMetadataRepository
+    let photoExif: PhotoExifRepository
     let albumImport: AlbumImportService
     let photoTextMetadataImport: PhotoTextMetadataImportService
+    let photoExifImport: PhotoExifImportService
     let metadataEnrichment: MetadataEnrichmentService
     let events: EventRepository
-    let occasions: OccasionRepository
     let eventTags: EventTagRepository
     let objectTags: ObjectTagRepository
     let visionJobs: VisionJobRepository
-    let photoOccasions: PhotoOccasionRepository
-    let landingMetricsCache: OccasionLandingMetricsCache
+    let faceRecognition: FaceRecognitionRepository
+    let pictureSearches: PictureSearchRepository
+    let holidays: HolidayRepository
+    private(set) lazy var faceRecognitionService: FaceRecognitionService = FaceRecognitionService(
+        database: databaseManager,
+        faces: faceRecognition,
+        people: people
+    )
+
     private(set) lazy var visionJobEnqueue: VisionJobEnqueueService = VisionJobEnqueueService(
         database: databaseManager,
         visionJobs: visionJobs,
         eventObjectRecognition: eventObjectRecognition,
-        eventTags: eventTags
+        eventTags: eventTags,
+        faceRecognition: faceRecognition
     )
 
     private(set) lazy var visionJobProcessor: VisionJobProcessor = VisionJobProcessor(
         database: databaseManager,
-        eventObjectRecognition: eventObjectRecognition
+        eventObjectRecognition: eventObjectRecognition,
+        faceRecognition: faceRecognitionService
     )
 
     private(set) lazy var visionJobCoordinator: VisionJobCoordinator = VisionJobCoordinator(
@@ -43,31 +52,15 @@ final class AppContainer {
     private(set) lazy var eventObjectRecognition: EventObjectRecognitionService = EventObjectRecognitionService(
         database: databaseManager,
         events: events,
-        occasions: occasions,
         objectTags: objectTags,
-        eventTags: eventTags,
-        occasionScoring: occasionScoring,
-        tuning: { [weak self] in
-            self?.photoDatabase.eventTuningUnsafe() ?? .defaults
-        }
+        eventTags: eventTags
     )
 
-    private(set) lazy var occasionScoring: OccasionScoringService = OccasionScoringService(
-        database: databaseManager,
-        occasions: occasions,
-        events: events,
-        holidayTags: OccasionHolidayTagService(
-            database: databaseManager,
-            eventTags: eventTags,
-            tuning: { [weak self] in
-                self?.photoDatabase.eventTuningUnsafe() ?? .defaults
-            }
-        ),
-        tuning: { [weak self] in
-            self?.photoDatabase.eventTuningUnsafe() ?? .defaults
-        }
-    )
     let locations: LocationRepository
+    let stadiums: StadiumRepository
+    private(set) lazy var sportsGameLookup: SportsGameLookupService = SportsGameLookupService(
+        stadiums: stadiums
+    )
     let geocodePendingQueue: LocationGeocodePendingQueue
 
     private(set) lazy var photoDatabase: PhotoDatabase = PhotoDatabase(container: self)
@@ -107,33 +100,32 @@ final class AppContainer {
         metadata = AppMetadataStore(database: databaseManager)
         photos = PhotoRepository(database: databaseManager, metadata: metadata)
         people = PeopleRepository(database: databaseManager)
-        peopleImport = PeopleImportService(people: people)
         albums = AlbumRepository(database: databaseManager)
         photoTextMetadata = PhotoTextMetadataRepository(database: databaseManager)
-        albumImport = AlbumImportService(albums: albums, photos: photos, people: people)
+        photoExif = PhotoExifRepository(database: databaseManager)
+        albumImport = AlbumImportService(albums: albums, photos: photos)
         photoTextMetadataImport = PhotoTextMetadataImportService(
             photos: photos,
             textMetadata: photoTextMetadata
         )
+        photoExifImport = PhotoExifImportService(repository: photoExif)
         metadataEnrichment = MetadataEnrichmentService(
             albumImport: albumImport,
             photoTextImport: photoTextMetadataImport,
             database: databaseManager
         )
         events = EventRepository(database: databaseManager, photos: photos)
-        occasions = OccasionRepository(database: databaseManager, metadata: metadata)
         eventTags = EventTagRepository(database: databaseManager)
         objectTags = ObjectTagRepository(database: databaseManager)
         visionJobs = VisionJobRepository(database: databaseManager)
-        photoOccasions = PhotoOccasionRepository(
+        faceRecognition = FaceRecognitionRepository(database: databaseManager)
+        holidays = HolidayRepository(database: databaseManager)
+        pictureSearches = PictureSearchRepository(
             database: databaseManager,
-            metadata: metadata
-        )
-        landingMetricsCache = OccasionLandingMetricsCache(
-            database: databaseManager,
-            metadata: metadata
+            holidays: holidays
         )
         locations = LocationRepository(database: databaseManager, events: events)
+        stadiums = StadiumRepository(database: databaseManager)
         photos.bindLocations(locations)
         geocodePendingQueue = LocationGeocodePendingQueue(
             database: databaseManager,
@@ -145,14 +137,9 @@ final class AppContainer {
             migrateLegacyHomeLocations: locations.migrateLegacyHomeLocations,
             migrateTripSubEventChildNames: events.migrateTripSubEventChildNamesIfNeeded,
             repairStaleGeocodeStatuses: locations.repairStaleGeocodeStatuses,
-            seedOccasionsIfNeeded: { [occasions] in
-                occasions.ensureDefaultSeedData()
-            },
-            backfillPhotoOccasionFromLegacyOnFrame: { [photoOccasions] in
-                _ = photoOccasions.backfillFromLegacyOnFrameIfNeeded()
-            },
             backfillEventAttributeTagsFromColumns: { [eventTags] in
                 eventTags.backfillAttributeTagsFromColumnsIfNeeded()
+                eventTags.migrateMisclassifiedMilestoneEventTypesIfNeeded()
             }
         ))
     }

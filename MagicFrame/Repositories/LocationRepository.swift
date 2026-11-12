@@ -222,11 +222,15 @@ final class LocationRepository {
     }
 
     func startGeocodingAllPending() {
-        LocationGeocodeCoordinator.shared.enqueueAllPendingFromDatabase()
+        if #available(iOS 26.0, *) {
+            LocationGeocodeCoordinator.shared.enqueueAllPendingFromDatabase()
+        }
     }
 
     func startGeocodingEventLocations(limit: Int? = nil) {
-        LocationGeocodeCoordinator.shared.enqueueEventLocationsMissingDetails(limit: limit)
+        if #available(iOS 26.0, *) {
+            LocationGeocodeCoordinator.shared.enqueueEventLocationsMissingDetails(limit: limit)
+        }
     }
 
     func completeLocationGeocode(
@@ -2011,13 +2015,15 @@ final class LocationRepository {
 
         if !isLocationGeocodeComplete(locationId: homeLocationId) {
             resetLocationGeocodeToPending(locationId: homeLocationId)
-            LocationGeocodeCoordinator.shared.enqueue([
-                PendingLocation(
-                    locationId: homeLocationId,
-                    latitude: homeLatitude,
-                    longitude: homeLongitude
-                )
-            ])
+            if #available(iOS 26.0, *) {
+                LocationGeocodeCoordinator.shared.enqueue([
+                    PendingLocation(
+                        locationId: homeLocationId,
+                        latitude: homeLatitude,
+                        longitude: homeLongitude
+                    )
+                ])
+            }
         }
     }
 

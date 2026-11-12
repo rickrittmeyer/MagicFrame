@@ -85,8 +85,7 @@ struct AnniversaryTagPropagationService {
             eventTags.upsertAIAttributeTagUnsafe(
                 eventId: eventId,
                 field: field,
-                tagValue: value,
-                appliedPhase: .postObject
+                tagValue: value
             )
             appliedAny = true
         }

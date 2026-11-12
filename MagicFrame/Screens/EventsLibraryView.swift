@@ -6,16 +6,20 @@ struct EventsLibraryView: View {
     var listFilter: EventListFilter = .allEvents
     var emptyHint: String = "No events yet."
     var isBusy: Bool = false
-    var showsHiddenEvents: Bool = false
+    var isSelecting: Bool = false
+    var selectedEventIds: Set<Int> = []
+    var onToggleSelection: ((Int) -> Void)? = nil
     let onEventUpdated: (Int) -> Void
     let onEventHidden: (Int) -> Void
     let onEventUnhidden: (Int) -> Void
     var scrollTarget: EventListScrollTarget? = nil
     var onScrollTargetHandled: (() -> Void)? = nil
-    var onConfirmAIAttributeTag: ((Int, EventAttributeTag) -> Void)? = nil
-    var onRemoveAIAttributeTag: ((Int, EventAttributeTag) -> Void)? = nil
     var onExpandedYearChanged: ((Int) -> Void)? = nil
-    var prefersFastSlideshowThumbnails: Bool = false
+    /// When set, scrolls to the section whose `year` id matches (month sections use YYYYMM).
+    var pendingScrollSectionId: Int? = nil
+    var onPendingScrollHandled: (() -> Void)? = nil
+    /// Sticky month-style headers (All Events) vs divider headers (Sport/Team, milestones).
+    var usesStickyMonthHeaders: Bool = false
     @Binding var expandedYear: Int?
 
     @State private var handledScrollRequestID: UUID?
@@ -39,57 +43,14 @@ struct EventsLibraryView: View {
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
-                        LazyVStack(spacing: 0) {
+                        LazyVStack(spacing: 0, pinnedViews: usesStickyMonthHeaders ? [.sectionHeaders] : []) {
                             ForEach(eventSections) { section in
-                                VStack(spacing: 12) {
-                                    yearBanner(section)
-                                        .id(section.year)
-
-                                    if expandedYear == section.year {
-                                        ForEach(section.items) { item in
-                                            NavigationLink {
-                                                EventDetailView(
-                                                    event: item.event,
-                                                    onEventUpdated: onEventUpdated,
-                                                    onEventHidden: onEventHidden,
-                                                    onEventUnhidden: onEventUnhidden
-                                                )
-                                            } label: {
-                                                EventLibraryRowView(
-                                                    event: item.event,
-                                                    slideshowPhotoIds: item.slideshowPhotoIds,
-                                                    slideshowQuality: prefersFastSlideshowThumbnails
-                                                        ? .fast
-                                                        : .high,
-                                                    showsHiddenBadge: showsHiddenEvents,
-                                                    onHide: showsHiddenEvents
-                                                        ? nil
-                                                        : { onEventHidden(item.event.eventId) },
-                                                    onUnhide: showsHiddenEvents
-                                                        ? { onEventUnhidden(item.event.eventId) }
-                                                        : nil,
-                                                    onConfirmAIAttributeTag: { tag in
-                                                        onConfirmAIAttributeTag?(
-                                                            item.event.eventId,
-                                                            tag
-                                                        )
-                                                    },
-                                                    onRemoveAIAttributeTag: { tag in
-                                                        onRemoveAIAttributeTag?(
-                                                            item.event.eventId,
-                                                            tag
-                                                        )
-                                                    }
-                                                )
-                                                .contentShape(Rectangle())
-                                            }
-                                            .buttonStyle(.plain)
-                                            .padding(.horizontal, 16)
-                                            .id(item.id)
-                                        }
-                                    }
+                                switch section.presentation {
+                                case .yearAccordion:
+                                    yearAccordionSection(section)
+                                case .flatAlwaysVisible:
+                                    flatSection(section)
                                 }
-                                .padding(.bottom, 4)
                             }
                         }
                         .padding(.bottom, 16)
@@ -108,9 +69,111 @@ struct EventsLibraryView: View {
                             self.expandedYear = nil
                         }
                     }
+                    .onChange(of: pendingScrollSectionId) { _, sectionId in
+                        guard let sectionId else { return }
+                        withAnimation(.easeInOut(duration: 0.25)) {
+                            proxy.scrollTo(sectionId, anchor: .top)
+                        }
+                        onPendingScrollHandled?()
+                    }
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private func yearAccordionSection(_ section: EventYearSection) -> some View {
+        VStack(spacing: 12) {
+            yearBanner(section)
+                .id(section.year)
+
+            if expandedYear == section.year {
+                eventRows(for: section)
+            }
+        }
+        .padding(.bottom, 4)
+    }
+
+    @ViewBuilder
+    private func flatSection(_ section: EventYearSection) -> some View {
+        Section {
+            VStack(spacing: 12) {
+                eventRows(for: section)
+            }
+            .padding(.bottom, 4)
+        } header: {
+            if let title = section.headerTitle {
+                if usesStickyMonthHeaders {
+                    monthSectionHeader(title)
+                        .id(section.year)
+                } else {
+                    sectionDividerHeader(title)
+                        .id(section.year)
+                }
+            }
+        }
+    }
+
+    private func monthSectionHeader(_ title: String) -> some View {
+        Text(title)
+            .font(.headline)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(Color(.systemBackground))
+            .accessibilityAddTraits(.isHeader)
+    }
+
+    @ViewBuilder
+    private func eventRows(for section: EventYearSection) -> some View {
+        ForEach(section.items) { item in
+            let isSelected = selectedEventIds.contains(item.id)
+
+            Group {
+                if isSelecting {
+                    Button {
+                        onToggleSelection?(item.id)
+                    } label: {
+                        eventRowLabel(item: item, isSelected: isSelected)
+                    }
+                    .buttonStyle(.plain)
+                } else {
+                    NavigationLink {
+                        EventDetailView(
+                            event: item.event,
+                            onEventUpdated: onEventUpdated,
+                            onEventHidden: onEventHidden,
+                            onEventUnhidden: onEventUnhidden
+                        )
+                    } label: {
+                        eventRowLabel(item: item, isSelected: false)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 16)
+            .id(item.id)
+        }
+    }
+
+    private func eventRowLabel(item: EventListDisplayItem, isSelected: Bool) -> some View {
+        EventLibraryRowView(
+            event: item.event,
+            slideshowPhotoIds: item.slideshowPhotoIds,
+            gameCoverScoreBoard: item.gameCoverScoreBoard,
+            gameSuggestedName: item.gameSuggestedName,
+            slideshowQuality: .high
+        )
+        .contentShape(Rectangle())
+        .overlay(alignment: .topTrailing) {
+            if isSelecting {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.title2)
+                    .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                    .padding(20)
+            }
+        }
+        .opacity(isSelecting && !isSelected ? 0.85 : 1)
     }
 
     private func scrollToTargetEvent(using proxy: ScrollViewProxy) {
@@ -122,7 +185,7 @@ struct EventsLibraryView: View {
             return
         }
 
-        if expandedYear != section.year {
+        if section.presentation == .yearAccordion, expandedYear != section.year {
             expandedYear = section.year
             onExpandedYearChanged?(section.year)
         }
@@ -140,6 +203,21 @@ struct EventsLibraryView: View {
             handledScrollRequestID = requestID
             onScrollTargetHandled?()
         }
+    }
+
+    private func sectionDividerHeader(_ title: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.primary)
+
+            Divider()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 16)
+        .padding(.top, 20)
+        .padding(.bottom, 4)
+        .accessibilityAddTraits(.isHeader)
     }
 
     private func yearBanner(_ section: EventYearSection) -> some View {

@@ -33,7 +33,8 @@ final class VisionJobCoordinator {
         database: DatabaseManager,
         visionJobs: VisionJobRepository,
         processor: VisionJobProcessor,
-        batchSize: Int = 3,
+        // Face scans are memory-heavy; claim one job at a time so CGImages drain between photos.
+        batchSize: Int = 1,
         idleSleepMilliseconds: Int = 250
     ) {
         self.database = database
@@ -138,6 +139,10 @@ final class VisionJobCoordinator {
                 }
 
                 refreshPendingCount()
+                // Longer pause lets Photos/Vision release cached decode buffers.
+                if job.jobType == .faceRecognitionScan {
+                    try? await Task.sleep(nanoseconds: 150_000_000)
+                }
                 await Task.yield()
             }
         }
@@ -161,6 +166,8 @@ final class VisionJobCoordinator {
             return "Analyzing face metrics"
         case .faceCropScan:
             return "Analyzing face crop"
+        case .faceRecognitionScan:
+            return "Recognizing faces"
         }
     }
 

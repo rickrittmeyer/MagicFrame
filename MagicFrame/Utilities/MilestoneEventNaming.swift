@@ -55,28 +55,69 @@ enum MilestoneEventNaming {
         }
     }
 
+    /// Fills `{person1}`, `{person2}`, and `{tagValue}` in an `event_name_templates` row.
+    /// Wedding seeds use bride=`person1`, groom=`person2` → `{person2} and {person1}'s Wedding`.
+    static func applyNameTemplate(
+        _ template: String,
+        person1: String?,
+        person2: String?,
+        tagValue: String
+    ) -> String? {
+        let trimmedTemplate = template.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTemplate.isEmpty else { return nil }
+
+        let first = person1?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let second = person2?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        if trimmedTemplate.contains("{person1}"), first.isEmpty { return nil }
+        if trimmedTemplate.contains("{person2}"), second.isEmpty { return nil }
+
+        let tag = tagValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedTemplate
+            .replacingOccurrences(of: "{person1}", with: first)
+            .replacingOccurrences(of: "{person2}", with: second)
+            .replacingOccurrences(of: "{tagValue}", with: tag)
+    }
+
     static func suggestCoupleEventName(
         person1: String,
         person2: String,
         milestoneType: String?,
         weddingDateISO: String?,
-        eventStartDate: String
+        eventStartDate: String,
+        nameTemplate: EventNameTemplate? = nil
     ) -> String? {
+        let first = person1.trimmingCharacters(in: .whitespacesAndNewlines)
+        let second = person2.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let nameTemplate,
+           let named = applyNameTemplate(
+               nameTemplate.nameTemplate,
+               person1: first,
+               person2: second.isEmpty ? nil : second,
+               tagValue: nameTemplate.tagValue
+           ) {
+            return named
+        }
+
         guard let kind = MilestonePersonPickerKind.from(milestoneType: milestoneType),
               kind.isCoupleMilestone else {
             return nil
         }
 
-        let first = person1.trimmingCharacters(in: .whitespacesAndNewlines)
-        let second = person2.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !first.isEmpty, !second.isEmpty else { return nil }
-
-        let coupleName = "\(first) & \(second)'s"
 
         switch kind {
         case .wedding:
-            return "\(coupleName) Wedding"
+            // Fallback if template row missing: bride=person1, groom=person2.
+            return applyNameTemplate(
+                "{person2} and {person1}'s Wedding",
+                person1: first,
+                person2: second,
+                tagValue: "Wedding"
+            )
         case .anniversary:
+            let coupleName = "\(first) & \(second)'s"
             guard let weddingDateISO,
                   let weddingDate = EventDateParser.parseDate(weddingDateISO),
                   let eventDate = EventDateParser.parseDate(eventStartDate),
@@ -87,6 +128,19 @@ enum MilestoneEventNaming {
         default:
             return nil
         }
+    }
+
+    static func suggestTemplatedEventName(
+        nameTemplate: EventNameTemplate,
+        person1: String?,
+        person2: String?
+    ) -> String? {
+        applyNameTemplate(
+            nameTemplate.nameTemplate,
+            person1: person1,
+            person2: person2,
+            tagValue: nameTemplate.tagValue
+        )
     }
 
     private static func yearsBetween(

@@ -1,7 +1,7 @@
 import Foundation
 import SQLite3
 
-/// SQLite access for `events`, `photo_events`, and `event_people`.
+/// SQLite access for `events` and `photo_events` (people via live `photo_people` joins).
 final class EventRepository {
 
     static let shared = EventRepository()
@@ -152,79 +152,149 @@ final class EventRepository {
     }
 
     func updateCoverPhotoForEvent(eventId: Int) {
-
-    let sql = """
-    SELECT p.id
-    FROM photos p
-    JOIN photo_events pe
-        ON p.id = pe.photoId
-    WHERE (
-        pe.eventId = ?
-        OR pe.eventId IN (
-            SELECT child.eventId
-            FROM events child
-            WHERE child.parentEventId = ?
-              AND child.isDeleted = 0
+        applyCoverPhotoSelection(
+            eventId: eventId,
+            photoId: fetchGenericCoverPhotoIdUnsafe(eventId: eventId)
         )
-    )
-      AND p.isDeleted = 0
-      AND COALESCE(pe.manuallyExcluded, 0) = 0
-    ORDER BY
-        p.isFavorite DESC,
-        p.qualityScore DESC,
-        p.creationDate DESC
-    LIMIT 1;
-    """
+    }
 
-    var statement: OpaquePointer?
-    var coverPhotoId: String?
-
-    if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
-
-        sqlite3_bind_int(statement, 1, Int32(eventId))
-        sqlite3_bind_int(statement, 2, Int32(eventId))
-
-        if sqlite3_step(statement) == SQLITE_ROW {
-
-            coverPhotoId =
-                String(
-                    cString:
-                        sqlite3_column_text(statement, 0)
-                )
+    /// Prefers Vision Bride+Groom photos, then Bride or Groom alone, then generic cover ranking.
+    func updateWeddingCoverPhotoForEvent(eventId: Int) {
+        sync {
+            updateWeddingCoverPhotoForEventUnsafe(eventId: eventId)
         }
     }
 
-    sqlite3_finalize(statement)
-
-    guard let coverPhotoId = coverPhotoId else {
-        clearCoverPhotoForEvent(eventId: eventId)
-        return
-    }
-
-    let updateSQL = """
-    UPDATE events
-    SET coverPhotoId = ?
-    WHERE eventId = ?;
-    """
-
-    if sqlite3_prepare_v2(db, updateSQL, -1, &statement, nil) == SQLITE_OK {
-
-        sqlite3_bind_text(
-            statement,
-            1,
-            (coverPhotoId as NSString).utf8String,
-            -1,
-            nil
+    func updateWeddingCoverPhotoForEventUnsafe(eventId: Int) {
+        applyCoverPhotoSelection(
+            eventId: eventId,
+            photoId: fetchWeddingCoverPhotoIdUnsafe(eventId: eventId)
+                ?? fetchGenericCoverPhotoIdUnsafe(eventId: eventId)
         )
-
-        sqlite3_bind_int(statement, 2, Int32(eventId))
-
-        sqlite3_step(statement)
     }
 
-    sqlite3_finalize(statement)
+    private func fetchGenericCoverPhotoIdUnsafe(eventId: Int) -> String? {
+        let sql = """
+        SELECT p.id
+        FROM photos p
+        JOIN photo_events pe
+            ON p.id = pe.photoId
+        WHERE (
+            pe.eventId = ?
+            OR pe.eventId IN (
+                SELECT child.eventId
+                FROM events child
+                WHERE child.parentEventId = ?
+                  AND child.isDeleted = 0
+            )
+        )
+          AND p.isDeleted = 0
+          AND COALESCE(p.mediaType, 1) != 2
+          AND COALESCE(pe.manuallyExcluded, 0) = 0
+        ORDER BY
+            p.isFavorite DESC,
+            p.qualityScore DESC,
+            p.creationDate DESC
+        LIMIT 1;
+        """
 
-    print("Updated cover photo for event \(eventId)")
+        var statement: OpaquePointer?
+        var coverPhotoId: String?
+
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            sqlite3_bind_int(statement, 1, Int32(eventId))
+            sqlite3_bind_int(statement, 2, Int32(eventId))
+            if sqlite3_step(statement) == SQLITE_ROW {
+                coverPhotoId = String(cString: sqlite3_column_text(statement, 0))
+            }
+        }
+
+        sqlite3_finalize(statement)
+        return coverPhotoId
+    }
+
+    private func fetchWeddingCoverPhotoIdUnsafe(eventId: Int) -> String? {
+        let sql = """
+        SELECT
+            p.id,
+            CASE
+                WHEN bride.photoId IS NOT NULL AND groom.photoId IS NOT NULL THEN 2
+                WHEN bride.photoId IS NOT NULL OR groom.photoId IS NOT NULL THEN 1
+                ELSE 0
+            END AS weddingTier,
+            COALESCE(bride.confidence, 0) + COALESCE(groom.confidence, 0) AS tagScore
+        FROM photos p
+        JOIN photo_events pe
+            ON p.id = pe.photoId
+        LEFT JOIN photo_object_tags bride
+            ON bride.photoId = p.id
+           AND LOWER(bride.objectKey) = 'bride'
+        LEFT JOIN photo_object_tags groom
+            ON groom.photoId = p.id
+           AND LOWER(groom.objectKey) = 'groom'
+        WHERE (
+            pe.eventId = ?
+            OR pe.eventId IN (
+                SELECT child.eventId
+                FROM events child
+                WHERE child.parentEventId = ?
+                  AND child.isDeleted = 0
+            )
+        )
+          AND p.isDeleted = 0
+          AND COALESCE(p.mediaType, 1) != 2
+          AND COALESCE(pe.manuallyExcluded, 0) = 0
+        ORDER BY
+            weddingTier DESC,
+            tagScore DESC,
+            p.isFavorite DESC,
+            p.qualityScore DESC,
+            p.creationDate DESC
+        LIMIT 1;
+        """
+
+        var statement: OpaquePointer?
+        var coverPhotoId: String?
+
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            sqlite3_bind_int(statement, 1, Int32(eventId))
+            sqlite3_bind_int(statement, 2, Int32(eventId))
+            if sqlite3_step(statement) == SQLITE_ROW {
+                coverPhotoId = String(cString: sqlite3_column_text(statement, 0))
+            }
+        }
+
+        sqlite3_finalize(statement)
+        return coverPhotoId
+    }
+
+    private func applyCoverPhotoSelection(eventId: Int, photoId: String?) {
+        guard let coverPhotoId = photoId else {
+            clearCoverPhotoForEvent(eventId: eventId)
+            return
+        }
+
+        let updateSQL = """
+        UPDATE events
+        SET coverPhotoId = ?
+        WHERE eventId = ?;
+        """
+
+        var statement: OpaquePointer?
+        if sqlite3_prepare_v2(db, updateSQL, -1, &statement, nil) == SQLITE_OK {
+            sqlite3_bind_text(
+                statement,
+                1,
+                (coverPhotoId as NSString).utf8String,
+                -1,
+                nil
+            )
+            sqlite3_bind_int(statement, 2, Int32(eventId))
+            sqlite3_step(statement)
+        }
+
+        sqlite3_finalize(statement)
+        print("Updated cover photo for event \(eventId)")
     }
 
 
@@ -324,31 +394,6 @@ final class EventRepository {
     }
 
 
-    func rebuildEventPeople() {
-    let deleteSQL = "DELETE FROM event_people;"
-    sqlite3_exec(db, deleteSQL, nil, nil, nil)
-
-    let sql = """
-    INSERT INTO event_people (eventId, personId, photoCount)
-    SELECT
-        pe.eventId,
-        pp.personId,
-        COUNT(*) as photoCount
-    FROM photo_events pe
-    JOIN photo_people pp ON pe.photoId = pp.photoId
-    JOIN photos p ON p.id = pe.photoId
-    WHERE p.isDeleted = 0
-    GROUP BY pe.eventId, pp.personId;
-    """
-
-    if sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK {
-        print("Event people rebuilt")
-        // debugEventPeopleCount omitted
-    } else {
-        print("Failed to rebuild event people: \(String(cString: sqlite3_errmsg(db)))")
-    }
-    }
-
     struct EventPersonRecord: Sendable, Equatable {
         let personId: Int
         let name: String
@@ -362,31 +407,39 @@ final class EventRepository {
     }
 
     func fetchEventPeopleUnsafe(eventId: Int, includeChildEvents: Bool) -> [EventPersonRecord] {
-        let sql: String
+        // On-demand from photo_people (no denormalized event_people table).
+        let eventScopeSQL: String
         if includeChildEvents {
-            sql = """
-            SELECT ep.personId, p.name, SUM(ep.photoCount) AS photoCount
-            FROM event_people ep
-            JOIN people p ON ep.personId = p.personId
-            WHERE ep.eventId = ?
-               OR ep.eventId IN (
-                   SELECT child.eventId
-                   FROM events child
-                   WHERE child.parentEventId = ?
-                     AND child.isDeleted = 0
-               )
-            GROUP BY ep.personId, p.name
-            ORDER BY photoCount DESC, p.name COLLATE NOCASE ASC;
+            eventScopeSQL = """
+            (
+                pev.eventId = ?
+                OR pev.eventId IN (
+                    SELECT child.eventId
+                    FROM events child
+                    WHERE child.parentEventId = ?
+                      AND child.isDeleted = 0
+                )
+            )
             """
         } else {
-            sql = """
-            SELECT ep.personId, p.name, ep.photoCount
-            FROM event_people ep
-            JOIN people p ON ep.personId = p.personId
-            WHERE ep.eventId = ?
-            ORDER BY ep.photoCount DESC, p.name COLLATE NOCASE ASC;
-            """
+            eventScopeSQL = "pev.eventId = ?"
         }
+
+        let sql = """
+        SELECT pp.personId, p.displayName, COUNT(DISTINCT pp.photoId) AS photoCount
+        FROM photo_events pev
+        JOIN photos ph
+            ON ph.id = pev.photoId
+           AND ph.isDeleted = 0
+        JOIN photo_people pp
+            ON pp.photoId = pev.photoId
+        JOIN people p
+            ON p.personId = pp.personId
+        WHERE \(eventScopeSQL)
+          AND TRIM(COALESCE(p.displayName, '')) != ''
+        GROUP BY pp.personId, p.displayName
+        ORDER BY photoCount DESC, p.displayName COLLATE NOCASE ASC;
+        """
 
         var statement: OpaquePointer?
         var records: [EventPersonRecord] = []
@@ -437,6 +490,78 @@ final class EventRepository {
     }
 
 
+    func setEventFavorite(eventId: Int, isFavorite: Bool) {
+    let now = ISO8601DateFormatter().string(from: Date())
+
+    let sql = """
+    UPDATE events
+    SET isFavorite = ?,
+        updatedAt = ?
+    WHERE eventId = ?;
+    """
+
+    var statement: OpaquePointer?
+
+    if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+        sqlite3_bind_int(statement, 1, isFavorite ? 1 : 0)
+        sqlite3_bind_text(statement, 2, (now as NSString).utf8String, -1, nil)
+        sqlite3_bind_int(statement, 3, Int32(eventId))
+        sqlite3_step(statement)
+    }
+
+    sqlite3_finalize(statement)
+    }
+
+
+    /// Parent list-event ids that have at least one photo marked on frame (includeInSlideshow),
+    /// including photos attached to trip child days.
+    func listEventIdsWithOnFramePhotos(among eventIds: [Int]) -> Set<Int> {
+        let unique = Array(Set(eventIds.filter { $0 > 0 }))
+        guard !unique.isEmpty else { return [] }
+
+        var result = Set<Int>()
+        let chunkSize = 400
+        for chunkStart in stride(from: 0, to: unique.count, by: chunkSize) {
+            let chunk = Array(unique[chunkStart..<min(chunkStart + chunkSize, unique.count)])
+            let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ", ")
+            let sql = """
+            SELECT DISTINCT listEventId FROM (
+                SELECT e.eventId AS listEventId
+                FROM events e
+                JOIN photo_events pe ON pe.eventId = e.eventId
+                JOIN photos p ON p.id = pe.photoId
+                WHERE e.eventId IN (\(placeholders))
+                  AND e.isDeleted = 0
+                  AND p.isDeleted = 0
+                  AND COALESCE(pe.includeInSlideshow, 0) = 1
+                UNION
+                SELECT e.parentEventId AS listEventId
+                FROM events e
+                JOIN photo_events pe ON pe.eventId = e.eventId
+                JOIN photos p ON p.id = pe.photoId
+                WHERE e.parentEventId IN (\(placeholders))
+                  AND e.isDeleted = 0
+                  AND p.isDeleted = 0
+                  AND COALESCE(pe.includeInSlideshow, 0) = 1
+            );
+            """
+
+            var statement: OpaquePointer?
+            if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+                for (index, eventId) in chunk.enumerated() {
+                    sqlite3_bind_int(statement, Int32(index + 1), Int32(eventId))
+                    sqlite3_bind_int(statement, Int32(chunk.count + index + 1), Int32(eventId))
+                }
+                while sqlite3_step(statement) == SQLITE_ROW {
+                    result.insert(Int(sqlite3_column_int(statement, 0)))
+                }
+            }
+            sqlite3_finalize(statement)
+        }
+        return result
+    }
+
+
     func setEventUserHidden(eventId: Int, hidden: Bool) {
     let now = ISO8601DateFormatter().string(from: Date())
 
@@ -474,18 +599,18 @@ final class EventRepository {
         }
     }
 
-    let column = field.sqlColumn
     let sql = """
-    SELECT DISTINCT \(column)
-    FROM events
-    WHERE isDeleted = 0
-      AND \(column) IS NOT NULL
-      AND TRIM(\(column)) != '';
+    SELECT DISTINCT tagValue
+    FROM event_tags
+    WHERE isRejected = 0
+      AND tagCategory = ?
+      AND TRIM(tagValue) != '';
     """
 
     var statement: OpaquePointer?
 
     if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+        sqlite3_bind_text(statement, 1, (field.tagCategory as NSString).utf8String, -1, nil)
         while sqlite3_step(statement) == SQLITE_ROW {
             if let value = sqliteOptionalText(statement, column: 0) {
                 options.insert(value)
@@ -494,6 +619,25 @@ final class EventRepository {
     }
 
     sqlite3_finalize(statement)
+
+    // Main-person options also include the secondary category / multi-value rows.
+    if field == .mainPerson {
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            sqlite3_bind_text(
+                statement,
+                1,
+                (EventAttributeField.secondaryMainPerson.tagCategory as NSString).utf8String,
+                -1,
+                nil
+            )
+            while sqlite3_step(statement) == SQLITE_ROW {
+                if let value = sqliteOptionalText(statement, column: 0) {
+                    options.insert(value)
+                }
+            }
+        }
+        sqlite3_finalize(statement)
+    }
 
     if field == .eventType {
         options = Set(
@@ -513,22 +657,24 @@ final class EventRepository {
 
     func migrateLegacyTripEventTypeAttribute() {
     let now = ISO8601DateFormatter().string(from: Date())
-    let clearSQL = """
-    UPDATE events
-    SET eventType = NULL,
-        updatedAt = ?
-    WHERE isDeleted = 0
-      AND LOWER(TRIM(COALESCE(eventType, ''))) = 'trip';
-    """
 
-    var statement: OpaquePointer?
-
-    if sqlite3_prepare_v2(db, clearSQL, -1, &statement, nil) == SQLITE_OK {
-        sqlite3_bind_text(statement, 1, (now as NSString).utf8String, -1, nil)
-        sqlite3_step(statement)
+    // Clear pre-archive column if it still exists.
+    if let db,
+       SQLiteMigrations.columnExists(table: "events", column: "eventType", on: db) {
+        let clearSQL = """
+        UPDATE events
+        SET eventType = NULL,
+            updatedAt = ?
+        WHERE isDeleted = 0
+          AND LOWER(TRIM(COALESCE(eventType, ''))) = 'trip';
+        """
+        var statement: OpaquePointer?
+        if sqlite3_prepare_v2(db, clearSQL, -1, &statement, nil) == SQLITE_OK {
+            sqlite3_bind_text(statement, 1, (now as NSString).utf8String, -1, nil)
+            sqlite3_step(statement)
+        }
+        sqlite3_finalize(statement)
     }
-
-    sqlite3_finalize(statement)
 
     guard let custom = getAppMetadata(key: "customEventTypes"),
           !custom.isEmpty else {
@@ -577,30 +723,28 @@ final class EventRepository {
     field: EventAttributeField,
     value: String?
     ) {
-    let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
-    let storedValue = (trimmed?.isEmpty ?? true) ? nil : trimmed
+    // Classification is stored only in `event_tags` (see EventTagRepository).
+    // Touch updatedAt so list caches refresh.
+    _ = field
+    _ = value
     let now = ISO8601DateFormatter().string(from: Date())
-    let column = field.sqlColumn
-
     let sql = """
     UPDATE events
-    SET \(column) = ?,
-        updatedAt = ?
+    SET updatedAt = ?
     WHERE eventId = ?;
     """
 
     var statement: OpaquePointer?
 
     if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
-        bindOptionalText(storedValue, to: statement, index: 1)
-        sqlite3_bind_text(statement, 2, (now as NSString).utf8String, -1, nil)
-        sqlite3_bind_int(statement, 3, Int32(eventId))
+        sqlite3_bind_text(statement, 1, (now as NSString).utf8String, -1, nil)
+        sqlite3_bind_int(statement, 2, Int32(eventId))
 
         if sqlite3_step(statement) != SQLITE_DONE {
-            print("Failed to update \(column): \(String(cString: sqlite3_errmsg(db)))")
+            print("Failed to touch event updatedAt: \(String(cString: sqlite3_errmsg(db)))")
         }
     } else {
-        print("Failed to prepare update \(column): \(String(cString: sqlite3_errmsg(db)))")
+        print("Failed to prepare touch event updatedAt: \(String(cString: sqlite3_errmsg(db)))")
     }
 
     sqlite3_finalize(statement)
@@ -687,25 +831,20 @@ final class EventRepository {
         COALESCE(e.state, l.state) as state,
         COALESCE(e.placeName, l.placeName) as placeName,
         e.coverPhotoId,
-        COUNT(DISTINCT CASE WHEN ph.isDeleted = 0 THEN pe.photoId END) as photoCount,
-        GROUP_CONCAT(DISTINCT p.name) as peopleNames,
+        COUNT(DISTINCT CASE WHEN ph.isDeleted = 0 AND COALESCE(ph.mediaType, 1) != 2 THEN pe.photoId END) as photoCount,
+        GROUP_CONCAT(DISTINCT p.displayName) as peopleNames,
         e.showAsSlideshowEvent,
         e.userEditedName,
         l.nickname as locationNickname,
         e.locationId,
         e.parentEventId,
         e.isTripEvent,
-        e.eventType,
-        e.activityType,
-        e.milestoneType,
-        e.holidayType,
-        e.eventMainPerson,
-        e.eventMainPerson2,
         e.weddingDate,
-        e.tripType,
         e.childEventName,
         COALESCE(e.userEditedChildEventName, 0) as userEditedChildEventName,
-        COALESCE(e.isUserHidden, 0) as isUserHidden
+        COALESCE(e.isUserHidden, 0) as isUserHidden,
+        COUNT(DISTINCT CASE WHEN ph.isDeleted = 0 AND COALESCE(ph.mediaType, 1) = 2 THEN pe.photoId END) as videoCount,
+        COALESCE(e.isFavorite, 0) as isFavorite
     FROM events e
     LEFT JOIN locations l
         ON e.locationId = l.locationId
@@ -713,10 +852,11 @@ final class EventRepository {
         ON e.eventId = pe.eventId
     LEFT JOIN photos ph
         ON pe.photoId = ph.id
-    LEFT JOIN event_people ep
-        ON e.eventId = ep.eventId
+    LEFT JOIN photo_people pp
+        ON pp.photoId = pe.photoId
+       AND COALESCE(ph.isDeleted, 0) = 0
     LEFT JOIN people p
-        ON ep.personId = p.personId
+        ON p.personId = pp.personId
     WHERE e.isDeleted = 0
       AND COALESCE(e.isUserHidden, 0) = 0
       AND e.parentEventId IS NULL
@@ -738,17 +878,11 @@ final class EventRepository {
         e.locationId,
         e.parentEventId,
         e.isTripEvent,
-        e.eventType,
-        e.activityType,
-        e.milestoneType,
-        e.holidayType,
-        e.eventMainPerson,
-        e.eventMainPerson2,
         e.weddingDate,
-        e.tripType,
         e.childEventName,
         e.userEditedChildEventName,
-        e.isUserHidden
+        e.isUserHidden,
+        e.isFavorite
     ORDER BY e.startDate DESC;
     """
 
@@ -1273,101 +1407,14 @@ final class EventRepository {
         return eventIds
     }
 
-    func countBirthdayOccasionEventsUnsafe(
-        occasionKey: String,
+    func countBirthdayPersonEventsUnsafe(
+        personId: Int,
         includeHidden: Bool = false
     ) -> Int {
-        let key = escapeSQLLiteral(occasionKey)
-        let hiddenFilter = includeHidden
-            ? "AND COALESCE(e.isUserHidden, 0) = 1"
-            : "AND COALESCE(e.isUserHidden, 0) = 0"
-        let dateOverlapSQL = birthdayOccasionDateOverlapSQL(eventAlias: "e", occasionAlias: "o")
-        let sql = """
-        SELECT COUNT(*) FROM (
-            SELECT e.eventId
-            FROM occasions o
-            JOIN photo_people pp ON pp.personId = o.personId
-            JOIN photo_events pe ON pe.photoId = pp.photoId
-            JOIN photos ph ON ph.id = pe.photoId AND ph.isDeleted = 0
-            JOIN events leaf ON leaf.eventId = pe.eventId AND leaf.isDeleted = 0
-            JOIN events e ON e.eventId = COALESCE(leaf.parentEventId, leaf.eventId)
-                AND e.isDeleted = 0
-                AND e.parentEventId IS NULL
-                \(hiddenFilter)
-            WHERE o.occasionKey = '\(key)'
-              AND o.personId IS NOT NULL
-              AND \(dateOverlapSQL)
-            GROUP BY e.eventId
-
-            UNION
-
-            SELECT e.eventId
-            FROM occasions o
-            JOIN people per ON per.personId = o.personId
-            JOIN events e ON e.isDeleted = 0
-                AND e.parentEventId IS NULL
-                \(hiddenFilter)
-                AND TRIM(COALESCE(e.eventMainPerson, '')) = per.name
-            WHERE o.occasionKey = '\(key)'
-              AND o.personId IS NOT NULL
-              AND \(dateOverlapSQL)
-              AND EXISTS (
-                  SELECT 1
-                  FROM photo_events pe
-                  JOIN photos ph ON ph.id = pe.photoId AND ph.isDeleted = 0
-                  WHERE pe.eventId = e.eventId
-                     OR pe.eventId IN (
-                         SELECT child.eventId
-                         FROM events child
-                         WHERE child.parentEventId = e.eventId
-                           AND child.isDeleted = 0
-                     )
-              )
-            GROUP BY e.eventId
-
-            UNION
-
-            SELECT e.eventId
-            FROM occasions o
-            JOIN event_people ep ON ep.personId = o.personId
-            JOIN events e ON e.eventId = ep.eventId
-                AND e.isDeleted = 0
-                AND e.parentEventId IS NULL
-                \(hiddenFilter)
-            WHERE o.occasionKey = '\(key)'
-              AND o.personId IS NOT NULL
-              AND \(dateOverlapSQL)
-              AND EXISTS (
-                  SELECT 1
-                  FROM photo_events pe
-                  JOIN photos ph ON ph.id = pe.photoId AND ph.isDeleted = 0
-                  WHERE pe.eventId = e.eventId
-                     OR pe.eventId IN (
-                         SELECT child.eventId
-                         FROM events child
-                         WHERE child.parentEventId = e.eventId
-                           AND child.isDeleted = 0
-                     )
-              )
-            GROUP BY e.eventId
-        );
-        """
-
-        var statement: OpaquePointer?
-        var count = 0
-
-        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK,
-           sqlite3_step(statement) == SQLITE_ROW {
-            count = Int(sqlite3_column_int(statement, 0))
-        } else if let db {
-            print(
-                "Failed to count birthday occasion events:"
-                    + " \(String(cString: sqlite3_errmsg(db)))"
-            )
-        }
-
-        sqlite3_finalize(statement)
-        return count
+        countListEventsUnsafe(
+            includeHidden: includeHidden,
+            filter: .birthdayPerson(personId: personId, displayName: "")
+        )
     }
 
     func countListEventsUnsafe(
@@ -1430,14 +1477,15 @@ final class EventRepository {
         let scopeFilter = listScopeFilterSQL(filter: filter)
         let peopleSelect = forList
             ? "NULL as peopleNames"
-            : "GROUP_CONCAT(DISTINCT p.name) as peopleNames"
+            : "GROUP_CONCAT(DISTINCT p.displayName) as peopleNames"
         let peopleJoins = forList
             ? ""
             : """
-            LEFT JOIN event_people ep
-                ON e.eventId = ep.eventId
+            LEFT JOIN photo_people pp
+                ON pp.photoId = pe.photoId
+               AND COALESCE(ph.isDeleted, 0) = 0
             LEFT JOIN people p
-                ON ep.personId = p.personId
+                ON p.personId = pp.personId
             """
         var sql = """
     SELECT
@@ -1451,7 +1499,7 @@ final class EventRepository {
         COALESCE(e.state, l.state) as state,
         COALESCE(e.placeName, l.placeName) as placeName,
         e.coverPhotoId,
-        COUNT(DISTINCT CASE WHEN ph.isDeleted = 0 THEN pe.photoId END) as photoCount,
+        COUNT(DISTINCT CASE WHEN ph.isDeleted = 0 AND COALESCE(ph.mediaType, 1) != 2 THEN pe.photoId END) as photoCount,
         \(peopleSelect),
         e.showAsSlideshowEvent,
         e.userEditedName,
@@ -1459,17 +1507,12 @@ final class EventRepository {
         e.locationId,
         e.parentEventId,
         e.isTripEvent,
-        e.eventType,
-        e.activityType,
-        e.milestoneType,
-        e.holidayType,
-        e.eventMainPerson,
-        e.eventMainPerson2,
         e.weddingDate,
-        e.tripType,
         e.childEventName,
         COALESCE(e.userEditedChildEventName, 0) as userEditedChildEventName,
-        COALESCE(e.isUserHidden, 0) as isUserHidden
+        COALESCE(e.isUserHidden, 0) as isUserHidden,
+        COUNT(DISTINCT CASE WHEN ph.isDeleted = 0 AND COALESCE(ph.mediaType, 1) = 2 THEN pe.photoId END) as videoCount,
+        COALESCE(e.isFavorite, 0) as isFavorite
     FROM events e
     LEFT JOIN locations l
         ON e.locationId = l.locationId
@@ -1505,17 +1548,11 @@ final class EventRepository {
         e.locationId,
         e.parentEventId,
         e.isTripEvent,
-        e.eventType,
-        e.activityType,
-        e.milestoneType,
-        e.holidayType,
-        e.eventMainPerson,
-        e.eventMainPerson2,
         e.weddingDate,
-        e.tripType,
         e.childEventName,
         e.userEditedChildEventName,
-        e.isUserHidden
+        e.isUserHidden,
+        e.isFavorite
     HAVING COUNT(DISTINCT CASE WHEN ph.isDeleted = 0 THEN pe.photoId END) > 0
     ORDER BY e.startDate DESC
     """
@@ -1558,25 +1595,20 @@ final class EventRepository {
         COALESCE(e.state, l.state) as state,
         COALESCE(e.placeName, l.placeName) as placeName,
         e.coverPhotoId,
-        COUNT(DISTINCT CASE WHEN ph.isDeleted = 0 THEN pe.photoId END) as photoCount,
-        GROUP_CONCAT(DISTINCT p.name) as peopleNames,
+        COUNT(DISTINCT CASE WHEN ph.isDeleted = 0 AND COALESCE(ph.mediaType, 1) != 2 THEN pe.photoId END) as photoCount,
+        GROUP_CONCAT(DISTINCT p.displayName) as peopleNames,
         e.showAsSlideshowEvent,
         e.userEditedName,
         l.nickname as locationNickname,
         e.locationId,
         e.parentEventId,
         e.isTripEvent,
-        e.eventType,
-        e.activityType,
-        e.milestoneType,
-        e.holidayType,
-        e.eventMainPerson,
-        e.eventMainPerson2,
         e.weddingDate,
-        e.tripType,
         e.childEventName,
         COALESCE(e.userEditedChildEventName, 0) as userEditedChildEventName,
-        COALESCE(e.isUserHidden, 0) as isUserHidden
+        COALESCE(e.isUserHidden, 0) as isUserHidden,
+        COUNT(DISTINCT CASE WHEN ph.isDeleted = 0 AND COALESCE(ph.mediaType, 1) = 2 THEN pe.photoId END) as videoCount,
+        COALESCE(e.isFavorite, 0) as isFavorite
     FROM events e
     LEFT JOIN locations l
         ON e.locationId = l.locationId
@@ -1590,10 +1622,11 @@ final class EventRepository {
         )
     LEFT JOIN photos ph
         ON pe.photoId = ph.id
-    LEFT JOIN event_people ep
-        ON e.eventId = ep.eventId
+    LEFT JOIN photo_people pp
+        ON pp.photoId = pe.photoId
+       AND COALESCE(ph.isDeleted, 0) = 0
     LEFT JOIN people p
-        ON ep.personId = p.personId
+        ON p.personId = pp.personId
     WHERE e.isDeleted = 0
       AND e.eventId = ?
     GROUP BY
@@ -1613,17 +1646,11 @@ final class EventRepository {
         e.locationId,
         e.parentEventId,
         e.isTripEvent,
-        e.eventType,
-        e.activityType,
-        e.milestoneType,
-        e.holidayType,
-        e.eventMainPerson,
-        e.eventMainPerson2,
         e.weddingDate,
-        e.tripType,
         e.childEventName,
         e.userEditedChildEventName,
-        e.isUserHidden;
+        e.isUserHidden,
+        e.isFavorite;
     """
 
     var statement: OpaquePointer?
@@ -1703,17 +1730,12 @@ final class EventRepository {
 
     let isTripEvent = sqlite3_column_int(statement, 17) == 1
 
-    let eventType = sqliteOptionalText(statement, column: 18)
-    let activityType = sqliteOptionalText(statement, column: 19)
-    let milestoneType = sqliteOptionalText(statement, column: 20)
-    let holidayType = sqliteOptionalText(statement, column: 21)
-    let eventMainPerson = sqliteOptionalText(statement, column: 22)
-    let eventMainPerson2 = sqliteOptionalText(statement, column: 23)
-    let weddingDate = sqliteOptionalText(statement, column: 24)
-    let tripType = sqliteOptionalText(statement, column: 25)
-    let childEventName = sqliteOptionalText(statement, column: 26)
-    let userEditedChildEventName = sqlite3_column_int(statement, 27) == 1
-    let isUserHidden = sqlite3_column_int(statement, 28) == 1
+    let weddingDate = sqliteOptionalText(statement, column: 18)
+    let childEventName = sqliteOptionalText(statement, column: 19)
+    let userEditedChildEventName = sqlite3_column_int(statement, 20) == 1
+    let isUserHidden = sqlite3_column_int(statement, 21) == 1
+    let videoCount = Int(sqlite3_column_int(statement, 22))
+    let isFavorite = sqlite3_column_int(statement, 23) == 1
 
     return IndexedEvent(
         eventId: eventId,
@@ -1721,6 +1743,7 @@ final class EventRepository {
         startDate: startDate,
         endDate: endDate,
         photoCount: photoCount,
+        videoCount: videoCount,
         latitude: latitude,
         longitude: longitude,
         city: city,
@@ -1729,20 +1752,14 @@ final class EventRepository {
         people: people,
         coverPhotoId: coverPhotoId,
         showOnFrame: showOnFrame,
+        isFavorite: isFavorite,
         userEditedName: userEditedName,
         locationNickname: locationNickname,
         locationId: locationId,
         parentEventId: parentEventId,
         isTripEvent: isTripEvent,
-        eventType: eventType,
-        activityType: activityType,
-        milestoneType: milestoneType,
-        holidayType: holidayType,
         attributeTags: [],
-        eventMainPerson: eventMainPerson,
-        eventMainPerson2: eventMainPerson2,
         weddingDate: weddingDate,
-        tripType: tripType,
         childEventName: childEventName,
         userEditedChildEventName: userEditedChildEventName,
         isUserHidden: isUserHidden
@@ -1813,6 +1830,7 @@ final class EventRepository {
         JOIN events e ON pe.eventId = e.eventId
         LEFT JOIN photo_people pp ON p.id = pp.photoId
         WHERE p.isDeleted = 0
+          AND COALESCE(p.mediaType, 1) != 2
           AND COALESCE(pe.includeInSlideshow, 0) = 1
           AND COALESCE(pe.manuallyExcluded, 0) = 0
           AND e.isDeleted = 0
@@ -1871,23 +1889,29 @@ final class EventRepository {
 
 
     func setPhotoShowOnFrame(photoId: String, eventId: Int, show: Bool) {
-    let sql = """
-    UPDATE photo_events
-    SET includeInSlideshow = ?
-    WHERE photoId = ?
-      AND eventId = ?;
-    """
-
-    var statement: OpaquePointer?
-
-    if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
-        sqlite3_bind_int(statement, 1, show ? 1 : 0)
-        sqlite3_bind_text(statement, 2, (photoId as NSString).utf8String, -1, nil)
-        sqlite3_bind_int(statement, 3, Int32(eventId))
-        sqlite3_step(statement)
+        sync {
+            setPhotoShowOnFrameUnsafe(photoId: photoId, eventId: eventId, show: show)
+        }
     }
 
-    sqlite3_finalize(statement)
+    func setPhotoShowOnFrameUnsafe(photoId: String, eventId: Int, show: Bool) {
+        let sql = """
+        UPDATE photo_events
+        SET includeInSlideshow = ?
+        WHERE photoId = ?
+          AND eventId = ?;
+        """
+
+        var statement: OpaquePointer?
+
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            sqlite3_bind_int(statement, 1, show ? 1 : 0)
+            sqlite3_bind_text(statement, 2, (photoId as NSString).utf8String, -1, nil)
+            sqlite3_bind_int(statement, 3, Int32(eventId))
+            sqlite3_step(statement)
+        }
+
+        sqlite3_finalize(statement)
     }
 
 
@@ -1924,7 +1948,6 @@ final class EventRepository {
 
     updateEventSummary(eventId: eventId)
     updateCoverPhotoForEvent(eventId: eventId)
-    rebuildEventPeople()
     cleanupEmptyEvents()
     }
 
@@ -1940,7 +1963,8 @@ final class EventRepository {
            p.faceEyesOpenScore, p.faceSmileScore,
            COALESCE(pe.includeInSlideshow, 0) as showOnFrame,
            COALESCE(pe.manuallyExcluded, 0) as manuallyExcluded,
-           COALESCE(pe.isSimilarGroupPick, 0) as isSimilarGroupPick
+           COALESCE(pe.isSimilarGroupPick, 0) as isSimilarGroupPick,
+           COALESCE(p.mediaType, 1) as mediaType
     FROM photos p
     JOIN photo_events pe ON p.id = pe.photoId
     WHERE (
@@ -2118,8 +2142,6 @@ final class EventRepository {
             refreshed.insert(parentId)
         }
     }
-
-    rebuildEventPeople()
     }
 
 
@@ -2154,6 +2176,7 @@ final class EventRepository {
         let showOnFrame = sqlite3_column_int(statement, 14) == 1
         let isHiddenInEvent = sqlite3_column_int(statement, 15) == 1
         let isSimilarGroupPick = sqlite3_column_int(statement, 16) == 1
+        let isVideo = sqlite3_column_int(statement, 17) == 2
 
         return IndexedPhoto(
             id: photo.id,
@@ -2172,7 +2195,8 @@ final class EventRepository {
             faceSmileScore: photo.faceSmileScore,
             showOnFrame: showOnFrame,
             isHiddenInEvent: isHiddenInEvent,
-            isSimilarGroupPick: isSimilarGroupPick
+            isSimilarGroupPick: isSimilarGroupPick,
+            isVideo: isVideo
         )
     }
 
@@ -2215,25 +2239,20 @@ final class EventRepository {
         COALESCE(e.state, l.state) as state,
         COALESCE(e.placeName, l.placeName) as placeName,
         e.coverPhotoId,
-        COUNT(DISTINCT CASE WHEN ph.isDeleted = 0 THEN pe.photoId END) as photoCount,
-        GROUP_CONCAT(DISTINCT p.name) as peopleNames,
+        COUNT(DISTINCT CASE WHEN ph.isDeleted = 0 AND COALESCE(ph.mediaType, 1) != 2 THEN pe.photoId END) as photoCount,
+        GROUP_CONCAT(DISTINCT p.displayName) as peopleNames,
         e.showAsSlideshowEvent,
         e.userEditedName,
         l.nickname as locationNickname,
         e.locationId,
         e.parentEventId,
         e.isTripEvent,
-        e.eventType,
-        e.activityType,
-        e.milestoneType,
-        e.holidayType,
-        e.eventMainPerson,
-        e.eventMainPerson2,
         e.weddingDate,
-        e.tripType,
         e.childEventName,
         COALESCE(e.userEditedChildEventName, 0) as userEditedChildEventName,
-        COALESCE(e.isUserHidden, 0) as isUserHidden
+        COALESCE(e.isUserHidden, 0) as isUserHidden,
+        COUNT(DISTINCT CASE WHEN ph.isDeleted = 0 AND COALESCE(ph.mediaType, 1) = 2 THEN pe.photoId END) as videoCount,
+        COALESCE(e.isFavorite, 0) as isFavorite
     FROM events e
     LEFT JOIN locations l
         ON e.locationId = l.locationId
@@ -2241,10 +2260,11 @@ final class EventRepository {
         ON e.eventId = pe.eventId
     LEFT JOIN photos ph
         ON pe.photoId = ph.id
-    LEFT JOIN event_people ep
-        ON e.eventId = ep.eventId
+    LEFT JOIN photo_people pp
+        ON pp.photoId = pe.photoId
+       AND COALESCE(ph.isDeleted, 0) = 0
     LEFT JOIN people p
-        ON ep.personId = p.personId
+        ON p.personId = pp.personId
     WHERE e.isDeleted = 0
       AND e.parentEventId = ?
     GROUP BY
@@ -2264,17 +2284,11 @@ final class EventRepository {
         e.locationId,
         e.parentEventId,
         e.isTripEvent,
-        e.eventType,
-        e.activityType,
-        e.milestoneType,
-        e.holidayType,
-        e.eventMainPerson,
-        e.eventMainPerson2,
         e.weddingDate,
-        e.tripType,
         e.childEventName,
         e.userEditedChildEventName,
-        e.isUserHidden
+        e.isUserHidden,
+        e.isFavorite
     ORDER BY e.startDate ASC;
     """
 
@@ -2504,6 +2518,115 @@ final class EventRepository {
 
         sqlite3_finalize(statement)
         return rows
+    }
+
+    struct SameDayLocatedEvent {
+        let eventId: Int
+        let startDate: Date
+        let endDate: Date
+        let startDay: Date
+        let endDay: Date
+        let isSingleDay: Bool
+        let isLeaf: Bool
+    }
+
+    /// One read of every GPS-backed event, so same-day matching does not query per photo.
+    func fetchSameDayLocatedEvents() -> [SameDayLocatedEvent] {
+        let calendar = Calendar.current
+        let sql = """
+        SELECT eventId, startDate, endDate,
+               (
+                   SELECT COUNT(*)
+                   FROM events child
+                   WHERE child.parentEventId = events.eventId
+                     AND child.isDeleted = 0
+               ) AS childCount
+        FROM events
+        WHERE isDeleted = 0
+          AND COALESCE(isUserHidden, 0) = 0
+          AND COALESCE(clusteredByTimeOnly, 0) = 0
+          AND latitude IS NOT NULL
+          AND longitude IS NOT NULL
+          AND TRIM(COALESCE(startDate, '')) != ''
+          AND TRIM(COALESCE(endDate, '')) != '';
+        """
+
+        var statement: OpaquePointer?
+        var located: [SameDayLocatedEvent] = []
+
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let eventId = Int(sqlite3_column_int(statement, 0))
+                guard let startString = sqliteOptionalText(statement, column: 1),
+                      let endString = sqliteOptionalText(statement, column: 2),
+                      let startDate = Self.iso8601Formatter.date(from: startString),
+                      let endDate = Self.iso8601Formatter.date(from: endString) else {
+                    continue
+                }
+                let startDay = calendar.startOfDay(for: startDate)
+                let endDay = calendar.startOfDay(for: endDate)
+                located.append(
+                    SameDayLocatedEvent(
+                        eventId: eventId,
+                        startDate: startDate,
+                        endDate: endDate,
+                        startDay: startDay,
+                        endDay: endDay,
+                        isSingleDay: startDay == endDay,
+                        isLeaf: sqlite3_column_int(statement, 3) == 0
+                    )
+                )
+            }
+        } else {
+            print(
+                "Failed to load same-day located events: \(String(cString: sqlite3_errmsg(db!)))"
+            )
+        }
+
+        sqlite3_finalize(statement)
+        return located
+    }
+
+    func bestSameDayLocatedEvent(
+        photoDate: Date,
+        in locatedEvents: [SameDayLocatedEvent]
+    ) -> Int? {
+        let calendar = Calendar.current
+        let photoDay = calendar.startOfDay(for: photoDate)
+
+        struct Candidate {
+            let eventId: Int
+            let gap: TimeInterval
+            let isSingleDay: Bool
+            let isLeaf: Bool
+        }
+
+        let candidates: [Candidate] = locatedEvents.compactMap { event in
+            guard event.startDay <= photoDay, photoDay <= event.endDay else { return nil }
+            return Candidate(
+                eventId: event.eventId,
+                gap: timeGapSeconds(
+                    photoDate: photoDate,
+                    startDate: event.startDate,
+                    endDate: event.endDate
+                ),
+                isSingleDay: event.isSingleDay,
+                isLeaf: event.isLeaf
+            )
+        }
+
+        return candidates.min { lhs, rhs in
+            if lhs.isSingleDay != rhs.isSingleDay { return lhs.isSingleDay }
+            if lhs.isLeaf != rhs.isLeaf { return lhs.isLeaf }
+            return lhs.gap < rhs.gap
+        }?.eventId
+    }
+
+    /// GPS-backed event on the photo's local calendar day.
+    /// A single-day event (the game) wins over a multi-day trip that merely covers that day.
+    /// When several single-day events exist, the closest in time wins.
+    func findSameDayLocatedEvent(photoDate: Date) -> Int? {
+        bestSameDayLocatedEvent(photoDate: photoDate, in: fetchSameDayLocatedEvents())
     }
 
     /// Best time-only event for a photo (date/time clustering; no GPS required on the event).
@@ -3320,6 +3443,30 @@ final class EventRepository {
         sqlite3_finalize(statement)
     }
 
+    func setEventCentroid(
+        eventId: Int,
+        latitude: Double,
+        longitude: Double,
+        clearTimeOnlyFlag: Bool
+    ) {
+        let sql = """
+        UPDATE events
+        SET latitude = ?,
+            longitude = ?,
+            clusteredByTimeOnly = CASE WHEN ? = 1 THEN 0 ELSE clusteredByTimeOnly END
+        WHERE eventId = ?;
+        """
+        var statement: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            sqlite3_bind_double(statement, 1, latitude)
+            sqlite3_bind_double(statement, 2, longitude)
+            sqlite3_bind_int(statement, 3, clearTimeOnlyFlag ? 1 : 0)
+            sqlite3_bind_int(statement, 4, Int32(eventId))
+            sqlite3_step(statement)
+        }
+        sqlite3_finalize(statement)
+    }
+
     func clearEventLocationFields(eventId: Int) {
         let sql = """
         UPDATE events
@@ -3353,98 +3500,6 @@ final class EventRepository {
         sqlite3_finalize(statement)
     }
 
-
-    // MARK: - Occasion scoring
-
-    func fetchEventOccasionScoringTargets() -> [EventOccasionScoringTarget] {
-        sync { fetchEventOccasionScoringTargetsUnsafe() }
-    }
-
-    func fetchEventOccasionScoringTargetsUnsafe() -> [EventOccasionScoringTarget] {
-        let sql = """
-        SELECT
-            e.eventId,
-            e.startDate,
-            e.endDate,
-            EXISTS (
-                SELECT 1
-                FROM events child
-                WHERE child.parentEventId = e.eventId
-                  AND child.isDeleted = 0
-            ) AS includesDescendantPhotos
-        FROM events e
-        WHERE e.isDeleted = 0
-          AND COALESCE(e.isUserHidden, 0) = 0
-          AND e.photoCount > 0
-        ORDER BY e.eventId;
-        """
-
-        var statement: OpaquePointer?
-        var targets: [EventOccasionScoringTarget] = []
-
-        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
-            while sqlite3_step(statement) == SQLITE_ROW {
-                let eventId = Int(sqlite3_column_int(statement, 0))
-                let startDate = sqliteOptionalText(statement, column: 1) ?? ""
-                let endDate = sqliteOptionalText(statement, column: 2) ?? startDate
-                let includesDescendantPhotos = sqlite3_column_int(statement, 3) != 0
-                targets.append(
-                    EventOccasionScoringTarget(
-                        eventId: eventId,
-                        startDateISO: startDate,
-                        endDateISO: endDate,
-                        includesDescendantPhotos: includesDescendantPhotos
-                    )
-                )
-            }
-        }
-
-        sqlite3_finalize(statement)
-        return targets
-    }
-
-    func fetchEventOccasionScoringTargetUnsafe(eventId: Int) -> EventOccasionScoringTarget? {
-        let sql = """
-        SELECT
-            e.eventId,
-            e.startDate,
-            e.endDate,
-            EXISTS (
-                SELECT 1
-                FROM events child
-                WHERE child.parentEventId = e.eventId
-                  AND child.isDeleted = 0
-            ) AS includesDescendantPhotos
-        FROM events e
-        WHERE e.eventId = ?
-          AND e.isDeleted = 0
-          AND COALESCE(e.isUserHidden, 0) = 0
-          AND e.photoCount > 0
-        LIMIT 1;
-        """
-
-        var statement: OpaquePointer?
-
-        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
-            sqlite3_bind_int(statement, 1, Int32(eventId))
-            if sqlite3_step(statement) == SQLITE_ROW {
-                let startDate = sqliteOptionalText(statement, column: 1) ?? ""
-                let endDate = sqliteOptionalText(statement, column: 2) ?? startDate
-                let includesDescendantPhotos = sqlite3_column_int(statement, 3) != 0
-                let target = EventOccasionScoringTarget(
-                    eventId: eventId,
-                    startDateISO: startDate,
-                    endDateISO: endDate,
-                    includesDescendantPhotos: includesDescendantPhotos
-                )
-                sqlite3_finalize(statement)
-                return target
-            }
-        }
-
-        sqlite3_finalize(statement)
-        return nil
-    }
 
     func isObjectRecognitionCompletedUnsafe(eventId: Int) -> Bool {
         let sql = """
@@ -3533,19 +3588,84 @@ final class EventRepository {
             return holidayTagExistsSQL(
                 tagValueClause: "AND ht.tagValue = '\(escapeSQLLiteral(value))'"
             )
-        case .birthdayOccasion(let occasionKey, _):
-            return birthdayOccasionExistsSQL(occasionKey: occasionKey)
+        case .anyMilestone:
+            return attributeTagExistsSQL(
+                category: EventAttributeField.milestoneType.tagCategory,
+                tagValueClause: ""
+            )
+        case .milestoneTag(let value):
+            return attributeTagExistsSQL(
+                category: EventAttributeField.milestoneType.tagCategory,
+                tagValueClause: "AND ht.tagValue = '\(escapeSQLLiteral(value))'"
+            )
+        case .milestoneTags(let values):
+            let cleaned = values
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            guard !cleaned.isEmpty else {
+                return attributeTagExistsSQL(
+                    category: EventAttributeField.milestoneType.tagCategory,
+                    tagValueClause: ""
+                )
+            }
+            let inList = cleaned
+                .map { "'\(escapeSQLLiteral($0))'" }
+                .joined(separator: ", ")
+            return attributeTagExistsSQL(
+                category: EventAttributeField.milestoneType.tagCategory,
+                tagValueClause: "AND ht.tagValue IN (\(inList))"
+            )
+        case .trips:
+            return "AND COALESCE(e.isTripEvent, 0) = 1"
+        case .anyActivity:
+            return attributeTagExistsSQL(
+                category: EventAttributeField.activityType.tagCategory,
+                tagValueClause: ""
+            )
+        case .activityTag(let value):
+            return attributeTagExistsSQL(
+                category: EventAttributeField.activityType.tagCategory,
+                tagValueClause: "AND ht.tagValue = '\(escapeSQLLiteral(value))'"
+            )
+        case .eventTypeTag(let value):
+            return attributeTagExistsSQL(
+                category: EventAttributeField.eventType.tagCategory,
+                tagValueClause: "AND ht.tagValue = '\(escapeSQLLiteral(value))'"
+            )
+        case .eventTypeTags(let values):
+            let cleaned = values
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            guard !cleaned.isEmpty else {
+                return attributeTagExistsSQL(
+                    category: EventAttributeField.eventType.tagCategory,
+                    tagValueClause: ""
+                )
+            }
+            let inList = cleaned
+                .map { "'\(escapeSQLLiteral($0))'" }
+                .joined(separator: ", ")
+            return attributeTagExistsSQL(
+                category: EventAttributeField.eventType.tagCategory,
+                tagValueClause: "AND ht.tagValue IN (\(inList))"
+            )
+        case .birthdayPerson(let personId, _):
+            return birthdayPersonExistsSQL(personId: personId)
         case .location(let locationId, _):
             return "AND e.locationId = \(locationId)"
         }
     }
 
     private func holidayTagExistsSQL(tagValueClause: String) -> String {
+        attributeTagExistsSQL(category: "holiday", tagValueClause: tagValueClause)
+    }
+
+    private func attributeTagExistsSQL(category: String, tagValueClause: String) -> String {
         """
         AND EXISTS (
             SELECT 1
             FROM event_tags ht
-            WHERE ht.tagCategory = 'holiday'
+            WHERE ht.tagCategory = '\(escapeSQLLiteral(category))'
               AND ht.isRejected = 0
               \(tagValueClause)
               AND (
@@ -3561,46 +3681,54 @@ final class EventRepository {
         """
     }
 
-    private func birthdayOccasionDateOverlapSQL(
+    /// Event date window overlaps birthday month/day (±3 days) for years near the event.
+    private func birthdayPersonDateOverlapSQL(
         eventAlias: String,
-        occasionAlias: String
+        personAlias: String
     ) -> String {
-        """
-        EXISTS (
-            SELECT 1
-            FROM occasion_dates od
-            WHERE od.occasionId = \(occasionAlias).occasionId
-              AND od.year >= CAST(substr(\(eventAlias).startDate, 1, 4) AS INTEGER) - 1
-              AND od.year <= CAST(substr(\(eventAlias).endDate, 1, 4) AS INTEGER) + 1
-              AND date(substr(\(eventAlias).startDate, 1, 10)) <= date(
-                  COALESCE(od.observedDate, od.date),
-                  '+' || CAST(COALESCE(\(occasionAlias).defaultWindowDaysAfter, 3) AS TEXT) || ' days'
-              )
-              AND date(substr(\(eventAlias).endDate, 1, 10)) >= date(
-                  COALESCE(od.observedDate, od.date),
-                  '-' || CAST(COALESCE(\(occasionAlias).defaultWindowDaysBefore, 3) AS TEXT) || ' days'
-              )
+        let windowDays = 3
+        func yearOverlap(_ yearSQL: String) -> String {
+            """
+            (
+                date(substr(\(eventAlias).startDate, 1, 10)) <= date(
+                    printf('%04d-', \(yearSQL)) || substr(\(personAlias).birthDate, 6, 5),
+                    '+\(windowDays) days'
+                )
+                AND date(substr(\(eventAlias).endDate, 1, 10)) >= date(
+                    printf('%04d-', \(yearSQL)) || substr(\(personAlias).birthDate, 6, 5),
+                    '-\(windowDays) days'
+                )
+            )
+            """
+        }
+        return """
+        (
+            \(yearOverlap("CAST(substr(\(eventAlias).startDate, 1, 4) AS INTEGER)"))
+            OR \(yearOverlap("CAST(substr(\(eventAlias).endDate, 1, 4) AS INTEGER)"))
+            OR \(yearOverlap("CAST(substr(\(eventAlias).startDate, 1, 4) AS INTEGER) - 1"))
+            OR \(yearOverlap("CAST(substr(\(eventAlias).startDate, 1, 4) AS INTEGER) + 1"))
         )
         """
     }
 
-    private func birthdayOccasionExistsSQL(occasionKey: String) -> String {
-        let key = escapeSQLLiteral(occasionKey)
-        let dateOverlapSQL = birthdayOccasionDateOverlapSQL(eventAlias: "e", occasionAlias: "o")
+    private func birthdayPersonExistsSQL(personId: Int) -> String {
+        let dateOverlapSQL = birthdayPersonDateOverlapSQL(eventAlias: "e", personAlias: "p")
         return """
         AND EXISTS (
             SELECT 1
-            FROM occasions o
-            WHERE o.occasionKey = '\(key)'
+            FROM people p
+            WHERE p.personId = \(personId)
+              AND p.birthDate IS NOT NULL
+              AND TRIM(p.birthDate) != ''
+              AND length(p.birthDate) >= 10
               AND \(dateOverlapSQL)
               AND (
-                  o.personId IS NULL
-                  OR EXISTS (
+                  EXISTS (
                       SELECT 1
                       FROM photo_events pe_b
                       JOIN photo_people pp ON pp.photoId = pe_b.photoId
                       JOIN photos ph_b ON ph_b.id = pp.photoId AND ph_b.isDeleted = 0
-                      WHERE pp.personId = o.personId
+                      WHERE pp.personId = p.personId
                         AND (
                             pe_b.eventId = e.eventId
                             OR pe_b.eventId IN (
@@ -3611,14 +3739,13 @@ final class EventRepository {
                             )
                         )
                   )
-                  OR TRIM(COALESCE(e.eventMainPerson, '')) = (
-                      SELECT name FROM people WHERE personId = o.personId
-                  )
                   OR EXISTS (
                       SELECT 1
-                      FROM event_people ep
-                      WHERE ep.eventId = e.eventId
-                        AND ep.personId = o.personId
+                      FROM event_tags et_main
+                      WHERE et_main.eventId = e.eventId
+                        AND et_main.isRejected = 0
+                        AND et_main.tagCategory IN ('eventMainPerson', 'eventMainPerson2')
+                        AND TRIM(et_main.tagValue) = p.displayName
                   )
               )
         )
@@ -3665,7 +3792,9 @@ final class EventRepository {
 
     private func listScopeFilterSQL(filter: EventListFilter) -> String {
         switch filter {
-        case .allEvents, .anyHoliday, .holidayTag, .birthdayOccasion, .location:
+        case .allEvents, .anyHoliday, .holidayTag, .anyMilestone, .milestoneTag, .milestoneTags,
+             .trips, .anyActivity, .activityTag, .eventTypeTag, .eventTypeTags,
+             .birthdayPerson, .location:
             return "AND e.parentEventId IS NULL"
         }
     }

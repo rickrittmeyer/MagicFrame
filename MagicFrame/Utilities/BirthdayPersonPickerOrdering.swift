@@ -86,13 +86,11 @@ enum BirthdayPersonPickerOrdering {
 
 enum EventMilestonePersonPickerOrdering {
 
-    static func items(
-        eventPeople: [EventRepository.EventPersonRecord],
-        allPeople: [PeopleRepository.PersonRecord]
+    /// People in the event only, most photo appearances first.
+    static func eventPeopleByPhotoCount(
+        eventPeople: [EventRepository.EventPersonRecord]
     ) -> [MilestonePersonPickerItem] {
-        let eventPersonIds = Set(eventPeople.map(\.personId))
-
-        let inEvent = eventPeople
+        eventPeople
             .sorted { lhs, rhs in
                 if lhs.photoCount != rhs.photoCount {
                     return lhs.photoCount > rhs.photoCount
@@ -106,6 +104,14 @@ enum EventMilestonePersonPickerOrdering {
                     birthDateISO: nil
                 )
             }
+    }
+
+    static func items(
+        eventPeople: [EventRepository.EventPersonRecord],
+        allPeople: [PeopleRepository.PersonRecord]
+    ) -> [MilestonePersonPickerItem] {
+        let eventPersonIds = Set(eventPeople.map(\.personId))
+        let inEvent = eventPeopleByPhotoCount(eventPeople: eventPeople)
 
         let notInEvent = allPeople
             .filter { !eventPersonIds.contains($0.personId) }

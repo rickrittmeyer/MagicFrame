@@ -22,7 +22,7 @@ final class LocationGeocodePendingQueue {
 
         if database.isOnQueue {
             pending.append(item)
-        } else {
+        } else if #available(iOS 26.0, *) {
             LocationGeocodeCoordinator.shared.enqueue([item])
         }
     }
@@ -31,6 +31,8 @@ final class LocationGeocodePendingQueue {
         guard !pending.isEmpty else { return }
         let batch = pending
         pending = []
-        LocationGeocodeCoordinator.shared.enqueue(batch)
+        if #available(iOS 26.0, *) {
+            LocationGeocodeCoordinator.shared.enqueue(batch)
+        }
     }
 }

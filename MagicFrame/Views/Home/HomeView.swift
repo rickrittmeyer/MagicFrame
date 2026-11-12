@@ -20,11 +20,6 @@ struct HomeView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
-                Text(vm.statusText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
                 HomeCategoryGridView(vm: vm)
 
                 if vm.archivePhotoCount > 0 {
@@ -43,6 +38,9 @@ struct HomeView: View {
         }
         .navigationTitle("Home")
         .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            vm.clearEventsTabFocus()
+        }
         .task {
             await vm.refreshHomeCategoryCounts()
         }

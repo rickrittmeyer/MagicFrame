@@ -169,6 +169,92 @@ This is the intended end state. Existing files should not be moved until a dedic
 - `MagicFrame/Debug/DebugTools.swift`
 - `MagicFrame/Debug/DevDatabaseTools.swift`
 
+## App entry and photo ingest (current)
+
+On first entry, the app sets up SQLite, asks for a **Current Home** (Location auth), then **automatically indexes** the Photo Library and builds events. After that, later launches with a populated library do **not** pick up new/edited photos by themselves — re-run **Index Photos** from Developer/Settings. There is no Photos change observer or change-token sync.
+
+### Phase 1 — Process start (every launch)
+
+```
+MagicFrameApp → ContentView → LibraryViewModel.init
+  → AppContainer.shared → DatabaseManager.bootstrapSchema
+ContentView.onAppear
+  → LibraryViewModel.onAppear → runStartupPipeline
+  → VisionJobCoordinator.startIfNeeded  (queued Vision jobs only; does not index Photos)
+```
+
+1. `MagicFrame/MagicFrameApp.swift` opens `ContentView`.
+2. `MagicFrame/ContentView.swift` creates `LibraryViewModel`, which materializes `AppDependencies` / `AppContainer`.
+3. Container bootstrap runs schema migrations (including dropping legacy occasion tables).
+4. UI is `MagicFrame/Views/MainTabView.swift`: Home + Settings (Developer console).
+5. On appear: `LibraryViewModel.onAppear()` → `runStartupPipeline()`, and the Vision worker starts.
+
+### Phase 2 — Startup decision tree
+
+In `LibraryViewModel.runStartupPipeline()`:
+
+| Condition | What happens |
+|-----------|----------------|
+| No Current Home | Show home onboarding; **stop** (no Photos index yet) |
+| Home + indexed photos + events | Lightweight status only; load home counts. **No auto index/sync** |
+| Home but 0 photos or 0 events | `continueLibraryBootstrap()` |
+
+### Phase 3 — First-time home onboarding
+
+Presented as a full-screen cover from `ContentView` when `showHomeOnboarding` is true.
+
+1. Location lookup / pin confirm (Core Location — **not** Photos yet).
+2. User taps **Continue & Import Photos**.
+3. Home saved → `homeOnboardingCompleted()` → `continueLibraryBootstrap(reindexAfterHomeSetup: true)`.
+
+### Phase 4 — Index Photos (first import or manual re-index)
+
+Triggered automatically when `indexedPhotoCount == 0`, or manually via Developer → Index Photos (`LibraryViewModel.indexPhotosFromLibrary()`).
+
+1. `PHPhotoLibrary.requestAuthorization(for: .readWrite)` — first Photos prompt.
+2. `enumeratePhotoLibrary` — full fetch of image assets (last 100 years).
+3. For **every** asset: `PhotoDatabase.upsertPhoto(...)` keyed by `localIdentifier`.
+4. SQLite `INSERT … ON CONFLICT(id) DO UPDATE` in `PhotoRepository`:
+   - New id → insert
+   - Existing id → overwrite PhotoKit fields (`modificationDate` stored, but **not used as a change gate**)
+   - Clears soft-delete flags; refreshes `lastSeenAt` / `indexedAt`
+   - Does **not** clear `eventAssignedAt` (already-assigned photos stay assigned)
+
+**New vs modified in practice:** both are upserts. There is no differential detection.
+
+### Phase 5 — Immediate post-index work (automatic after index)
+
+Still inside `indexPhotosFromLibrary()` / bootstrap:
+
+```
+Full PhotoKit upsert
+  → Metadata enrichment (AlbumImportService, PhotoTextMetadataImportService)
+  → PeopleImportService → rebuildEventPeople
+  → performEventSync(forceMaintenance: true)
+       → GPS assign / cluster batches (eventAssignedAt IS NULL)
+       → No-GPS metadata assignment passes
+       → Post-sync maintenance
+            → Location links + merges
+            → Covers + event_people
+            → Enqueue geocode queue
+```
+
+Vision object recognition does **not** run on this path; it is later (holiday collection expand / Developer rescan). Holiday AI tagging no longer runs via occasion scoring.
+
+### Phase 6 — Later launches and library changes
+
+- If home + photos + events already exist, startup returns early — no re-enumeration.
+- New camera rolls / edits in the Photos app are **not watched**.
+- To ingest them today: Developer → **Index Photos** (full re-upsert), then Sync/Rebuild as needed for unassigned photos.
+- Soft-delete helper `markPhotosDeletedIfMissing` exists but is **not called** from the index path, so Photos deletions are not cleaned up automatically.
+
+### Manual knobs (Settings / Developer)
+
+- **Index Photos** — re-run full upsert
+- **Sync Events** — assign remaining `eventAssignedAt IS NULL`
+- **Rebuild Events** — heavier reset/rebuild path
+- Geocode batch, holiday scoring, Vision rescan, etc.
+
 ## Event assignment (current + planned)
 
 ### Current batch pipeline (Sync Events)
@@ -201,120 +287,14 @@ This is the intended end state. Existing files should not be moved until a dedic
 - DB columns: `userManualCity`, `userManualState`, `userEditedManualLocation` on `events` (UI not wired yet).
 - When the user sets the same manual city/state on contiguous day events, merge them into a trip (e.g. "Trip to Orlando") — see `mergeTripsByUserManualLocation()` stub in `EventClusteringService`.
 
-## Occasion scoring (planned)
+## Holidays (tags + birthdays)
 
-Recurring date-based occasions (holidays, birthdays, anniversaries). Tables: `occasions`, `occasion_dates`, `occasion_scoring_rules`, `event_occasion_scores`, `photo_object_tags`, `event_object_tags`.
+Holidays no longer use an `occasions` / `event_occasion_scores` system.
 
-Component scores on `event_occasion_scores` map to rule `signalType` groups below. **`dateScore` is not driven by `occasion_scoring_rules`** — it comes from overlap with `occasion_dates` (and `occasions.defaultWindowDaysBefore/After` when `startDate`/`endDate` are null).
-
-### `signalType` / `signalValue` vocabulary
-
-Rules live in `occasion_scoring_rules (occasionId, signalType, signalValue, score)`. Matching is **case-insensitive** after trim unless noted. Text rules (keyword/album) fire at most once per occasion per event; object rules add `score × photoCount` where `photoCount` is distinct photos with that `objectKey` above min confidence (then component caps apply before `totalScore`).
-
-| `signalType` | `signalValue` format | Writes to | Data source |
-|--------------|-------------------|-----------|-------------|
-| `object` | `objectKey` | `objectScore` | `event_object_tags.objectKey` (from `photo_object_tags`) |
-| `album` | see Album formats | `albumScore` | `photo_albums` → `albums` |
-| `people` | see People formats | `peopleScore` | `event_people`, `photo_people`, `occasions.personId` |
-| `location` | see Location formats | `locationScore` | `events` + `locations` (city/state/place/home/away) |
-| `keyword` | see Keyword formats | `albumScore`* | `photo_text_metadata` (filename, title, keywords) |
-| `user` | see User formats | `userScore` | UI / confirmed tags / manual boosts |
-
-\*Keyword rules default into the same component bucket as album/text signals (`albumScore` or a future `textScore`). If we split later, migrate rules only — not `signalValue` strings.
-
-#### `object`
-
-- **`signalValue`:** canonical `objectKey` (snake_case, stable), same as `photo_object_tags.objectKey` / `event_object_tags.objectKey`.
-- **Match:** count distinct photos in the event (or trip descendants when scoring a container) with that `objectKey` and `confidence >= minObjectConfidence` (tuning, e.g. 0.25).
-- **Score:** `rule.score × photoCount` per object rule (e.g. 3 photos with `christmas_tree` at +0.45 → +1.35 before the 1.0 object cap).
-- **Examples:** `christmas_tree`, `pumpkin`, `birthday_cake`, `balloon`, `fireworks`.
-- **Display names** belong in `displayName` columns, not in rules.
-
-#### `album`
-
-Album title / person-album linkage. Prefer stable ids where possible.
-
-| Prefix | `signalValue` example | Matches |
-|--------|---------------------|---------|
-| `id:` | `id:album.localIdentifier` | Exact PhotoKit album id (`albums.albumId`) |
-| `title:` | `title:Christmas` | `albums.title` equals or contains (tuning: exact vs contains) |
-| `title_contains:` | `title_contains:birthday` | Substring match on normalized title |
-| `person_album:` | `person_album:42` | Album linked to `personId` 42 (`albums.personId`) |
-| `subtype:` | `subtype:smartAlbumFavorites` | `albums.collectionSubtype` (optional, for smart albums) |
-
-- **High-cardinality albums** (`albums.isHighCardinality = 1`) are ignored unless the rule uses `id:` (same idea as metadata attach).
-- **Examples for Christmas:** `title_contains:christmas`, `title:Christmas`, `id:<user’s Christmas album uuid>`.
-
-#### `people`
-
-| Prefix | `signalValue` example | Matches |
-|--------|---------------------|---------|
-| `person:` | `person:42` | `event_people` or ≥N photos with `photo_people.personId = 42` |
-| `person_name:` | `person_name:Vince` | `people.name` on any person linked to event (fallback when id unknown) |
-| `occasion_person` | `occasion_person` | `occasions.personId` for this occasion appears in `event_people` (birthdays) |
-| `min_people:` | `min_people:2` | Event has at least 2 distinct people (anniversaries, parties) |
-| `couple:` | `couple:42,57` | Both person ids present (anniversaries; see `occasions` gap below) |
-
-- **Birthday occasions** should set `occasions.personId` and use `occasion_person` (and optional `person:{id}`) rules.
-- **Anniversary occasions** should use `couple:{id},{id}` until a first-class couple model exists.
-
-#### `location`
-
-| Prefix | `signalValue` example | Matches |
-|--------|---------------------|---------|
-| `home` | `home` | Event centroid within `homeEventSnapMiles` of current home (or designated home for event dates) |
-| `away` | `away` | Event is away from home beyond `awayFromHomeMiles` |
-| `city:` | `city:Orlando` | `events.city` or linked `locations.city` |
-| `state:` | `state:FL` | State match (normalize abbrev vs full name in code) |
-| `place:` | `place:Disney World` | `placeName` or location nickname contains value |
-
-- Location is usually a **weak** holiday signal; use low rule scores unless the occasion is place-specific.
-
-#### `keyword`
-
-Cheap text from indexing; scanned across photos in the event.
-
-| Prefix | `signalValue` example | Matches |
-|--------|---------------------|---------|
-| `filename_contains:` | `filename_contains:christmas` | `photo_text_metadata.originalFilename` |
-| `title_contains:` | `title_contains:Halloween` | `photo_text_metadata.assetTitle` |
-| `keyword:` | `keyword:birthday` | Entry in `keywordsJson` (if populated) |
-
-- Prefer **contains** matching with normalized lowercase.
-- Filename rules are noisy; keep scores lower than album/people signals.
-
-#### `user`
-
-Manual / explicit overrides. Not used for automatic detection logic except replay.
-
-| `signalValue` | Meaning |
-|---------------|---------|
-| `confirmed` | User confirmed this occasion for this event/year → sets `userScore` to rule `score` (often 1.0) and `isConfirmed` |
-| `rejected` | Reserved; prefer `event_occasion_scores.isRejected` column over a rule |
-| `boost` | Manual boost (e.g. +0.25) without full confirm |
-
-### `dateScore` (not in `occasion_scoring_rules`)
-
-Computed from `occasion_dates` for scoring year `Y`:
-
-1. Resolve window: `startDate`/`endDate` on `occasion_dates`, else `date` ± `defaultWindowDaysBefore/After` from `occasions`.
-2. Compare to event effective range (min/max photo dates in event, or `events.startDate`/`endDate`).
-3. Output 0.0–1.0 (e.g. 1.0 if event center falls on `date`, decay by days outside window).
-
-Use `observedDate` when present instead of `date` for “when celebrated” if you want observed-day matching.
-
-### Rule authoring conventions
-
-- **One occasion** = many rules across signal types; **sum** matching rule scores per component, then **cap** each component (e.g. 0.0–1.0) before weighting into `totalScore`.
-- **Do not** duplicate the same `(signalType, signalValue)` for one `occasionId` (enforce `UNIQUE(occasionId, signalType, signalValue)` when implementing).
-- **Seed holidays** with `object` + `album` + `keyword` rules; **seed birthdays** with `occasion_person` + optional `object:birthday_cake`.
-- **`confidence`** on `event_occasion_scores`: derive from `totalScore` bands (`low` / `medium` / `high`), not from individual rules.
-
-### Open schema notes (for later steps)
-
-- **Anniversaries:** `occasions.personId` holds only one person; use `couple:id,id` in rules or add `occasion_people` junction.
-- **Movable holidays:** one `occasion_dates` row per year (Easter, Thanksgiving); seed annually.
-- **FKs:** `occasion_scoring_rules.occasionId`, `event_occasion_scores.eventId` → parent tables when migrations are added.
+- **Landing catalog:** built-in `EventAttributeField.holidayType.builtInOptions` plus people with a non-empty `birthDate`.
+- **Event filtering:** `EventListFilter.holidayTag` / `.anyHoliday` via `event_tags` (`tagCategory = holiday`); birthdays via `.birthdayPerson(personId:displayName:)` using `people.birthDate` ±3 days.
+- **Vision object scans:** `ObjectDetectionCategory` hardcodes Christmas/Halloween/(Mother’s|Father’s Day) object keys. Landing Vision configs come from those categories (no DB occasions).
+- **Dropped tables (migration):** `occasion_landing_metrics`, `occasion_collection_events`, `photo_occasion`, `occasion_subjects`, `event_occasion_scores`, `occasion_scoring_rules`, `occasion_dates`, `occasions`.
 
 ## Migration approach (high level)
 

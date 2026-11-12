@@ -27,12 +27,17 @@ struct PhotoThumbnailView: View {
     var analyzesFacesIfMissing: Bool = false
     /// Explicit focal point (top-left normalized). Overrides `cropContext` when set.
     var normalizedCropFocus: CGPoint? = nil
+    /// White play glyph on videos. Turn off when a parent already draws that button.
+    var showsVideoBadge: Bool = true
+    /// Known video flag from the database. When nil, the thumbnail checks the photo library.
+    var isVideo: Bool? = nil
 
     @Environment(\.displayScale) private var displayScale
 
     @State private var image: UIImage?
     @State private var loadedTargetSize: CGSize = .zero
     @State private var resolvedCropFocus: CGPoint?
+    @State private var detectedIsVideo = false
 
     var body: some View {
         Group {
@@ -42,10 +47,18 @@ struct PhotoThumbnailView: View {
                     .overlay { imageLayer }
                     .background(sizeReader)
             } else {
-                Color.clear
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                // Fill the parent (e.g. 4:3 event banner). Avoid Color.clear + infinity,
+                // which can report a zero size in LazyVStack and skip thumbnail loads.
+                Rectangle()
+                    .fill(Color(.systemGray5))
                     .overlay { imageLayer }
                     .background(sizeReader)
+            }
+        }
+        .overlay {
+            if showsPlayIcon {
+                VideoPlayIcon(size: 36)
+                    .allowsHitTesting(false)
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
@@ -56,6 +69,11 @@ struct PhotoThumbnailView: View {
             guard cropContext != nil else { return }
             await resolveCropFocusIfNeeded()
         }
+    }
+
+    private var showsPlayIcon: Bool {
+        guard showsVideoBadge else { return false }
+        return isVideo ?? detectedIsVideo
     }
 
     private var thumbnailCacheKey: String {
@@ -133,6 +151,9 @@ struct PhotoThumbnailView: View {
     private func loadThumbnail(for size: CGSize) async {
         if image == nil, let cached = PhotoThumbnailImageCache.image(for: thumbnailCacheKey) {
             image = cached
+            if isVideo == nil {
+                detectedIsVideo = PhotoAssetKind.isVideo(assetIdentifier: assetIdentifier)
+            }
             if size.width > 1, size.height > 1 {
                 loadedTargetSize = CGSize(
                     width: size.width * displayScale,
@@ -175,6 +196,9 @@ struct PhotoThumbnailView: View {
         }.value
 
         guard let asset else { return }
+        if isVideo == nil {
+            detectedIsVideo = asset.mediaType == .video
+        }
 
         let options = PHImageRequestOptions()
         options.isNetworkAccessAllowed = true
@@ -245,15 +269,18 @@ struct PhotoThumbnailView: View {
                     options: options
                 ) { result, info in
                     Task { @MainActor in
+                        let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
                         if let result {
                             session.deliveredImage = true
-                            PhotoThumbnailImageCache.store(result, for: self.thumbnailCacheKey)
+                            // Don't cache opportunistic placeholders — they stick as blurry "high" thumbs.
+                            if !isDegraded || !waitForFinalQuality {
+                                PhotoThumbnailImageCache.store(result, for: self.thumbnailCacheKey)
+                            }
                             self.image = result
                             self.loadedTargetSize = targetSize
                         }
 
                         if waitForFinalQuality {
-                            let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
                             let isCancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
                             let hasError = info?[PHImageErrorKey] != nil
                             if isCancelled || hasError || !isDegraded {

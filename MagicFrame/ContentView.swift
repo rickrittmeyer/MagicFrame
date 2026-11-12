@@ -13,10 +13,14 @@ struct ContentView: View {
     var body: some View {
         MainTabView(vm: vm)
             .fullScreenCover(isPresented: $vm.showHomeOnboarding) {
-                HomeOnboardingView {
-                    vm.homeOnboardingCompleted()
+                Group {
+                    if #available(iOS 26.0, *) {
+                        HomeOnboardingView {
+                            vm.homeOnboardingCompleted()
+                        }
+                        .interactiveDismissDisabled()
+                    }
                 }
-                .interactiveDismissDisabled()
             }
             .onAppear {
                 vm.onAppear()

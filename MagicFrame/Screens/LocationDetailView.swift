@@ -31,7 +31,8 @@ struct LocationDetailView: View {
 
                 EventsLibraryListContent(
                     filter: locationFilter,
-                    vm: libraryVM
+                    vm: libraryVM,
+                    showsPictureStyleHeader: false
                 )
             }
         }

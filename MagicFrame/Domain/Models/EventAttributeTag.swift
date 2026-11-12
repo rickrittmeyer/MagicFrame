@@ -4,7 +4,6 @@ struct EventAttributeTag: Sendable, Equatable, Identifiable {
     let category: EventAttributeField
     let tagValue: String
     let source: EventTagSource
-    let appliedPhase: EventTagAppliedPhase?
     let totalScore: Double?
     /// When a parent list row shows a child's tag, actions target this event id.
     let owningEventId: Int?
@@ -15,14 +14,12 @@ struct EventAttributeTag: Sendable, Equatable, Identifiable {
         category: EventAttributeField,
         tagValue: String,
         source: EventTagSource,
-        appliedPhase: EventTagAppliedPhase? = nil,
         totalScore: Double? = nil,
         owningEventId: Int? = nil
     ) {
         self.category = category
         self.tagValue = tagValue
         self.source = source
-        self.appliedPhase = appliedPhase
         self.totalScore = totalScore
         self.owningEventId = owningEventId
     }
@@ -34,7 +31,6 @@ struct EventAttributeTag: Sendable, Equatable, Identifiable {
         self.category = .holidayType
         self.tagValue = holidayTag.tagValue
         self.source = holidayTag.source
-        self.appliedPhase = holidayTag.appliedPhase
         self.totalScore = holidayTag.totalScore
         self.owningEventId = owningEventId ?? holidayTag.owningEventId
     }
@@ -50,7 +46,7 @@ struct EventAttributeTag: Sendable, Equatable, Identifiable {
         EventHolidayTag(
             tagValue: tagValue,
             source: source,
-            appliedPhase: appliedPhase,
+            totalScore: totalScore,
             owningEventId: owningEventId
         )
     }
