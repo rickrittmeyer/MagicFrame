@@ -30,7 +30,7 @@ struct IdentifyEventTypesView: View {
            let holidayDefault = PictureSearchDefinition.holidayDefault(tagValue: tagValue) {
             _draft = State(initialValue: holidayDefault)
         } else if preferredSearchName?.compare(
-            AppViewCatalog.christmasPictureSearchName,
+            HolidayPictureSearchDefaults.pictureSearchName(forTagValue: "Christmas"),
             options: .caseInsensitive
         ) == .orderedSame {
             _draft = State(initialValue: .christmasDefault())
@@ -570,7 +570,7 @@ struct IdentifyEventTypesView: View {
                       ) {
                 preferred = ensured
             } else if preferredSearchName.compare(
-                AppViewCatalog.christmasPictureSearchName,
+                HolidayPictureSearchDefaults.pictureSearchName(forTagValue: "Christmas"),
                 options: .caseInsensitive
             ) == .orderedSame {
                 preferred = AppDependencies.database.ensureChristmasPictureSearch()

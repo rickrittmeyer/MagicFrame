@@ -1,3 +1,7 @@
 .DS_Store
 *.xcuserstate
 xcuserdata/
+.derivedData/
+build-output*.txt
+MagicFrame/build-*.txt
+MagicFrame/build-output*.txt
