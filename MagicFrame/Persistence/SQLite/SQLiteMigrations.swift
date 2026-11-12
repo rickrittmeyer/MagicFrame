@@ -12,6 +12,8 @@ struct LegacyDataMigrationHooks {
 
 enum SQLiteMigrations {
 
+    /// Current schema for new databases / after Dev Reset.
+    /// Feature tables are created here too; `migrateTablesIfNeeded` still upgrades older phone DBs in place.
     static func createTablesIfNeeded(on db: OpaquePointer) {
         let sql = """
         CREATE TABLE IF NOT EXISTS photos (
@@ -31,6 +33,8 @@ enum SQLiteMigrations {
 
             latitude REAL,
             longitude REAL,
+            userLatitude REAL,
+            userLongitude REAL,
 
             isScreenshot INTEGER,
 
@@ -38,6 +42,7 @@ enum SQLiteMigrations {
             orientation TEXT,
 
             qualityScore INTEGER,
+            duration REAL,
 
             isDeleted INTEGER DEFAULT 0,
             deletedAt TEXT,
@@ -47,7 +52,16 @@ enum SQLiteMigrations {
 
             eventNeedsReview INTEGER DEFAULT 0,
             eventAssignedAt TEXT,
-            visionAnalyzed INTEGER DEFAULT 0
+            captureDateOverride TEXT,
+            visionAnalyzed INTEGER DEFAULT 0,
+            faceRecognitionVersion INTEGER DEFAULT 0,
+
+            faceEyesOpenScore REAL,
+            faceSmileScore REAL,
+            listCropFocusX REAL,
+            listCropFocusY REAL,
+            frameCropFocusX REAL,
+            frameCropFocusY REAL
         );
 
         CREATE TABLE IF NOT EXISTS events (
@@ -63,11 +77,22 @@ enum SQLiteMigrations {
             city TEXT,
             state TEXT,
             placeName TEXT,
+            userManualCity TEXT,
+            userManualState TEXT,
+            userEditedManualLocation INTEGER DEFAULT 0,
 
             locationId INTEGER,
+            parentEventId INTEGER,
+            isTripEvent INTEGER DEFAULT 0,
 
             coverPhotoId TEXT,
             userEditedName INTEGER DEFAULT 0,
+            childEventName TEXT,
+            userEditedChildEventName INTEGER DEFAULT 0,
+            isFavorite INTEGER DEFAULT 0,
+            isUserHidden INTEGER DEFAULT 0,
+            clusteredByTimeOnly INTEGER DEFAULT 0,
+            weddingDate TEXT,
 
             isDeleted INTEGER DEFAULT 0,
             deletedAt TEXT,
@@ -83,9 +108,14 @@ enum SQLiteMigrations {
         CREATE TABLE IF NOT EXISTS photo_events (
             photoId TEXT,
             eventId INTEGER,
-            includeInSlideshow INTEGER,
-            manuallyExcluded INTEGER,
-            manualBoost INTEGER,
+            includeInSlideshow INTEGER DEFAULT 0,
+            manuallyExcluded INTEGER DEFAULT 0,
+            manualBoost INTEGER DEFAULT 0,
+            isSimilarGroupPick INTEGER DEFAULT 0,
+            assignmentConfidence REAL,
+            assignmentMethod TEXT,
+            assignedAt TEXT,
+            needsReview INTEGER DEFAULT 0,
             PRIMARY KEY (photoId, eventId)
         );
 
@@ -123,6 +153,10 @@ enum SQLiteMigrations {
             locationType TEXT,
             geocodeStatus TEXT,
             lastGeocodedAt TEXT,
+            isFavorite INTEGER DEFAULT 0,
+            isCurrentHome INTEGER DEFAULT 0,
+            homeStartDate TEXT,
+            homeEndDate TEXT,
             createdAt TEXT,
             updatedAt TEXT,
             UNIQUE(latitudeBucket, longitudeBucket)
@@ -142,6 +176,13 @@ enum SQLiteMigrations {
 
         CREATE INDEX IF NOT EXISTS idx_photo_people_photoId
         ON photo_people(photoId);
+
+        CREATE INDEX IF NOT EXISTS idx_events_locationId ON events(locationId);
+        CREATE INDEX IF NOT EXISTS idx_events_parentEventId ON events(parentEventId);
+        CREATE INDEX IF NOT EXISTS idx_events_assignment
+        ON events(isDeleted, parentEventId, startDate, endDate);
+        CREATE INDEX IF NOT EXISTS idx_photo_people_personId
+        ON photo_people(personId);
         """
 
         if sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK {
@@ -149,6 +190,18 @@ enum SQLiteMigrations {
         } else {
             print("Unable to create tables: \(String(cString: sqlite3_errmsg(db)))")
         }
+
+        // Feature tables (CREATE IF NOT EXISTS). Also invoked from migrate for older installs.
+        migrateMetadataTablesIfNeeded(on: db)
+        migrateFaceRecognitionTablesIfNeeded(on: db)
+        migrateEventTagsIfNeeded(on: db)
+        migrateEventNameTemplatesIfNeeded(on: db)
+        migrateSimilarEventTagsIfNeeded(on: db)
+        migrateObjectTagTablesIfNeeded(on: db)
+        migrateVisionJobTablesIfNeeded(on: db)
+        migratePictureSearchTablesIfNeeded(on: db)
+        migrateStadiumsTablesIfNeeded(on: db)
+        migrateHolidaysTablesIfNeeded(on: db)
     }
 
     static func migrateTablesIfNeeded(on db: OpaquePointer, legacyHooks: LegacyDataMigrationHooks) {
@@ -1843,24 +1896,6 @@ enum SQLiteMigrations {
         if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
             print("Metadata table migration failed: \(String(cString: sqlite3_errmsg(db)))")
         }
-    }
-
-    static func dropDevelopmentTables(on db: OpaquePointer) -> Bool {
-        let sql = """
-        DROP TABLE IF EXISTS photo_exif;
-        DROP TABLE IF EXISTS photo_albums;
-        DROP TABLE IF EXISTS photo_text_metadata;
-        DROP TABLE IF EXISTS albums;
-        DROP TABLE IF EXISTS face_instances;
-        DROP TABLE IF EXISTS person_clusters;
-        DROP TABLE IF EXISTS event_people;
-        DROP TABLE IF EXISTS photo_people;
-        DROP TABLE IF EXISTS people;
-        DROP TABLE IF EXISTS photo_events;
-        DROP TABLE IF EXISTS events;
-        DROP TABLE IF EXISTS photos;
-        """
-        return sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK
     }
 
     static func columnExists(table: String, column: String, on db: OpaquePointer) -> Bool {

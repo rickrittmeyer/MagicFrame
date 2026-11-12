@@ -9,6 +9,7 @@ struct DeveloperView: View {
 
     @ObservedObject var vm: LibraryViewModel
     @State private var isConfirmingRebuild = false
+    @State private var isConfirmingDevReset = false
     @State private var visionResetHolidays: [HolidayVisionLandingConfig] = []
     @State private var visionTagRangeStart = "12/1"
     @State private var visionTagRangeEnd = "12/31"
@@ -284,16 +285,14 @@ struct DeveloperView: View {
             }
 
             Section("Danger zone") {
-                Button("Dev Reset DB", role: .destructive) {
-                    vm.events = []
-                    vm.eventSections = []
-                    vm.recentPhotos = []
-                    vm.statusText = "Resetting database (dev)..."
+                Text(
+                    "Dev Reset deletes the entire local database file (people names, event tags, home, searches) and recreates an empty schema. Not needed for normal upgrades."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
-                    AppDependencies.database.resetDatabaseForDevelopmentOnly()
-                    vm.refreshLibraryCounts()
-
-                    vm.statusText = "Dev reset complete"
+                Button("Dev Reset DB (wipe all data)", role: .destructive) {
+                    isConfirmingDevReset = true
                 }
             }
             }
@@ -310,6 +309,22 @@ struct DeveloperView: View {
         ) {
             Button("Rebuild Events", role: .destructive) {
                 vm.rebuildEventsTapped()
+            }
+            Button("Cancel", role: .cancel) {}
+        }
+        .confirmationDialog(
+            "Wipe the entire local database?",
+            isPresented: $isConfirmingDevReset,
+            titleVisibility: .visible
+        ) {
+            Button("Delete All Local Data", role: .destructive) {
+                vm.events = []
+                vm.eventSections = []
+                vm.recentPhotos = []
+                vm.statusText = "Resetting database (dev)…"
+                AppDependencies.database.resetDatabaseForDevelopmentOnly()
+                vm.refreshLibraryCounts()
+                vm.statusText = "Dev reset complete — empty database"
             }
             Button("Cancel", role: .cancel) {}
         } message: {

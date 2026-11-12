@@ -81,11 +81,15 @@ final class PhotoDatabase: @unchecked Sendable {
     }
 
     func resetDatabaseForDevelopmentOnly() {
-        databaseManager.resetDevelopmentTables(legacyHooks: LegacyDataMigrationHooks(
+        databaseManager.resetDevelopmentDatabase(legacyHooks: LegacyDataMigrationHooks(
             migrateLegacyTripEventType: eventRepository.migrateLegacyTripEventTypeAttribute,
             migrateLegacyHomeLocations: locationRepository.migrateLegacyHomeLocations,
             migrateTripSubEventChildNames: eventRepository.migrateTripSubEventChildNamesIfNeeded,
-            repairStaleGeocodeStatuses: locationRepository.repairStaleGeocodeStatuses
+            repairStaleGeocodeStatuses: locationRepository.repairStaleGeocodeStatuses,
+            backfillEventAttributeTagsFromColumns: { [eventTags] in
+                eventTags.backfillAttributeTagsFromColumnsIfNeeded()
+                eventTags.migrateMisclassifiedMilestoneEventTypesIfNeeded()
+            }
         ))
     }
 

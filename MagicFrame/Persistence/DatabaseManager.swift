@@ -64,16 +64,51 @@ final class DatabaseManager {
         return SQLiteMigrations.columnExists(table: table, column: column, on: connection)
     }
 
+    /// Deletes the on-disk database (including WAL) and bootstraps a fresh schema.
+    /// Destructive developer tool — not required for normal upgrades or phone installs.
+    @discardableResult
+    func resetDevelopmentDatabase(legacyHooks: LegacyDataMigrationHooks) -> Bool {
+        queue.sync {
+            if let open = connection {
+                sqlite3_exec(open, "PRAGMA wal_checkpoint(TRUNCATE);", nil, nil, nil)
+                sqlite3_close(open)
+                connection = nil
+            }
+
+            let base = databaseURL
+            let fm = FileManager.default
+            let urls = [
+                base,
+                URL(fileURLWithPath: base.path + "-wal"),
+                URL(fileURLWithPath: base.path + "-shm"),
+            ]
+            for url in urls where fm.fileExists(atPath: url.path) {
+                do {
+                    try fm.removeItem(at: url)
+                } catch {
+                    print("Unable to remove \(url.lastPathComponent): \(error)")
+                    openConnection()
+                    return false
+                }
+            }
+
+            openConnection()
+            guard let connection else {
+                print("Unable to reopen database after DEV reset")
+                return false
+            }
+
+            SQLiteMigrations.createTablesIfNeeded(on: connection)
+            SQLiteMigrations.migrateTablesIfNeeded(on: connection, legacyHooks: legacyHooks)
+            print("DEV reset complete (fresh database file)")
+            return true
+        }
+    }
+
+    @available(*, deprecated, renamed: "resetDevelopmentDatabase")
     @discardableResult
     func resetDevelopmentTables(legacyHooks: LegacyDataMigrationHooks) -> Bool {
-        guard let connection else { return false }
-        guard SQLiteMigrations.dropDevelopmentTables(on: connection) else {
-            print("Unable to reset tables: \(String(cString: sqlite3_errmsg(connection)))")
-            return false
-        }
-        print("DEV reset complete")
-        bootstrapSchema(legacyHooks: legacyHooks)
-        return true
+        resetDevelopmentDatabase(legacyHooks: legacyHooks)
     }
 
     /// Writes a consistent single-file snapshot (WAL-safe) for Share / AirDrop.
