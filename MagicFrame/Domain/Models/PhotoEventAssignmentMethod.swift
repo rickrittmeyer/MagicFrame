@@ -6,6 +6,7 @@ enum PhotoEventAssignmentMethod: String, Sendable {
     case albumTime = "album_time"
     case peopleTime = "people_time"
     case albumPeopleTime = "album_people_time"
+    case manualDateAdjust = "manual_date_adjust"
 }
 
 enum PhotoEventAssignmentScorer {

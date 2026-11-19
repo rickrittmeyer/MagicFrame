@@ -40,6 +40,7 @@ struct HomeView: View {
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
             vm.clearEventsTabFocus()
+            vm.setMainTabChromeMode(.landing)
         }
         .task {
             await vm.refreshHomeCategoryCounts()

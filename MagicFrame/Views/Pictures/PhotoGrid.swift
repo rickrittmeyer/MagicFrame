@@ -12,6 +12,8 @@ struct PhotoGrid<Header: View, Menu: View>: View {
     var isSelecting: Bool
     var selectedPhotoIds: Set<String>
     var allowsContextMenu: Bool
+    /// When false, section headers still render but do not pin (e.g. under a sticky controls bar).
+    var pinsSectionHeaders: Bool
     let onTap: (EventPhotoDisplayItem) -> Void
     @ViewBuilder let sectionHeader: (PhotoGridSection) -> Header
     @ViewBuilder let contextMenu: (EventPhotoDisplayItem) -> Menu
@@ -29,6 +31,7 @@ struct PhotoGrid<Header: View, Menu: View>: View {
         isSelecting: Bool = false,
         selectedPhotoIds: Set<String> = [],
         allowsContextMenu: Bool = true,
+        pinsSectionHeaders: Bool = true,
         onTap: @escaping (EventPhotoDisplayItem) -> Void,
         @ViewBuilder sectionHeader: @escaping (PhotoGridSection) -> Header,
         @ViewBuilder contextMenu: @escaping (EventPhotoDisplayItem) -> Menu
@@ -37,13 +40,18 @@ struct PhotoGrid<Header: View, Menu: View>: View {
         self.isSelecting = isSelecting
         self.selectedPhotoIds = selectedPhotoIds
         self.allowsContextMenu = allowsContextMenu
+        self.pinsSectionHeaders = pinsSectionHeaders
         self.onTap = onTap
         self.sectionHeader = sectionHeader
         self.contextMenu = contextMenu
     }
 
     var body: some View {
-        LazyVStack(alignment: .leading, spacing: 20, pinnedViews: [.sectionHeaders]) {
+        LazyVStack(
+            alignment: .leading,
+            spacing: 20,
+            pinnedViews: pinsSectionHeaders ? [.sectionHeaders] : []
+        ) {
             ForEach(sections) { section in
                 Section {
                     LazyVGrid(columns: columns, spacing: gridSpacing) {

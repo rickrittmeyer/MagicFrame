@@ -18,6 +18,17 @@ enum PictureDateSearchType: String, Codable, CaseIterable, Identifiable, Sendabl
         case .allDates: return "Search All Dates"
         }
     }
+
+    /// Labels for Event Score Card date gate / scoring (not Picture Search).
+    var scoreCardDisplayName: String {
+        switch self {
+        case .sameDateEveryYear: return "Same date every year"
+        case .movingHoliday: return "Moving holiday"
+        case .sameDateRangeEveryYear: return "Same date range every year"
+        case .absoluteRange: return "Absolute date range"
+        case .allDates: return "All dates"
+        }
+    }
 }
 
 enum PictureMovingHolidayKey: String, Codable, CaseIterable, Identifiable, Sendable {
@@ -110,6 +121,33 @@ struct DateSearchDefinition: Sendable, Equatable, Identifiable {
                 includeXDaysBefore: nil,
                 includeYDaysAfter: nil
             )
+    }
+
+    /// Copy calendar fields for a new owner (scorecard) — never shares `dateSearchId`.
+    func detachedCopy(named name: String?) -> DateSearchDefinition {
+        var copy = self
+        copy.dateSearchId = nil
+        copy.name = name
+        return copy
+    }
+
+    /// Copy type / anchor / window fields while keeping this row's id and name.
+    mutating func copyCalendarFields(from other: DateSearchDefinition) {
+        dateSearchType = other.dateSearchType
+        sameDateSearchDate = other.sameDateSearchDate
+        movingHolidayKey = other.movingHolidayKey
+        floatingHolidayId = other.floatingHolidayId
+        holidayId = other.holidayId
+        rangeStartMonthDay = other.rangeStartMonthDay
+        rangeEndMonthDay = other.rangeEndMonthDay
+        absoluteStartDate = other.absoluteStartDate
+        absoluteEndDate = other.absoluteEndDate
+        includeWeekendsBefore = other.includeWeekendsBefore
+        includeWeekendsAfter = other.includeWeekendsAfter
+        includeDaysBefore = other.includeDaysBefore
+        includeDaysAfter = other.includeDaysAfter
+        includeXDaysBefore = other.includeXDaysBefore
+        includeYDaysAfter = other.includeYDaysAfter
     }
 }
 
@@ -340,6 +378,27 @@ struct PictureSearchEventScoreCardSettings: Sendable, Equatable {
 
     static let defaultMinimumScoreForAI: Double = 0
 
+    /// Empty scorecard for a tag pair (Developer browser / AI Assist create path).
+    static func blank(tagCategory: String, tagValue: String) -> PictureSearchEventScoreCardSettings {
+        let trimmedValue = tagValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedCategory = tagCategory.trimmingCharacters(in: .whitespacesAndNewlines)
+        return PictureSearchEventScoreCardSettings(
+            name: trimmedValue.isEmpty ? "Score Card" : trimmedValue,
+            eventScoreCardId: nil,
+            targetTagCategory: trimmedCategory.isEmpty
+                ? EventAttributeField.milestoneType.tagCategory
+                : trimmedCategory,
+            targetEventType: trimmedValue.isEmpty ? "Untitled" : trimmedValue,
+            visionTags: [],
+            dateSearch: .weddingDefault(),
+            onDatePoints: 10,
+            pointsPerDayFromAnchor: -1,
+            minimumScoreForAI: defaultMinimumScoreForAI,
+            people: [],
+            locations: []
+        )
+    }
+
     static func fromPictureSearch(
         _ definition: PictureSearchDefinition,
         personNamesById: [Int: String] = [:]
@@ -356,6 +415,7 @@ struct PictureSearchEventScoreCardSettings: Sendable, Equatable {
             .filter { !$0.isEmpty }
             .map { LocationRule(searchTerm: $0, points: 5) }
 
+        let scoreCardName = definition.name.trimmingCharacters(in: .whitespacesAndNewlines)
         return PictureSearchEventScoreCardSettings(
             name: definition.name,
             eventScoreCardId: nil,
@@ -368,7 +428,12 @@ struct PictureSearchEventScoreCardSettings: Sendable, Equatable {
                     points: 1
                 )
             },
-            dateSearch: definition.dateSearch,
+            // Own date_searches row — do not share Picture Search dateSearchId.
+            dateSearch: definition.dateSearch.detachedCopy(
+                named: scoreCardName.isEmpty
+                    ? "Score Card Dates"
+                    : "\(scoreCardName) Score Card Dates"
+            ),
             onDatePoints: 10,
             pointsPerDayFromAnchor: -1,
             minimumScoreForAI: defaultMinimumScoreForAI,

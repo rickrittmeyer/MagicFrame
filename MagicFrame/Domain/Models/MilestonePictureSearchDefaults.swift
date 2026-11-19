@@ -3,17 +3,36 @@ import Foundation
 /// Seeded Picture Search definitions for milestone hub tiles.
 enum MilestonePictureSearchDefaults {
 
-    /// Days before/after the birthday anchor (± matches birthday event list overlap).
-    static let birthdayWindowDays = 3
+    /// Birthday scoring / search window relative to birth month-day.
+    static let birthdayDaysBefore = 7
+    static let birthdayDaysAfter = 3
 
     /// Matches the Milestones tile title (`Weddings`, `Graduations`, …) for programmatic lookup.
     static func pictureSearchName(for topic: MilestoneTopic) -> String {
         topic.title
     }
 
-    /// Matches the birthday person tile style (`Alex Birthday`).
+    /// Canonical person birthday tag / Picture Search name (`Vince's Birthday`).
+    static func personBirthdayTagValue(displayName: String) -> String {
+        let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "Birthday" }
+        return "\(trimmed)'s Birthday"
+    }
+
+    /// Matches the birthday person tile style (`Vince's Birthday`).
     static func pictureSearchName(forPersonBirthday person: PeopleRepository.PersonBirthdayRecord) -> String {
-        "\(person.name) Birthday"
+        personBirthdayTagValue(displayName: person.name)
+    }
+
+    /// Milestone tag values that score as a birthday (person-scoped or legacy generic).
+    static func isPersonBirthdayTagValue(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if trimmed.compare("Birthday", options: .caseInsensitive) == .orderedSame {
+            return true
+        }
+        let lower = trimmed.lowercased()
+        return lower.hasSuffix("'s birthday") || lower.hasSuffix(" birthday")
     }
 
     /// Older saved names we still resolve to the canonical tile title.
@@ -37,9 +56,12 @@ enum MilestonePictureSearchDefaults {
 
     static func legacyPictureSearchNames(forPersonBirthday person: PeopleRepository.PersonBirthdayRecord) -> [String] {
         let canonical = pictureSearchName(forPersonBirthday: person)
+        let plain = "\(person.name) Birthday"
         return [
             canonical,
             "\(canonical) Picture Search",
+            plain,
+            "\(plain) Picture Search",
             "\(person.name) Birthday Picture Search",
         ]
     }
@@ -78,11 +100,12 @@ enum MilestonePictureSearchDefaults {
         guard let monthDay = monthDay(fromBirthDateISO: person.birthDateISO) else {
             return nil
         }
+        let tagValue = pictureSearchName(forPersonBirthday: person)
         return PictureSearchDefinition(
             pictureSearchId: nil,
-            name: pictureSearchName(forPersonBirthday: person),
+            name: tagValue,
             targetTagCategory: EventAttributeField.milestoneType.tagCategory,
-            targetEventType: "Birthday",
+            targetEventType: tagValue,
             dateSearch: birthdayDateSearch(monthDay: monthDay),
             visionTagSearch: birthdayVisionTagSearch(),
             locationSearch: .empty(),
@@ -119,12 +142,12 @@ enum MilestonePictureSearchDefaults {
             rangeEndMonthDay: nil,
             absoluteStartDate: nil,
             absoluteEndDate: nil,
-            includeWeekendsBefore: true,
-            includeWeekendsAfter: true,
+            includeWeekendsBefore: false,
+            includeWeekendsAfter: false,
             includeDaysBefore: true,
             includeDaysAfter: true,
-            includeXDaysBefore: birthdayWindowDays,
-            includeYDaysAfter: birthdayWindowDays
+            includeXDaysBefore: birthdayDaysBefore,
+            includeYDaysAfter: birthdayDaysAfter
         )
     }
 

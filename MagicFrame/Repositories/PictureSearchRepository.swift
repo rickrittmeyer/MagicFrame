@@ -99,6 +99,35 @@ final class PictureSearchRepository {
         sync { fetchEventScoreCardSettingsUnsafe(named: name) }
     }
 
+    func fetchEventScoreCardSettings(
+        tagCategory: String,
+        tagValue: String
+    ) -> PictureSearchEventScoreCardSettings? {
+        sync {
+            fetchEventScoreCardSettingsUnsafe(tagCategory: tagCategory, tagValue: tagValue)
+        }
+    }
+
+    func fetchAllEventScoreCardSettings() -> [PictureSearchEventScoreCardSettings] {
+        sync { fetchAllEventScoreCardSettingsUnsafe() }
+    }
+
+    /// Looks up by tag; seeds from a matching Picture Search when possible; otherwise creates a blank card.
+    @discardableResult
+    func ensureEventScoreCardSettings(
+        tagCategory: String,
+        tagValue: String,
+        personNamesById: [Int: String] = [:]
+    ) -> PictureSearchEventScoreCardSettings {
+        sync {
+            ensureEventScoreCardSettingsUnsafe(
+                tagCategory: tagCategory,
+                tagValue: tagValue,
+                personNamesById: personNamesById
+            )
+        }
+    }
+
     /// Finds the saved “Weddings” Picture Search, creating the default definition if missing.
     func ensureWeddingPictureSearch() -> PictureSearchDefinition {
         sync { ensureWeddingPictureSearchUnsafe() }
@@ -499,6 +528,20 @@ final class PictureSearchRepository {
         }
         sqlite3_finalize(statement)
         return Int(sqlite3_last_insert_rowid(db))
+    }
+
+    private func isDateSearchReferencedByPictureSearchUnsafe(dateSearchId: Int) -> Bool {
+        let sql = """
+        SELECT 1
+        FROM picture_searches
+        WHERE dateSearchId = ?
+        LIMIT 1;
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_int(statement, 1, Int32(dateSearchId))
+        return sqlite3_step(statement) == SQLITE_ROW
     }
 
     private func upsertDateSearchUnsafe(
@@ -1549,29 +1592,102 @@ final class PictureSearchRepository {
     // MARK: - Event score cards
 
     private func ensureEventScoreCardSettingsUnsafe(
+        tagCategory: String,
+        tagValue: String,
+        personNamesById: [Int: String]
+    ) -> PictureSearchEventScoreCardSettings {
+        let category = tagCategory.trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = tagValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let existing = fetchEventScoreCardSettingsUnsafe(
+            tagCategory: category,
+            tagValue: value
+        ) {
+            return existing
+        }
+
+        if let definition = fetchAllPictureSearchesUnsafe().first(where: {
+            $0.targetTagCategory.compare(category, options: .caseInsensitive) == .orderedSame
+                && $0.targetEventType.compare(value, options: .caseInsensitive) == .orderedSame
+        }) {
+            return ensureEventScoreCardSettingsUnsafe(
+                for: definition,
+                personNamesById: personNamesById
+            )
+        }
+
+        var blank = PictureSearchEventScoreCardSettings.blank(
+            tagCategory: category,
+            tagValue: value
+        )
+        // Avoid UNIQUE name collisions with unrelated cards.
+        if fetchEventScoreCardSettingsUnsafe(named: blank.name) != nil {
+            blank.name = "\(value) · \(category)"
+        }
+        return saveEventScoreCardSettingsUnsafe(blank)
+    }
+
+    private func ensureEventScoreCardSettingsUnsafe(
         for definition: PictureSearchDefinition,
         personNamesById: [Int: String]
     ) -> PictureSearchEventScoreCardSettings {
-        if var existing = fetchEventScoreCardSettingsUnsafe(named: definition.name) {
+        let desired = PictureSearchEventScoreCardSettings.fromPictureSearch(
+            definition,
+            personNamesById: personNamesById
+        )
+
+        var existing =
+            fetchEventScoreCardSettingsUnsafe(named: definition.name)
+            ?? fetchEventScoreCardSettingsUnsafe(
+                tagCategory: definition.targetTagCategory,
+                tagValue: definition.targetEventType
+            )
+
+        // Legacy person birthday cards used "Vince Birthday" / target "Birthday".
+        if existing == nil,
+           MilestonePictureSearchDefaults.isPersonBirthdayTagValue(definition.targetEventType) {
+            let legacyPlain = definition.targetEventType
+                .replacingOccurrences(of: "'s Birthday", with: " Birthday", options: .caseInsensitive)
+            if legacyPlain.compare(definition.targetEventType, options: .caseInsensitive) != .orderedSame {
+                existing = fetchEventScoreCardSettingsUnsafe(named: legacyPlain)
+            }
+        }
+
+        if var existing {
             var didMutate = false
-            if existing.targetEventType != definition.targetEventType
-                || existing.targetTagCategory != definition.targetTagCategory {
-                existing.targetEventType = definition.targetEventType
-                existing.targetTagCategory = definition.targetTagCategory
+            if existing.name.compare(desired.name, options: .caseInsensitive) != .orderedSame {
+                // Keep UNIQUE name: only rename when the desired name is free.
+                if fetchEventScoreCardSettingsUnsafe(named: desired.name) == nil
+                    || fetchEventScoreCardSettingsUnsafe(named: desired.name)?.eventScoreCardId
+                        == existing.eventScoreCardId {
+                    existing.name = desired.name
+                    didMutate = true
+                }
+            }
+            if existing.targetEventType != desired.targetEventType
+                || existing.targetTagCategory != desired.targetTagCategory {
+                existing.targetEventType = desired.targetEventType
+                existing.targetTagCategory = desired.targetTagCategory
                 didMutate = true
             }
             let existingKeys = Set(existing.visionTags.map { $0.objectKey.lowercased() })
-            for tag in definition.visionTagSearch.tags {
+            for tag in desired.visionTags {
                 let key = tag.objectKey.lowercased()
                 guard !existingKeys.contains(key) else { continue }
-                existing.visionTags.append(
-                    .init(
-                        objectKey: tag.objectKey,
-                        minConfidence: tag.minConfidence,
-                        points: 1
-                    )
-                )
+                existing.visionTags.append(tag)
                 didMutate = true
+            }
+            let existingPeople = Set(existing.people.map(\.personId))
+            for person in desired.people where !existingPeople.contains(person.personId) {
+                existing.people.append(person)
+                didMutate = true
+            }
+            // Keep birthday date window synced from Picture Search values, not its dateSearchId.
+            if MilestonePictureSearchDefaults.isPersonBirthdayTagValue(desired.targetEventType) {
+                let before = existing.dateSearch
+                existing.dateSearch.copyCalendarFields(from: desired.dateSearch)
+                if existing.dateSearch != before {
+                    didMutate = true
+                }
             }
             if didMutate {
                 return saveEventScoreCardSettingsUnsafe(existing)
@@ -1579,11 +1695,7 @@ final class PictureSearchRepository {
             return existing
         }
 
-        let created = PictureSearchEventScoreCardSettings.fromPictureSearch(
-            definition,
-            personNamesById: personNamesById
-        )
-        return saveEventScoreCardSettingsUnsafe(created)
+        return saveEventScoreCardSettingsUnsafe(desired)
     }
 
     private func saveEventScoreCardSettingsUnsafe(
@@ -1593,6 +1705,12 @@ final class PictureSearchRepository {
         var dateSearch = settings.dateSearch
         if dateSearch.name == nil || dateSearch.name?.isEmpty == true {
             dateSearch.name = "\(settings.name) Score Card Dates"
+        }
+        // Never mutate a date_searches row still owned by a Picture Search.
+        if let sharedId = dateSearch.dateSearchId,
+           sharedId > 0,
+           isDateSearchReferencedByPictureSearchUnsafe(dateSearchId: sharedId) {
+            dateSearch = dateSearch.detachedCopy(named: dateSearch.name)
         }
         let dateSearchId = upsertDateSearchUnsafe(dateSearch, timestamp: timestamp)
 
@@ -1783,12 +1901,48 @@ final class PictureSearchRepository {
         return Int(sqlite3_column_int(statement, 0))
     }
 
+    private func fetchAllEventScoreCardSettingsUnsafe() -> [PictureSearchEventScoreCardSettings] {
+        let sql = """
+        SELECT eventScoreCardId
+        FROM event_score_cards
+        ORDER BY targetTagCategory COLLATE NOCASE, targetEventType COLLATE NOCASE, name COLLATE NOCASE;
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(statement) }
+        var ids: [Int] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            ids.append(Int(sqlite3_column_int(statement, 0)))
+        }
+        return ids.compactMap { fetchEventScoreCardSettingsUnsafe(cardId: $0) }
+    }
+
+    private func fetchEventScoreCardSettingsUnsafe(
+        tagCategory: String,
+        tagValue: String
+    ) -> PictureSearchEventScoreCardSettings? {
+        let sql = """
+        SELECT eventScoreCardId
+        FROM event_score_cards
+        WHERE COALESCE(targetTagCategory, '') = ? COLLATE NOCASE
+          AND targetEventType = ? COLLATE NOCASE
+        ORDER BY eventScoreCardId ASC
+        LIMIT 1;
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        sqlite3_bind_text(statement, 1, (tagCategory as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 2, (tagValue as NSString).utf8String, -1, nil)
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        return fetchEventScoreCardSettingsUnsafe(cardId: Int(sqlite3_column_int(statement, 0)))
+    }
+
     private func fetchEventScoreCardSettingsUnsafe(
         named name: String
     ) -> PictureSearchEventScoreCardSettings? {
         let sql = """
-        SELECT eventScoreCardId, name, targetTagCategory, targetEventType, dateSearchId,
-               onDatePoints, pointsPerDayFromAnchor, minimumScoreForAI
+        SELECT eventScoreCardId
         FROM event_score_cards
         WHERE name = ? COLLATE NOCASE
         LIMIT 1;
@@ -1796,12 +1950,30 @@ final class PictureSearchRepository {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
         sqlite3_bind_text(statement, 1, (name as NSString).utf8String, -1, nil)
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        return fetchEventScoreCardSettingsUnsafe(cardId: Int(sqlite3_column_int(statement, 0)))
+    }
+
+    private func fetchEventScoreCardSettingsUnsafe(
+        cardId: Int
+    ) -> PictureSearchEventScoreCardSettings? {
+        let sql = """
+        SELECT eventScoreCardId, name, targetTagCategory, targetEventType, dateSearchId,
+               onDatePoints, pointsPerDayFromAnchor, minimumScoreForAI
+        FROM event_score_cards
+        WHERE eventScoreCardId = ?
+        LIMIT 1;
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        sqlite3_bind_int(statement, 1, Int32(cardId))
         guard sqlite3_step(statement) == SQLITE_ROW else {
             sqlite3_finalize(statement)
             return nil
         }
 
-        let cardId = Int(sqlite3_column_int(statement, 0))
+        let loadedCardId = Int(sqlite3_column_int(statement, 0))
         let cardName = String(cString: sqlite3_column_text(statement, 1))
         let targetTagCategory = optionalString(statement, 2) ?? "Milestone"
         let targetEventType = String(cString: sqlite3_column_text(statement, 3))
@@ -1813,13 +1985,13 @@ final class PictureSearchRepository {
 
         let dateSearch = dateSearchId.flatMap { fetchDateSearchUnsafe(dateSearchId: $0) }
             ?? .weddingDefault()
-        let visionTags = fetchEventScoreCardVisionTagsUnsafe(cardId: cardId)
-        let people = fetchEventScoreCardPeopleUnsafe(cardId: cardId)
-        let locations = fetchEventScoreCardLocationsUnsafe(cardId: cardId)
+        let visionTags = fetchEventScoreCardVisionTagsUnsafe(cardId: loadedCardId)
+        let people = fetchEventScoreCardPeopleUnsafe(cardId: loadedCardId)
+        let locations = fetchEventScoreCardLocationsUnsafe(cardId: loadedCardId)
 
         return PictureSearchEventScoreCardSettings(
             name: cardName,
-            eventScoreCardId: cardId,
+            eventScoreCardId: loadedCardId,
             targetTagCategory: targetTagCategory,
             targetEventType: targetEventType,
             visionTags: visionTags,

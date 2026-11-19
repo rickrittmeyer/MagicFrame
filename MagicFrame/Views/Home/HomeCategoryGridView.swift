@@ -13,11 +13,12 @@ struct HomeCategoryGridView: View {
         LazyVGrid(columns: columns, spacing: 12) {
             NavigationLink {
                 PictureBrowserView(
-                    title: "All Media",
+                    title: "All",
                     loadsAllPhotos: true,
                     sortOptions: [.dateTaken, .dateImported],
                     usesNavigationTitle: true,
-                    enablesVideoFilter: true
+                    enablesVideoFilter: true,
+                    browseMonthScope: .allLibrary
                 )
             } label: {
                 HomeCategoryCard(

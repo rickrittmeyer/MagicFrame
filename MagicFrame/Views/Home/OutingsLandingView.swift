@@ -47,6 +47,7 @@ struct OutingsLandingView: View {
         }
         .onAppear {
             vm.clearEventsTabFocus()
+            vm.setMainTabChromeMode(.landing)
         }
     }
 

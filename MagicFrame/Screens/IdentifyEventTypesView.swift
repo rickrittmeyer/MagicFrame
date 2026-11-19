@@ -65,12 +65,17 @@ struct IdentifyEventTypesView: View {
         return nil
     }
 
-    /// Matches “{Name} Birthday” (or legacy “… Birthday Picture Search”) to a people record.
+    /// Matches “{Name}'s Birthday” / legacy “{Name} Birthday” to a people record.
     private static func ensurePersonBirthdayPictureSearchIfNeeded(
         preferredSearchName: String
     ) -> PictureSearchDefinition? {
         let trimmed = preferredSearchName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let suffixes = [" Birthday Picture Search", " Birthday"]
+        let suffixes = [
+            "'s Birthday Picture Search",
+            "'s Birthday",
+            " Birthday Picture Search",
+            " Birthday",
+        ]
         var personName: String?
         for suffix in suffixes {
             guard trimmed.count > suffix.count,

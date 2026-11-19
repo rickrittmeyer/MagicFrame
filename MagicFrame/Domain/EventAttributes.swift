@@ -53,6 +53,11 @@ enum EventAttributeField: String, CaseIterable, Identifiable {
         }) {
             return .eventType
         }
+        if tripType.builtInOptions.contains(where: {
+            $0.compare(trimmed, options: .caseInsensitive) == .orderedSame
+        }) {
+            return .tripType
+        }
         return .milestoneType
     }
 
@@ -60,7 +65,7 @@ enum EventAttributeField: String, CaseIterable, Identifiable {
         switch self {
         case .eventType: return "Event Type"
         case .activityType: return "Activity"
-        case .tripType: return "Trip"
+        case .tripType: return "Trips"
         case .milestoneType: return "Milestone"
         case .holidayType: return "Holiday"
         case .mainPerson, .secondaryMainPerson: return "Person"
@@ -71,7 +76,7 @@ enum EventAttributeField: String, CaseIterable, Identifiable {
         switch self {
         case .eventType: return "Event Type"
         case .activityType: return "Activity"
-        case .tripType: return "Trip"
+        case .tripType: return "Trips"
         case .milestoneType: return "Milestone"
         case .holidayType: return "Holiday"
         case .mainPerson, .secondaryMainPerson: return "Person"
@@ -91,10 +96,11 @@ enum EventAttributeField: String, CaseIterable, Identifiable {
         }
     }
 
-    /// `event_tags.tagCategory` value (holiday uses legacy `"holiday"`).
+    /// `event_tags.tagCategory` value (holiday / Trips use display-style keys).
     var tagCategory: String {
         switch self {
         case .holidayType: return "holiday"
+        case .tripType: return "Trips"
         default: return legacyColumnName
         }
     }
@@ -124,6 +130,10 @@ enum EventAttributeField: String, CaseIterable, Identifiable {
         if trimmed.compare("holiday", options: .caseInsensitive) == .orderedSame {
             return .holidayType
         }
+        if trimmed.compare("Trips", options: .caseInsensitive) == .orderedSame
+            || trimmed.compare("tripType", options: .caseInsensitive) == .orderedSame {
+            return .tripType
+        }
         if trimmed.compare("eventMainPerson", options: .caseInsensitive) == .orderedSame {
             return .mainPerson
         }
@@ -145,7 +155,7 @@ enum EventAttributeField: String, CaseIterable, Identifiable {
         switch self {
         case .eventType: return "customEventTypes"
         case .activityType: return "customActivityTypes"
-        case .tripType: return nil
+        case .tripType: return "customTripTypes"
         case .milestoneType: return "customMilestoneTypes"
         case .holidayType: return "customHolidayTypes"
         case .mainPerson, .secondaryMainPerson: return nil
@@ -174,7 +184,7 @@ enum EventAttributeField: String, CaseIterable, Identifiable {
         case .activityType:
             return ["Dance", "Hiking", "Cornhole"]
         case .tripType:
-            return []
+            return ["Beach", "Camping", "Ski", "Disney"]
         case .milestoneType:
             return [
                 "Birthday",

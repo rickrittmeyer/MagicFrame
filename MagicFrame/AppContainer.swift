@@ -9,6 +9,7 @@ final class AppContainer {
     let metadata: AppMetadataStore
     let photos: PhotoRepository
     let people: PeopleRepository
+    let peopleRelationships: PeopleRelationshipRepository
     let albums: AlbumRepository
     let photoTextMetadata: PhotoTextMetadataRepository
     let photoExif: PhotoExifRepository
@@ -22,6 +23,7 @@ final class AppContainer {
     let visionJobs: VisionJobRepository
     let faceRecognition: FaceRecognitionRepository
     let pictureSearches: PictureSearchRepository
+    let mediaSavedSearches: MediaSavedSearchRepository
     let holidays: HolidayRepository
     private(set) lazy var faceRecognitionService: FaceRecognitionService = FaceRecognitionService(
         database: databaseManager,
@@ -100,6 +102,7 @@ final class AppContainer {
         metadata = AppMetadataStore(database: databaseManager)
         photos = PhotoRepository(database: databaseManager, metadata: metadata)
         people = PeopleRepository(database: databaseManager)
+        peopleRelationships = PeopleRelationshipRepository(database: databaseManager)
         albums = AlbumRepository(database: databaseManager)
         photoTextMetadata = PhotoTextMetadataRepository(database: databaseManager)
         photoExif = PhotoExifRepository(database: databaseManager)
@@ -124,6 +127,7 @@ final class AppContainer {
             database: databaseManager,
             holidays: holidays
         )
+        mediaSavedSearches = MediaSavedSearchRepository(database: databaseManager)
         locations = LocationRepository(database: databaseManager, events: events)
         stadiums = StadiumRepository(database: databaseManager)
         photos.bindLocations(locations)
@@ -142,5 +146,7 @@ final class AppContainer {
                 eventTags.migrateMisclassifiedMilestoneEventTypesIfNeeded()
             }
         ))
+
+        peopleRelationships.backfillFromEventWeddingDatesIfNeeded()
     }
 }

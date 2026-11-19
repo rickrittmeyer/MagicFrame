@@ -9,6 +9,7 @@ struct IndexedPhoto {
     let mediaSubtype: Int
     let latitude: Double?
     let longitude: Double?
+    let locationId: Int?
     let isScreenshot: Bool
     let aspectRatio: Double
     let orientation: String
@@ -29,6 +30,7 @@ struct IndexedPhoto {
         mediaSubtype: Int,
         latitude: Double?,
         longitude: Double?,
+        locationId: Int? = nil,
         isScreenshot: Bool,
         aspectRatio: Double,
         orientation: String,
@@ -48,6 +50,7 @@ struct IndexedPhoto {
         self.mediaSubtype = mediaSubtype
         self.latitude = latitude
         self.longitude = longitude
+        self.locationId = locationId
         self.isScreenshot = isScreenshot
         self.aspectRatio = aspectRatio
         self.orientation = orientation
@@ -65,6 +68,7 @@ struct IndexedPhoto {
         isSimilarGroupPick: Bool? = nil
     ) -> IndexedPhoto {
         copy(
+            creationDate: creationDate,
             isFavorite: isFavorite,
             showOnFrame: showOnFrame,
             isHiddenInEvent: isHiddenInEvent,
@@ -74,6 +78,7 @@ struct IndexedPhoto {
 
     func withFavorite(_ isFavorite: Bool) -> IndexedPhoto {
         copy(
+            creationDate: creationDate,
             isFavorite: isFavorite,
             showOnFrame: showOnFrame,
             isHiddenInEvent: isHiddenInEvent,
@@ -83,6 +88,7 @@ struct IndexedPhoto {
 
     func withHiddenInEvent(_ isHiddenInEvent: Bool) -> IndexedPhoto {
         copy(
+            creationDate: creationDate,
             isFavorite: isFavorite,
             showOnFrame: isHiddenInEvent ? false : showOnFrame,
             isHiddenInEvent: isHiddenInEvent,
@@ -90,7 +96,38 @@ struct IndexedPhoto {
         )
     }
 
+    func withCreationDate(_ creationDate: String) -> IndexedPhoto {
+        copy(
+            creationDate: creationDate,
+            isFavorite: isFavorite,
+            showOnFrame: showOnFrame,
+            isHiddenInEvent: isHiddenInEvent,
+            isSimilarGroupPick: isSimilarGroupPick
+        )
+    }
+
+    func withLocation(
+        latitude: Double?,
+        longitude: Double?,
+        locationId: Int?
+    ) -> IndexedPhoto {
+        copy(
+            creationDate: creationDate,
+            latitude: latitude,
+            longitude: longitude,
+            locationId: locationId,
+            isFavorite: isFavorite,
+            showOnFrame: showOnFrame,
+            isHiddenInEvent: isHiddenInEvent,
+            isSimilarGroupPick: isSimilarGroupPick
+        )
+    }
+
     private func copy(
+        creationDate: String? = nil,
+        latitude: Double? = nil,
+        longitude: Double? = nil,
+        locationId: Int? = nil,
         isFavorite: Bool,
         showOnFrame: Bool,
         isHiddenInEvent: Bool,
@@ -98,13 +135,14 @@ struct IndexedPhoto {
     ) -> IndexedPhoto {
         IndexedPhoto(
             id: id,
-            creationDate: creationDate,
+            creationDate: creationDate ?? self.creationDate,
             isFavorite: isFavorite,
             width: width,
             height: height,
             mediaSubtype: mediaSubtype,
-            latitude: latitude,
-            longitude: longitude,
+            latitude: latitude ?? self.latitude,
+            longitude: longitude ?? self.longitude,
+            locationId: locationId ?? self.locationId,
             isScreenshot: isScreenshot,
             aspectRatio: aspectRatio,
             orientation: orientation,
@@ -113,7 +151,8 @@ struct IndexedPhoto {
             faceSmileScore: faceSmileScore,
             showOnFrame: showOnFrame,
             isHiddenInEvent: isHiddenInEvent,
-            isSimilarGroupPick: isSimilarGroupPick
+            isSimilarGroupPick: isSimilarGroupPick,
+            isVideo: isVideo
         )
     }
 }

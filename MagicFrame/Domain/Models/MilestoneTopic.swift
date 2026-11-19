@@ -21,7 +21,7 @@ enum MilestoneTopicCatalog {
         MilestoneTopic(
             id: "birthdays",
             title: "Birthdays",
-            filter: .milestoneTag(value: "Birthday"),
+            filter: .birthdays,
             systemImage: "birthday.cake.fill",
             pictureSearchTargetTag: "Birthday",
             visionObjectKeys: MilestonePictureSearchDefaults.birthdayVisionObjectKeys

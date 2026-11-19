@@ -1,3 +1,4 @@
+import CoreLocation
 import SwiftUI
 
 struct EventDetailView: View {
@@ -9,7 +10,33 @@ struct EventDetailView: View {
     @State private var attributePickerField: EventAttributeField?
     @State private var activeMilestonePersonPicker: MilestonePersonPickerKind?
     @State private var pendingMilestonePersonPicker: MilestonePersonPickerKind?
-    @FocusState private var isNameFieldFocused: Bool
+    @State private var isShowingEventScoreCards = false
+    @State private var isShowingAdjustDateSheet = false
+    @State private var isShowingAdjustLocationSheet = false
+    @State private var pendingDateAdjustPreview: PhotoDateAdjustPreview?
+    @State private var pendingLocationAdjustPreview: PhotoLocationAdjustPreview?
+    @State private var isShowingLeaveEventPrompt = false
+    @State private var isShowingExistingEventPicker = false
+    @State private var candidateEventsForDateAdjust: [IndexedEvent] = []
+    @State private var isShowingNoMatchingEventAlert = false
+    @State private var dateAdjustSuccessEvent: IndexedEvent?
+    @State private var isShowingDateAdjustSuccess = false
+    @State private var shouldDismissAfterDateAdjust = false
+    @State private var destinationEventToOpen: IndexedEvent?
+    @State private var isNavigatingToDestinationEvent = false
+    @State private var dateAdjustErrorMessage: String?
+    @State private var pendingApplePhotosDateUpdates: [(photoId: String, newDate: Date)] = []
+    @State private var isShowingApplePhotosSyncConfirm = false
+    @State private var isSyncingApplePhotosDates = false
+    @State private var pendingApplePhotosLocationUpdates: [(photoId: String, latitude: Double, longitude: Double)] = []
+    @State private var isShowingApplePhotosLocationSyncConfirm = false
+    @State private var isSyncingApplePhotosLocations = false
+    @State private var locationAdjustErrorMessage: String?
+    @State private var isShowingDuplicatesSheet = false
+    @State private var pendingDuplicateDeleteIds: [String] = []
+    @State private var isConfirmingDuplicateDelete = false
+    @State private var isDeletingDuplicates = false
+    @State private var duplicateActionErrorMessage: String?
     @Environment(\.dismiss) private var dismiss
 
     init(
@@ -29,33 +56,229 @@ struct EventDetailView: View {
     }
 
     var body: some View {
+        eventDetailChrome
+            .sheet(isPresented: $isShowingAdjustLocationSheet) {
+                PhotoAdjustLocationSheet(
+                    originalLabel: vm.adjustLocationAnchorLabel,
+                    originalCoordinate: vm.adjustLocationAnchorCoordinate.map {
+                        CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude)
+                    },
+                    selectedCount: vm.selectedPhotoCount,
+                    locations: vm.locationsForAdjust(),
+                    onCancel: {
+                        isShowingAdjustLocationSheet = false
+                    },
+                    onAdjust: { location in
+                        isShowingAdjustLocationSheet = false
+                        handleLocationAdjust(location: location)
+                    }
+                )
+            }
+            .alert(
+                "Also update these photos in Apple Photos?",
+                isPresented: $isShowingApplePhotosLocationSyncConfirm
+            ) {
+                Button("Update Photos") {
+                    Task { await confirmApplePhotosLocationSync(shouldSync: true) }
+                }
+                Button("Not Now", role: .cancel) {
+                    Task { await confirmApplePhotosLocationSync(shouldSync: false) }
+                }
+            } message: {
+                Text(
+                    "This will change the location stored in the Photos app for the selected photos."
+                )
+            }
+            .alert(
+                "Couldn’t Adjust Location",
+                isPresented: Binding(
+                    get: { locationAdjustErrorMessage != nil },
+                    set: { if !$0 { locationAdjustErrorMessage = nil } }
+                )
+            ) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(locationAdjustErrorMessage ?? "")
+            }
+            .sheet(isPresented: $isShowingDuplicatesSheet) {
+                EventDuplicatesReviewSheet(
+                    matches: vm.duplicateMatches,
+                    onCancel: {
+                        isShowingDuplicatesSheet = false
+                    },
+                    onHide: { photoIds in
+                        vm.hideDuplicatePhotos(photoIds: photoIds)
+                        if vm.duplicateMatches.isEmpty {
+                            isShowingDuplicatesSheet = false
+                        }
+                    },
+                    onDelete: { photoIds in
+                        pendingDuplicateDeleteIds = photoIds
+                        isConfirmingDuplicateDelete = true
+                    }
+                )
+            }
+            .alert(
+                "Delete Selected Photos?",
+                isPresented: $isConfirmingDuplicateDelete
+            ) {
+                Button("Delete", role: .destructive) {
+                    let ids = pendingDuplicateDeleteIds
+                    pendingDuplicateDeleteIds = []
+                    Task { await deleteSelectedDuplicates(ids) }
+                }
+                Button("Cancel", role: .cancel) {
+                    pendingDuplicateDeleteIds = []
+                }
+            } message: {
+                Text(
+                    "This removes \(pendingDuplicateDeleteIds.count) photo\(pendingDuplicateDeleteIds.count == 1 ? "" : "s") from Magic Frame and Apple Photos."
+                )
+            }
+            .alert(
+                "Couldn’t Finish Delete",
+                isPresented: Binding(
+                    get: { duplicateActionErrorMessage != nil },
+                    set: { if !$0 { duplicateActionErrorMessage = nil } }
+                )
+            ) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(duplicateActionErrorMessage ?? "")
+            }
+            .overlay {
+                if isDeletingDuplicates {
+                    ZStack {
+                        Color.black.opacity(0.25).ignoresSafeArea()
+                        ProgressView("Deleting…")
+                            .padding(20)
+                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+                    }
+                    .allowsHitTesting(true)
+                }
+            }
+    }
+
+    @ViewBuilder
+    private var duplicatesFooter: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                vm.findDuplicates()
+            } label: {
+                HStack {
+                    if vm.isFindingDuplicates {
+                        ProgressView()
+                    } else {
+                        Image(systemName: "doc.on.doc")
+                    }
+                    Text(vm.isFindingDuplicates ? "Finding Duplicates…" : "Find Duplicates")
+                    Spacer()
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+            }
+            .buttonStyle(.plain)
+            .disabled(vm.isFindingDuplicates || vm.isRunningAIAssist)
+
+            if let duplicateScanStatus = vm.duplicateScanStatus {
+                Text(duplicateScanStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 4)
+            }
+
+            if !vm.duplicateMatches.isEmpty {
+                Button {
+                    isShowingDuplicatesSheet = true
+                } label: {
+                    HStack {
+                        Image(systemName: "eye")
+                        Text("Duplicates detected")
+                        Spacer()
+                        Text("\(vm.duplicateMatches.count)")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Image(systemName: "chevron.right")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 12)
+        .padding(.bottom, 8)
+    }
+
+    @MainActor
+    private func deleteSelectedDuplicates(_ photoIds: [String]) async {
+        isDeletingDuplicates = true
+        let error = await vm.deleteDuplicatePhotos(photoIds: photoIds)
+        isDeletingDuplicates = false
+        if let error {
+            duplicateActionErrorMessage = error
+        }
+        if vm.duplicateMatches.isEmpty {
+            isShowingDuplicatesSheet = false
+        }
+    }
+
+    private var eventDetailChrome: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                nameSection
+            LazyVStack(alignment: .leading, spacing: 16, pinnedViews: [.sectionHeaders]) {
+                eventMetaSection
                     .padding(.horizontal, 16)
                     .padding(.top, 8)
 
-                eventMetaSection
-                    .padding(.horizontal, 16)
-
                 photoGridHeader
 
-                photoGrid
+                Section {
+                    photoGridContent
 
-                if let objectStatus = vm.objectRecognitionStatus {
-                    Text(objectStatus)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 16)
-                        .padding(.top, 8)
+                    if let objectStatus = vm.objectRecognitionStatus {
+                        Text(objectStatus)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 16)
+                            .padding(.top, 8)
+                    }
+
+                    duplicatesFooter
+                } header: {
+                    stickyPhotoControlsBar
                 }
-
             }
         }
         .background(Color(.systemBackground))
-        .navigationTitle("Event")
         .navigationBarTitleDisplayMode(.inline)
+        .navigationDestination(isPresented: $isShowingEventScoreCards) {
+            EventScoreCardsListView()
+        }
+        .navigationDestination(isPresented: $isNavigatingToDestinationEvent) {
+            if let destinationEventToOpen {
+                EventDetailView(
+                    event: destinationEventToOpen,
+                    onEventUpdated: vm.onEventUpdated,
+                    onEventHidden: vm.onEventHidden,
+                    onEventUnhidden: vm.onEventUnhidden
+                )
+            }
+        }
         .toolbar {
+            ToolbarItem(placement: .principal) {
+                Text(vm.eventName)
+                    .font(.headline)
+                    .foregroundStyle(vm.userEditedName ? .primary : .secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .accessibilityLabel("Event name")
+            }
+
             ToolbarItem(placement: .topBarLeading) {
                 if vm.isSelectingPhotos {
                     Button("Cancel") {
@@ -65,15 +288,19 @@ struct EventDetailView: View {
             }
 
             ToolbarItem(placement: .topBarTrailing) {
-                if vm.isSelectingPhotos {
-                    Text("\(vm.selectedPhotoCount) selected")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                } else {
+                if !vm.isSelectingPhotos {
                     HStack(spacing: 16) {
-                        Button("Select") {
-                            vm.beginPhotoSelection()
+                        Button {
+                            vm.runAIAssist()
+                        } label: {
+                            if vm.isRunningAIAssist {
+                                ProgressView()
+                            } else {
+                                Image(systemName: "sparkles")
+                            }
                         }
+                        .disabled(vm.isRunningAIAssist)
+                        .accessibilityLabel("AI Assist")
 
                         Menu {
                             Button(vm.showHiddenPhotos ? "Hide Hidden Photos" : "Show Hidden Photos") {
@@ -114,14 +341,6 @@ struct EventDetailView: View {
                     }
                 }
             }
-
-            ToolbarItemGroup(placement: .keyboard) {
-                Spacer()
-                Button("Done") {
-                    isNameFieldFocused = false
-                    vm.saveEventName()
-                }
-            }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if vm.isSelectingPhotos {
@@ -154,12 +373,14 @@ struct EventDetailView: View {
                         .padding(.vertical, 2)
                     }
                 }
-                .navigationTitle("Choose Game")
+                .navigationTitle(
+                    vm.gameLookupCandidates.count == 1 ? "Confirm Game Score" : "Choose Game"
+                )
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) {
-                        Button("Cancel") {
-                            vm.showGameLookupCandidates = false
+                        Button("Dismiss") {
+                            vm.dismissGameLookupCandidates()
                         }
                     }
                 }
@@ -180,6 +401,132 @@ struct EventDetailView: View {
             Text(
                 "This event will now be hidden. You can find this Event again by selecting Show Hidden Events."
             )
+        }
+        .sheet(isPresented: $isShowingAdjustDateSheet) {
+            if let originalDate = vm.adjustDateAnchorDate {
+                PhotoAdjustDateTimeSheet(
+                    originalDate: originalDate,
+                    selectedCount: vm.selectedPhotoCount,
+                    onCancel: {
+                        isShowingAdjustDateSheet = false
+                    },
+                    onAdjust: { adjustedDate, _ in
+                        isShowingAdjustDateSheet = false
+                        handleDateAdjust(adjustedAnchor: adjustedDate)
+                    }
+                )
+            }
+        }
+        .confirmationDialog(
+            "Change Event?",
+            isPresented: $isShowingLeaveEventPrompt,
+            titleVisibility: .visible
+        ) {
+            Button("Create New Event") {
+                runAfterDialogDismisses {
+                    Task { await commitDateAdjust(destination: .createNew) }
+                }
+            }
+            Button("Add to Existing Event") {
+                runAfterDialogDismisses {
+                    presentExistingEventChoices()
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                pendingDateAdjustPreview = nil
+            }
+        } message: {
+            Text(
+                "Changing the dates of these photos will remove them from this event. Do you want to create a new event with these photos, or add them to an existing event with the same date range?"
+            )
+        }
+        .sheet(isPresented: $isShowingExistingEventPicker) {
+            PhotoDateAdjustEventPickerSheet(
+                events: candidateEventsForDateAdjust,
+                onCancel: {
+                    isShowingExistingEventPicker = false
+                    pendingDateAdjustPreview = nil
+                },
+                onSelect: { event in
+                    isShowingExistingEventPicker = false
+                    runAfterDialogDismisses {
+                        Task { await commitDateAdjust(destination: .existing(eventId: event.eventId)) }
+                    }
+                }
+            )
+        }
+        .overlay {
+            if vm.isAdjustingDates || vm.isAdjustingLocations
+                || isSyncingApplePhotosDates || isSyncingApplePhotosLocations {
+                ZStack {
+                    Color.black.opacity(0.25).ignoresSafeArea()
+                    ProgressView(progressOverlayTitle)
+                        .padding(20)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+                }
+                .allowsHitTesting(true)
+            }
+        }
+        .alert(
+            "No Matching Events",
+            isPresented: $isShowingNoMatchingEventAlert
+        ) {
+            Button("Create New Event") {
+                Task { await commitDateAdjust(destination: .createNew) }
+            }
+            Button("Cancel", role: .cancel) {
+                pendingDateAdjustPreview = nil
+            }
+        } message: {
+            Text("No existing events contain this date range. Create a new event instead?")
+        }
+        .alert(
+            "Also update these photos in Apple Photos?",
+            isPresented: $isShowingApplePhotosSyncConfirm
+        ) {
+            Button("Update Photos") {
+                Task { await confirmApplePhotosDateSync(shouldSync: true) }
+            }
+            Button("Not Now", role: .cancel) {
+                Task { await confirmApplePhotosDateSync(shouldSync: false) }
+            }
+        } message: {
+            Text(
+                "This will change the date/time stored in the Photos app for the selected photos."
+            )
+        }
+        .alert(
+            "Photos Moved",
+            isPresented: $isShowingDateAdjustSuccess
+        ) {
+            Button("Go to Event") {
+                if let event = dateAdjustSuccessEvent {
+                    destinationEventToOpen = event
+                    isNavigatingToDestinationEvent = true
+                }
+            }
+            Button(shouldDismissAfterDateAdjust ? "Close Event" : "Stay Here", role: .cancel) {
+                if shouldDismissAfterDateAdjust {
+                    dismiss()
+                }
+            }
+        } message: {
+            if let event = dateAdjustSuccessEvent {
+                Text(
+                    "These pictures were added to \(PhotoDateAdjustResult.eventSummaryLine(for: event)). Do you want to go to that event?"
+                )
+            }
+        }
+        .alert(
+            "Couldn’t Adjust Date",
+            isPresented: Binding(
+                get: { dateAdjustErrorMessage != nil },
+                set: { if !$0 { dateAdjustErrorMessage = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(dateAdjustErrorMessage ?? "")
         }
         .alert(
             customOptionAlertTitle,
@@ -257,6 +604,25 @@ struct EventDetailView: View {
                 )
             }
         }
+        .sheet(isPresented: $vm.showWeddingCoupleNaming) {
+            if let photoId = vm.weddingCoupleNamingPhotoId,
+               vm.weddingCoupleNamingFaces.count >= 2 {
+                WeddingCoupleNamingSheet(
+                    photoId: photoId,
+                    faces: vm.weddingCoupleNamingFaces,
+                    defaultWeddingDate: vm.defaultWeddingDate(),
+                    onComplete: { brideFaceId, brideName, groomFaceId, groomName, weddingDate in
+                        vm.completeWeddingCoupleNaming(
+                            brideFaceId: brideFaceId,
+                            brideName: brideName,
+                            groomFaceId: groomFaceId,
+                            groomName: groomName,
+                            weddingDate: weddingDate
+                        )
+                    }
+                )
+            }
+        }
         .sheet(item: $vm.pendingSimilarEventAlternatives, onDismiss: {
             vm.pendingSimilarEventAlternatives = nil
         }) { request in
@@ -312,7 +678,7 @@ struct EventDetailView: View {
         return "Add Option"
     }
 
-    /// Tag control on the left; attribute chips flow in the remaining width above the photo grid.
+    /// Tag control on the left; Developer and attribute chips flow in the remaining width.
     private var photoGridHeader: some View {
         HStack(alignment: .top, spacing: 12) {
             Button {
@@ -334,39 +700,66 @@ struct EventDetailView: View {
         .padding(.horizontal, 16)
     }
 
-    @ViewBuilder
     private var selectedAttributeChips: some View {
-        if !vm.event.libraryAttributeTags.isEmpty {
-            FlowLayout(spacing: 8, lineSpacing: 8) {
-                ForEach(vm.event.libraryAttributeTags) { tag in
-                    EventAttributeTagChip(
-                        tag: tag,
-                        showsCategoryIcon: true,
-                        showsScore: false,
-                        onConfirmAI: tag.isAIDerived
-                            ? {
-                                if tag.category == .milestoneType,
-                                   tag.tagValue.compare("Wedding", options: .caseInsensitive) == .orderedSame {
-                                    vm.confirmAIWeddingMilestoneTag(tag)
+        FlowLayout(spacing: 8, lineSpacing: 8) {
+            developerTag
+
+            ForEach(vm.event.libraryAttributeTags) { tag in
+                EventAttributeTagChip(
+                    tag: tag,
+                    showsCategoryIcon: true,
+                    showsScore: false,
+                    onConfirmAI: tag.isAIDerived
+                        ? {
+                            if tag.category == .milestoneType,
+                               tag.tagValue.compare("Wedding", options: .caseInsensitive) == .orderedSame {
+                                vm.confirmAIWeddingMilestoneTag(tag)
+                                if !vm.showWeddingCoupleNaming {
                                     activeMilestonePersonPicker = .wedding
-                                } else {
-                                    vm.confirmAIAttributeTag(tag)
                                 }
+                            } else {
+                                vm.confirmAIAttributeTag(tag)
                             }
-                            : nil,
-                        onRemove: { vm.removeAttributeTag(tag) },
-                        onShowScoreDetails: nil,
-                        onTap: vm.isMilestonePersonPickerTag(tag) && !tag.isAIDerived
-                            ? {
-                                if let kind = MilestonePersonPickerKind.from(milestoneType: tag.tagValue) {
-                                    activeMilestonePersonPicker = kind
-                                }
+                        }
+                        : nil,
+                    onRemove: { vm.removeAttributeTag(tag) },
+                    onShowScoreDetails: nil,
+                    onTap: vm.isMilestonePersonPickerTag(tag) && !tag.isAIDerived
+                        ? {
+                            if let kind = MilestonePersonPickerKind.from(milestoneType: tag.tagValue) {
+                                activeMilestonePersonPicker = kind
                             }
-                            : nil
-                    )
-                }
+                        }
+                        : nil
+                )
             }
         }
+    }
+
+    /// Opens the Event Score Cards list.
+    private var developerTag: some View {
+        Button {
+            isShowingEventScoreCards = true
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "hammer.fill")
+                    .font(.caption2.weight(.semibold))
+                Text("Developer")
+                    .font(.caption.weight(.semibold))
+            }
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color(.tertiarySystemFill))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .overlay {
+                RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(Color.secondary.opacity(0.35), lineWidth: 1)
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Developer")
+        .accessibilityHint("Opens Event Score Cards")
     }
 
     private var eventMetaSection: some View {
@@ -387,6 +780,15 @@ struct EventDetailView: View {
             if let locationGeocodeStatus = vm.locationGeocodeStatus {
                 Text(locationGeocodeStatus)
                     .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let eventDate = EventDateParser.detailDisplayDateRange(
+                startDate: vm.event.startDate,
+                endDate: vm.event.endDate
+            ) {
+                Text(eventDate)
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
 
@@ -465,95 +867,247 @@ struct EventDetailView: View {
         .contentShape(Rectangle())
     }
 
-    private var nameSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Event name")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-
-                Spacer()
-
-                if let status = vm.nameSaveStatus {
-                    Text(status)
-                        .font(.caption)
-                        .foregroundStyle(status == "Saved" ? .green : .red)
+    private var photoSelectionBar: some View {
+        PhotoSelectionToggleBar(
+            isEnabled: vm.selectedPhotoCount > 0,
+            isFrameOn: vm.selectedAllOnFrame,
+            isFavoriteOn: vm.selectedAllFavorite,
+            isHiddenOn: vm.selectedAllHidden,
+            onToggleFrame: {
+                vm.toggleSelectedPhotosOnFrame()
+            },
+            onToggleFavorite: {
+                vm.toggleSelectedPhotosFavorite()
+            },
+            onToggleHide: {
+                if vm.toggleSelectedPhotosHidden() {
+                    dismiss()
                 }
+            },
+            onAdjustDate: {
+                guard vm.adjustDateAnchorDate != nil else { return }
+                isShowingAdjustDateSheet = true
+            },
+            onAdjustLocation: {
+                guard vm.selectedPhotoCount > 0 else { return }
+                isShowingAdjustLocationSheet = true
             }
+        )
+    }
 
-            TextField("Event name", text: $vm.eventName)
-                .font(.title2.bold())
-                .textFieldStyle(.roundedBorder)
-                .textInputAutocapitalization(.words)
-                .focused($isNameFieldFocused)
-                .submitLabel(.done)
-                .onSubmit {
-                    isNameFieldFocused = false
-                    vm.saveEventName()
-                }
-                .onChange(of: vm.eventName) { _, newValue in
-                    if newValue.trimmingCharacters(in: .whitespacesAndNewlines)
-                        != vm.suggestedName {
-                        vm.markNameAsUserEdited()
-                    }
-                }
+    private var progressOverlayTitle: String {
+        if isSyncingApplePhotosDates || isSyncingApplePhotosLocations {
+            return "Updating Apple Photos…"
+        }
+        if vm.isAdjustingLocations {
+            return "Updating locations…"
+        }
+        return "Updating dates…"
+    }
 
-            if let suggestedName = vm.suggestedName,
-               vm.showSuggestion {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Suggested name")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+    private func handleDateAdjust(adjustedAnchor: Date) {
+        guard let preview = vm.makeDateAdjustPreview(adjustedAnchor: adjustedAnchor) else {
+            dateAdjustErrorMessage = "Could not prepare date adjustment."
+            return
+        }
+        pendingDateAdjustPreview = preview
+        if preview.leavesCurrentEvent {
+            // Wait for the adjust sheet to finish dismissing before the next presentation.
+            runAfterDialogDismisses {
+                isShowingLeaveEventPrompt = true
+            }
+        } else {
+            Task { await commitDateAdjust(destination: nil) }
+        }
+    }
 
-                    HStack(alignment: .center, spacing: 12) {
-                        Text(suggestedName)
-                            .font(.subheadline.weight(.medium))
-                            .foregroundStyle(.primary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+    private func presentExistingEventChoices() {
+        guard let preview = pendingDateAdjustPreview else { return }
+        let candidates = vm.candidateEventsForDateAdjust(preview: preview)
+        if candidates.isEmpty {
+            isShowingNoMatchingEventAlert = true
+        } else if candidates.count == 1, let only = candidates.first {
+            Task { await commitDateAdjust(destination: .existing(eventId: only.eventId)) }
+        } else {
+            candidateEventsForDateAdjust = candidates
+            isShowingExistingEventPicker = true
+        }
+    }
 
-                        Button("Use suggested name") {
-                            vm.applySuggestedName()
-                        }
-                        .font(.subheadline)
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                    }
-                }
-                .padding(.vertical, 8)
-                .padding(.horizontal, 10)
-                .background(Color(.secondarySystemBackground))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
+    /// Avoid SwiftUI freezes from presenting a sheet/alert while another dialog is still dismissing.
+    private func runAfterDialogDismisses(_ action: @escaping () -> Void) {
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(350))
+            action()
+        }
+    }
+
+    @MainActor
+    private func commitDateAdjust(destination: PhotoDateAdjustDestination?) async {
+        guard let preview = pendingDateAdjustPreview else { return }
+        let photosUpdates = preview.updates.map { (photoId: $0.photoId, newDate: $0.newDate) }
+        let result = await vm.commitDateAdjust(preview: preview, destination: destination)
+        pendingDateAdjustPreview = nil
+
+        // Dates are always written first; only abort the Photos prompt when the user still
+        // needs to pick a destination (incomplete leave-event flow).
+        if let error = result.errorMessage,
+           result.destinationEvent == nil,
+           destination == nil,
+           preview.leavesCurrentEvent {
+            dateAdjustErrorMessage = error
+            return
+        }
+
+        if let error = result.errorMessage, result.destinationEvent == nil, destination != nil {
+            dateAdjustErrorMessage = error
+        }
+
+        pendingApplePhotosDateUpdates = photosUpdates
+        dateAdjustSuccessEvent = result.destinationEvent
+        shouldDismissAfterDateAdjust = result.sourceEmptied
+
+        runAfterDialogDismisses {
+            isShowingApplePhotosSyncConfirm = true
+        }
+    }
+
+    @MainActor
+    private func confirmApplePhotosDateSync(shouldSync: Bool) async {
+        let updates = pendingApplePhotosDateUpdates
+        pendingApplePhotosDateUpdates = []
+
+        if shouldSync, !updates.isEmpty {
+            isSyncingApplePhotosDates = true
+            let error = await vm.syncAdjustedDatesToApplePhotos(updates)
+            isSyncingApplePhotosDates = false
+            if let error {
+                dateAdjustErrorMessage = error
+            }
+        }
+
+        if dateAdjustSuccessEvent != nil {
+            runAfterDialogDismisses {
+                isShowingDateAdjustSuccess = true
+            }
+        } else if shouldDismissAfterDateAdjust {
+            dismiss()
+        }
+    }
+
+    private func handleLocationAdjust(location: ManagedLocation) {
+        guard let preview = vm.makeLocationAdjustPreview(location: location) else {
+            locationAdjustErrorMessage = "Could not prepare location adjustment."
+            return
+        }
+        pendingLocationAdjustPreview = preview
+        Task { await commitLocationAdjust() }
+    }
+
+    @MainActor
+    private func commitLocationAdjust() async {
+        guard let preview = pendingLocationAdjustPreview else { return }
+        let photosUpdates = preview.photoIds.map {
+            (photoId: $0, latitude: preview.latitude, longitude: preview.longitude)
+        }
+        let result = await vm.commitLocationAdjust(preview: preview)
+        pendingLocationAdjustPreview = nil
+
+        if let error = result.errorMessage {
+            locationAdjustErrorMessage = error
+            return
+        }
+
+        pendingApplePhotosLocationUpdates = photosUpdates
+        runAfterDialogDismisses {
+            isShowingApplePhotosLocationSyncConfirm = true
+        }
+    }
+
+    @MainActor
+    private func confirmApplePhotosLocationSync(shouldSync: Bool) async {
+        let updates = pendingApplePhotosLocationUpdates
+        pendingApplePhotosLocationUpdates = []
+
+        if shouldSync, !updates.isEmpty {
+            isSyncingApplePhotosLocations = true
+            let error = await vm.syncAdjustedLocationsToApplePhotos(updates)
+            isSyncingApplePhotosLocations = false
+            if let error {
+                locationAdjustErrorMessage = error
             }
         }
     }
 
-    private var photoSelectionBar: some View {
+    private var stickyPhotoControlsBar: some View {
         HStack(spacing: 12) {
-            Button("Add to Frame") {
-                vm.setSelectedPhotosOnFrame(true)
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(vm.selectedPhotoCount == 0)
-
-            Button("Remove from Frame") {
-                vm.setSelectedPhotosOnFrame(false)
-            }
-            .buttonStyle(.bordered)
-            .disabled(vm.selectedPhotoCount == 0)
-
-            Button("Hide", role: .destructive) {
-                if vm.hideSelectedPhotos() {
-                    dismiss()
+            if vm.isSelectingPhotos {
+                Text("\(vm.selectedPhotoCount) selected")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+            } else {
+                Spacer(minLength: 8)
+                sortMenu
+                filterMenu
+                Button("Select") {
+                    vm.beginPhotoSelection()
                 }
+                .font(.subheadline.weight(.semibold))
             }
-            .buttonStyle(.bordered)
-            .disabled(vm.selectedPhotoCount == 0)
         }
-        .font(.subheadline)
         .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.vertical, 10)
         .frame(maxWidth: .infinity)
         .background(.bar)
+    }
+
+    private var sortMenu: some View {
+        Menu {
+            ForEach(EventDetailPhotoSort.allCases) { option in
+                Button {
+                    vm.photoSort = option
+                } label: {
+                    if vm.photoSort == option {
+                        Label(option.title, systemImage: "checkmark")
+                    } else {
+                        Text(option.title)
+                    }
+                }
+            }
+        } label: {
+            Label("Sort", systemImage: "arrow.up.arrow.down")
+                .labelStyle(.iconOnly)
+                .font(.body.weight(.semibold))
+                .frame(width: 36, height: 36)
+                .contentShape(Rectangle())
+        }
+        .accessibilityLabel("Sort")
+        .accessibilityValue(vm.photoSort.title)
+    }
+
+    private var filterMenu: some View {
+        Menu {
+            ForEach(PictureBrowserFilter.allCases) { option in
+                Button {
+                    vm.photoFilter = option
+                } label: {
+                    if vm.photoFilter == option {
+                        Label(option.title, systemImage: "checkmark")
+                    } else {
+                        Text(option.title)
+                    }
+                }
+            }
+        } label: {
+            Label("Filter", systemImage: "line.3.horizontal.decrease.circle")
+                .labelStyle(.iconOnly)
+                .font(.body.weight(.semibold))
+                .frame(width: 36, height: 36)
+                .contentShape(Rectangle())
+        }
+        .accessibilityLabel("Filter")
+        .accessibilityValue(vm.photoFilter.title)
     }
 
     private func tripSectionHeader(_ section: TripPhotoDisplaySection) -> some View {
@@ -573,46 +1127,69 @@ struct EventDetailView: View {
         .padding(.horizontal, 16)
     }
 
-    private var photoGridSections: [PhotoGridSection] {
-        if vm.event.isTripContainer, !vm.tripPhotoDisplaySections.isEmpty {
-            return vm.tripPhotoDisplaySections.map { section in
-                PhotoGridSection(id: "trip-\(section.id)", items: section.displayItems)
-            }
-        }
-        return [PhotoGridSection(id: "photos", items: vm.photoDisplayItems)]
+    private func sortGroupHeader(title: String) -> some View {
+        Text(title)
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
+            .padding(.bottom, 4)
+            .background(Color(.systemBackground))
     }
 
-    private var photoGrid: some View {
-        PhotoGrid(
-            sections: photoGridSections,
-            isSelecting: vm.isSelectingPhotos,
-            selectedPhotoIds: vm.selectedPhotoIds,
-            onTap: { item in
-                if vm.isSelectingPhotos {
-                    vm.toggleDisplayItemSelection(item)
-                } else if let index = vm.fullscreenDisplayItems.firstIndex(where: { $0.id == item.id }) {
-                    selectedPhotoIndex = index
-                }
-            },
-            sectionHeader: { section in
-                if let trip = vm.tripPhotoDisplaySections.first(where: { "trip-\($0.id)" == section.id }) {
+    @ViewBuilder
+    private var photoGridContent: some View {
+        let blocks = vm.gridBlocks
+        if blocks.isEmpty {
+            ContentUnavailableView(
+                "No Pictures",
+                systemImage: "photo.on.rectangle.angled",
+                description: Text("Nothing matches the current filter.")
+            )
+            .padding(.top, 24)
+        } else {
+            ForEach(blocks) { block in
+                if let trip = block.tripSection {
                     tripSectionHeader(trip)
+                        .padding(.top, 8)
                 }
-            },
-            contextMenu: { item in
-                Button(item.representative.showOnFrame ? "Remove from Frame" : "Add to Frame") {
-                    vm.togglePhotoOnFrame(
-                        photoId: item.representative.id,
-                        in: item.isStack ? item.group : nil
-                    )
-                }
-                Button("Hide") {
-                    if vm.hideDisplayItem(item) {
-                        dismiss()
+
+                PhotoGrid(
+                    sections: block.groups.map {
+                        PhotoGridSection(id: $0.id, items: $0.items)
+                    },
+                    isSelecting: vm.isSelectingPhotos,
+                    selectedPhotoIds: vm.selectedPhotoIds,
+                    pinsSectionHeaders: false,
+                    onTap: { item in
+                        if vm.isSelectingPhotos {
+                            vm.toggleDisplayItemSelection(item)
+                        } else if let index = vm.fullscreenDisplayItems.firstIndex(where: { $0.id == item.id }) {
+                            selectedPhotoIndex = index
+                        }
+                    },
+                    sectionHeader: { section in
+                        if let group = block.groups.first(where: { $0.id == section.id }) {
+                            sortGroupHeader(title: group.title)
+                        }
+                    },
+                    contextMenu: { item in
+                        Button(item.representative.showOnFrame ? "Remove from Frame" : "Add to Frame") {
+                            vm.togglePhotoOnFrame(
+                                photoId: item.representative.id,
+                                in: item.isStack ? item.group : nil
+                            )
+                        }
+                        Button("Hide") {
+                            if vm.hideDisplayItem(item) {
+                                dismiss()
+                            }
+                        }
                     }
-                }
+                )
             }
-        )
+        }
     }
 }
 
@@ -653,18 +1230,12 @@ private struct EventAttributePickerSheet: View {
     private var attributeCategoryList: some View {
         List(EventAttributeField.tagMenuCases) { field in
             Button {
-                if field == .tripType {
-                    viewModel.setSelection("Trip", for: .tripType)
-                    onDismiss()
-                } else {
-                    selectedField = field
-                }
+                selectedField = field
             } label: {
                 HStack {
                     Label(field.menuTitle, systemImage: field.iconName)
                     Spacer()
-                    if field == .tripType,
-                       viewModel.selection(for: .tripType) != nil {
+                    if viewModel.selection(for: field) != nil {
                         Image(systemName: "checkmark")
                             .foregroundStyle(.secondary)
                     }
@@ -787,6 +1358,7 @@ private struct SimilarPhotoGroupPickerView: View {
                         onDismiss: { previewPhotoId = nil },
                         header: { context in
                             PhotoPreviewStandardHeader(
+                                photo: context.photo,
                                 index: context.displayIndex + 1,
                                 count: context.displayCount,
                                 showsCounter: !context.isZoomed,

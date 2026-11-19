@@ -513,52 +513,43 @@ final class EventRepository {
     }
 
 
-    /// Parent list-event ids that have at least one photo marked on frame (includeInSlideshow),
-    /// including photos attached to trip child days.
+    /// Parent list-event ids that have at least one photo/video marked on frame (includeInSlideshow),
+    /// including assets attached to trip child days.
+    ///
+    /// Scans on-frame links once, then intersects with the requested event ids in memory.
+    /// Avoids huge per-chunk `IN (...)` joins that freeze large libraries.
     func listEventIdsWithOnFramePhotos(among eventIds: [Int]) -> Set<Int> {
-        let unique = Array(Set(eventIds.filter { $0 > 0 }))
-        guard !unique.isEmpty else { return [] }
+        let requested = Set(eventIds.filter { $0 > 0 })
+        guard !requested.isEmpty else { return [] }
 
-        var result = Set<Int>()
-        let chunkSize = 400
-        for chunkStart in stride(from: 0, to: unique.count, by: chunkSize) {
-            let chunk = Array(unique[chunkStart..<min(chunkStart + chunkSize, unique.count)])
-            let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ", ")
-            let sql = """
-            SELECT DISTINCT listEventId FROM (
-                SELECT e.eventId AS listEventId
-                FROM events e
-                JOIN photo_events pe ON pe.eventId = e.eventId
-                JOIN photos p ON p.id = pe.photoId
-                WHERE e.eventId IN (\(placeholders))
-                  AND e.isDeleted = 0
-                  AND p.isDeleted = 0
-                  AND COALESCE(pe.includeInSlideshow, 0) = 1
-                UNION
-                SELECT e.parentEventId AS listEventId
-                FROM events e
-                JOIN photo_events pe ON pe.eventId = e.eventId
-                JOIN photos p ON p.id = pe.photoId
-                WHERE e.parentEventId IN (\(placeholders))
-                  AND e.isDeleted = 0
-                  AND p.isDeleted = 0
-                  AND COALESCE(pe.includeInSlideshow, 0) = 1
-            );
-            """
+        let sql = """
+        SELECT DISTINCT COALESCE(e.parentEventId, e.eventId) AS listEventId
+        FROM photo_events pe
+        JOIN photos p
+            ON p.id = pe.photoId
+           AND p.isDeleted = 0
+        JOIN events e
+            ON e.eventId = pe.eventId
+           AND e.isDeleted = 0
+        WHERE COALESCE(pe.includeInSlideshow, 0) = 1
+          AND COALESCE(pe.manuallyExcluded, 0) = 0;
+        """
 
-            var statement: OpaquePointer?
-            if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
-                for (index, eventId) in chunk.enumerated() {
-                    sqlite3_bind_int(statement, Int32(index + 1), Int32(eventId))
-                    sqlite3_bind_int(statement, Int32(chunk.count + index + 1), Int32(eventId))
-                }
-                while sqlite3_step(statement) == SQLITE_ROW {
-                    result.insert(Int(sqlite3_column_int(statement, 0)))
+        var statement: OpaquePointer?
+        var onFrame = Set<Int>()
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let listEventId = Int(sqlite3_column_int(statement, 0))
+                if listEventId > 0 {
+                    onFrame.insert(listEventId)
                 }
             }
-            sqlite3_finalize(statement)
+        } else if let db {
+            print("Failed on-frame event scan: \(String(cString: sqlite3_errmsg(db)))")
         }
-        return result
+        sqlite3_finalize(statement)
+
+        return onFrame.intersection(requested)
     }
 
 
@@ -609,27 +600,9 @@ final class EventRepository {
 
     var statement: OpaquePointer?
 
-    if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
-        sqlite3_bind_text(statement, 1, (field.tagCategory as NSString).utf8String, -1, nil)
-        while sqlite3_step(statement) == SQLITE_ROW {
-            if let value = sqliteOptionalText(statement, column: 0) {
-                options.insert(value)
-            }
-        }
-    }
-
-    sqlite3_finalize(statement)
-
-    // Main-person options also include the secondary category / multi-value rows.
-    if field == .mainPerson {
+    func collectTagValues(forCategory category: String) {
         if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
-            sqlite3_bind_text(
-                statement,
-                1,
-                (EventAttributeField.secondaryMainPerson.tagCategory as NSString).utf8String,
-                -1,
-                nil
-            )
+            sqlite3_bind_text(statement, 1, (category as NSString).utf8String, -1, nil)
             while sqlite3_step(statement) == SQLITE_ROW {
                 if let value = sqliteOptionalText(statement, column: 0) {
                     options.insert(value)
@@ -639,14 +612,21 @@ final class EventRepository {
         sqlite3_finalize(statement)
     }
 
+    collectTagValues(forCategory: field.tagCategory)
+    // Pre-migration rows may still use legacy `tripType` until migrate runs.
+    if field == .tripType {
+        collectTagValues(forCategory: "tripType")
+    }
+
+    // Main-person options also include the secondary category / multi-value rows.
+    if field == .mainPerson {
+        collectTagValues(forCategory: EventAttributeField.secondaryMainPerson.tagCategory)
+    }
+
     if field == .eventType {
         options = Set(
             options.filter { $0.localizedCaseInsensitiveCompare("Trip") != .orderedSame }
         )
-    }
-
-    if field == .tripType {
-        return []
     }
 
     return options.sorted {
@@ -1020,11 +1000,11 @@ final class EventRepository {
 
     func getEvents(includeHidden: Bool = false) -> [IndexedEvent] {
     sync {
-        getEventsUnsafe(includeHidden: includeHidden, forList: false, limit: nil)
+        getEventsUnsafe(includeHidden: includeHidden, limit: nil)
     }
     }
 
-    /// Lighter list query (no people join). Use for the scrolling events library.
+    /// Events library list query (includes named people for the row meta line).
     func getEventsForList(
         includeHidden: Bool = false,
         limit: Int? = nil,
@@ -1033,7 +1013,6 @@ final class EventRepository {
         sync {
             getEventsUnsafe(
                 includeHidden: includeHidden,
-                forList: true,
                 limit: limit,
                 filter: filter
             )
@@ -1466,7 +1445,6 @@ final class EventRepository {
 
     func getEventsUnsafe(
         includeHidden: Bool,
-        forList: Bool,
         limit: Int? = nil,
         filter: EventListFilter = .allEvents
     ) -> [IndexedEvent] {
@@ -1475,12 +1453,13 @@ final class EventRepository {
             : "AND COALESCE(e.isUserHidden, 0) = 0"
         let listFilter = listFilterWhereSQL(filter: filter)
         let scopeFilter = listScopeFilterSQL(filter: filter)
-        let peopleSelect = forList
-            ? "NULL as peopleNames"
-            : "GROUP_CONCAT(DISTINCT p.displayName) as peopleNames"
-        let peopleJoins = forList
-            ? ""
-            : """
+        // Named people only (blank displayName = unnamed cluster face links).
+        let peopleSelect = """
+            GROUP_CONCAT(DISTINCT CASE
+                WHEN TRIM(COALESCE(p.displayName, '')) != '' THEN p.displayName
+            END) as peopleNames
+            """
+        let peopleJoins = """
             LEFT JOIN photo_people pp
                 ON pp.photoId = pe.photoId
                AND COALESCE(ph.isDeleted, 0) = 0
@@ -1776,13 +1755,144 @@ final class EventRepository {
         for event in events {
             guard slideshowPhotos[event.eventId]?.isEmpty ?? true else { continue }
 
-            if let coverPhotoId = event.coverPhotoId {
+            if let coverPhotoId = event.coverPhotoId, !coverPhotoId.isEmpty {
                 slideshowPhotos[event.eventId] = [coverPhotoId]
+            }
+        }
+
+        // Video-only (or photo-less) events: use a video poster frame as the list cover.
+        let stillEmpty = events.compactMap { event -> Int? in
+            let ids = slideshowPhotos[event.eventId]
+            return (ids == nil || ids?.isEmpty == true) ? event.eventId : nil
+        }
+        if !stillEmpty.isEmpty {
+            let videoCovers = fetchVideoCoverIdsByEvent(eventIds: stillEmpty)
+            for (eventId, videoId) in videoCovers {
+                slideshowPhotos[eventId] = [videoId]
             }
         }
 
         return slideshowPhotos
     }
+    }
+
+    /// Best on-frame video per list event (`includeInSlideshow = 1`, mediaType video).
+    func getOnFrameVideoIds(for events: [IndexedEvent]) -> [Int: String] {
+        sync {
+            fetchOnFrameVideoIdsByEvent(eventIds: events.map(\.eventId))
+        }
+    }
+
+    private func fetchOnFrameVideoIdsByEvent(eventIds: [Int]) -> [Int: String] {
+        guard !eventIds.isEmpty else { return [:] }
+
+        var covers: [Int: String] = [:]
+        for chunkStart in stride(from: 0, to: eventIds.count, by: Self.slideshowEventIdChunkSize) {
+            let chunkEnd = min(chunkStart + Self.slideshowEventIdChunkSize, eventIds.count)
+            let chunk = Array(eventIds[chunkStart..<chunkEnd])
+            mergeOnFrameVideoIds(into: &covers, eventIds: chunk)
+        }
+        return covers
+    }
+
+    private func mergeOnFrameVideoIds(into covers: inout [Int: String], eventIds: [Int]) {
+        guard !eventIds.isEmpty else { return }
+
+        let placeholders = Array(repeating: "?", count: eventIds.count).joined(separator: ", ")
+        let sql = """
+        SELECT
+            COALESCE(e.parentEventId, e.eventId) AS displayEventId,
+            p.id
+        FROM photos p
+        JOIN photo_events pe ON p.id = pe.photoId
+        JOIN events e ON pe.eventId = e.eventId
+        WHERE p.isDeleted = 0
+          AND COALESCE(p.mediaType, 1) = 2
+          AND COALESCE(pe.includeInSlideshow, 0) = 1
+          AND COALESCE(pe.manuallyExcluded, 0) = 0
+          AND e.isDeleted = 0
+          AND COALESCE(e.parentEventId, e.eventId) IN (\(placeholders))
+        ORDER BY
+            displayEventId,
+            p.isFavorite DESC,
+            p.creationDate DESC
+        """
+
+        var statement: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            for (index, eventId) in eventIds.enumerated() {
+                sqlite3_bind_int(statement, Int32(index + 1), Int32(eventId))
+            }
+
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let displayEventId = Int(sqlite3_column_int(statement, 0))
+                guard covers[displayEventId] == nil,
+                      let videoId = sqliteOptionalText(statement, column: 1) else {
+                    continue
+                }
+                covers[displayEventId] = videoId
+            }
+        } else if let db {
+            print("Failed to get on-frame videos: \(String(cString: sqlite3_errmsg(db)))")
+        }
+
+        sqlite3_finalize(statement)
+    }
+
+    /// First usable video asset per list event (poster frame for event-list covers).
+    private func fetchVideoCoverIdsByEvent(eventIds: [Int]) -> [Int: String] {
+        guard !eventIds.isEmpty else { return [:] }
+
+        var covers: [Int: String] = [:]
+        for chunkStart in stride(from: 0, to: eventIds.count, by: Self.slideshowEventIdChunkSize) {
+            let chunkEnd = min(chunkStart + Self.slideshowEventIdChunkSize, eventIds.count)
+            let chunk = Array(eventIds[chunkStart..<chunkEnd])
+            mergeVideoCoverIds(into: &covers, eventIds: chunk)
+        }
+        return covers
+    }
+
+    private func mergeVideoCoverIds(into covers: inout [Int: String], eventIds: [Int]) {
+        guard !eventIds.isEmpty else { return }
+
+        let placeholders = Array(repeating: "?", count: eventIds.count).joined(separator: ", ")
+        let sql = """
+        SELECT
+            COALESCE(e.parentEventId, e.eventId) AS displayEventId,
+            p.id
+        FROM photos p
+        JOIN photo_events pe ON p.id = pe.photoId
+        JOIN events e ON pe.eventId = e.eventId
+        WHERE p.isDeleted = 0
+          AND COALESCE(p.mediaType, 1) = 2
+          AND COALESCE(pe.manuallyExcluded, 0) = 0
+          AND e.isDeleted = 0
+          AND COALESCE(e.parentEventId, e.eventId) IN (\(placeholders))
+        ORDER BY
+            displayEventId,
+            p.isFavorite DESC,
+            p.creationDate DESC
+        """
+
+        var statement: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            for (index, eventId) in eventIds.enumerated() {
+                sqlite3_bind_int(statement, Int32(index + 1), Int32(eventId))
+            }
+
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let displayEventId = Int(sqlite3_column_int(statement, 0))
+                guard covers[displayEventId] == nil,
+                      let videoId = sqliteOptionalText(statement, column: 1) else {
+                    continue
+                }
+                covers[displayEventId] = videoId
+            }
+        } else if let db {
+            print("Failed to get video covers: \(String(cString: sqlite3_errmsg(db)))")
+        }
+
+        sqlite3_finalize(statement)
     }
 
     /// SQLite bind limit on iOS is typically 999; chunk `IN` lists to stay safe.
@@ -1871,20 +1981,24 @@ final class EventRepository {
 
 
     private func sortedSlideshowPhotoIds(from candidates: [SlideshowPhotoCandidate]) -> [String] {
-    candidates
-        .sorted { lhs, rhs in
-            if lhs.isFavorite != rhs.isFavorite {
-                return lhs.isFavorite && !rhs.isFavorite
-            }
-            if lhs.qualityScore != rhs.qualityScore {
-                return lhs.qualityScore > rhs.qualityScore
-            }
-            if lhs.peopleCount != rhs.peopleCount {
-                return lhs.peopleCount > rhs.peopleCount
-            }
-            return lhs.id < rhs.id
-        }
-        .map(\.id)
+        // Match events.maxSlideshowPhotos default (3). Unbounded IDs make list enrichment/rotation costly.
+        Array(
+            candidates
+                .sorted { lhs, rhs in
+                    if lhs.isFavorite != rhs.isFavorite {
+                        return lhs.isFavorite && !rhs.isFavorite
+                    }
+                    if lhs.qualityScore != rhs.qualityScore {
+                        return lhs.qualityScore > rhs.qualityScore
+                    }
+                    if lhs.peopleCount != rhs.peopleCount {
+                        return lhs.peopleCount > rhs.peopleCount
+                    }
+                    return lhs.id < rhs.id
+                }
+                .map(\.id)
+                .prefix(3)
+        )
     }
 
 
@@ -1957,10 +2071,15 @@ final class EventRepository {
         ? ""
         : "AND COALESCE(pe.manuallyExcluded, 0) = 0"
     let sql = """
-    SELECT p.id, p.creationDate, p.isFavorite, p.width, p.height,
-           p.mediaSubtype, p.latitude, p.longitude, p.isScreenshot,
+    SELECT p.id,
+           \(Self.effectivePhotoDateSQL) AS creationDate,
+           p.isFavorite, p.width, p.height,
+           p.mediaSubtype,
+           COALESCE(p.userLatitude, p.latitude) AS latitude,
+           COALESCE(p.userLongitude, p.longitude) AS longitude,
+           p.isScreenshot,
            p.aspectRatio, p.orientation, p.qualityScore,
-           p.faceEyesOpenScore, p.faceSmileScore,
+           p.faceEyesOpenScore, p.faceSmileScore, p.locationId,
            COALESCE(pe.includeInSlideshow, 0) as showOnFrame,
            COALESCE(pe.manuallyExcluded, 0) as manuallyExcluded,
            COALESCE(pe.isSimilarGroupPick, 0) as isSimilarGroupPick,
@@ -1978,7 +2097,7 @@ final class EventRepository {
     )
       AND p.isDeleted = 0
       \(hiddenFilter)
-    ORDER BY p.creationDate ASC, p.qualityScore DESC;
+    ORDER BY \(Self.effectivePhotoDateSQL) ASC, p.qualityScore DESC;
     """
 
     var statement: OpaquePointer?
@@ -2063,38 +2182,57 @@ final class EventRepository {
     }
 
 
-    func setPhotosHiddenInEvent(photoIds: [String], hidden: Bool) {
-    guard !photoIds.isEmpty else { return }
+    /// Sets hide on every `photo_events` row for each photo. Returns photo ids that had no event link.
+    @discardableResult
+    func setPhotosHiddenInEvent(photoIds: [String], hidden: Bool) -> [String] {
+    guard !photoIds.isEmpty else { return [] }
 
-    sync {
+    return sync {
         var touchedEventIds = Set<Int>()
+        var photosWithoutEvents: [String] = []
+
+        let updateSQL = """
+        UPDATE photo_events
+        SET manuallyExcluded = ?,
+            includeInSlideshow = CASE WHEN ? = 1 THEN 0 ELSE includeInSlideshow END
+        WHERE photoId = ?;
+        """
+
+        let eventIdsSQL = """
+        SELECT eventId
+        FROM photo_events
+        WHERE photoId = ?;
+        """
 
         for photoId in photoIds {
-            guard let eventId = getEventIdForPhotoUnsafe(photoId: photoId) else { continue }
+            var eventStatement: OpaquePointer?
+            var eventIdsForPhoto: [Int] = []
+            if sqlite3_prepare_v2(db, eventIdsSQL, -1, &eventStatement, nil) == SQLITE_OK {
+                sqlite3_bind_text(eventStatement, 1, (photoId as NSString).utf8String, -1, nil)
+                while sqlite3_step(eventStatement) == SQLITE_ROW {
+                    eventIdsForPhoto.append(Int(sqlite3_column_int(eventStatement, 0)))
+                }
+            }
+            sqlite3_finalize(eventStatement)
 
-            let sql = """
-            UPDATE photo_events
-            SET manuallyExcluded = ?,
-                includeInSlideshow = CASE WHEN ? = 1 THEN 0 ELSE includeInSlideshow END
-            WHERE photoId = ?
-              AND eventId = ?;
-            """
+            guard !eventIdsForPhoto.isEmpty else {
+                photosWithoutEvents.append(photoId)
+                continue
+            }
 
             var statement: OpaquePointer?
-
-            if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            if sqlite3_prepare_v2(db, updateSQL, -1, &statement, nil) == SQLITE_OK {
                 sqlite3_bind_int(statement, 1, hidden ? 1 : 0)
                 sqlite3_bind_int(statement, 2, hidden ? 1 : 0)
                 sqlite3_bind_text(statement, 3, (photoId as NSString).utf8String, -1, nil)
-                sqlite3_bind_int(statement, 4, Int32(eventId))
                 sqlite3_step(statement)
             }
-
             sqlite3_finalize(statement)
-            touchedEventIds.insert(eventId)
+            touchedEventIds.formUnion(eventIdsForPhoto)
         }
 
         refreshSummariesAndCovers(for: touchedEventIds)
+        return photosWithoutEvents
     }
     }
 
@@ -2173,10 +2311,14 @@ final class EventRepository {
 
     func readEventPhoto(from statement: OpaquePointer?) -> IndexedPhoto {
         let photo = photos.readIndexedPhotoRow(from: statement)
-        let showOnFrame = sqlite3_column_int(statement, 14) == 1
-        let isHiddenInEvent = sqlite3_column_int(statement, 15) == 1
-        let isSimilarGroupPick = sqlite3_column_int(statement, 16) == 1
-        let isVideo = sqlite3_column_int(statement, 17) == 2
+        let locationId =
+            sqlite3_column_type(statement, 14) == SQLITE_NULL
+            ? nil
+            : Int(sqlite3_column_int(statement, 14))
+        let showOnFrame = sqlite3_column_int(statement, 15) == 1
+        let isHiddenInEvent = sqlite3_column_int(statement, 16) == 1
+        let isSimilarGroupPick = sqlite3_column_int(statement, 17) == 1
+        let isVideo = sqlite3_column_int(statement, 18) == 2
 
         return IndexedPhoto(
             id: photo.id,
@@ -2187,6 +2329,7 @@ final class EventRepository {
             mediaSubtype: photo.mediaSubtype,
             latitude: photo.latitude,
             longitude: photo.longitude,
+            locationId: locationId,
             isScreenshot: photo.isScreenshot,
             aspectRatio: photo.aspectRatio,
             orientation: photo.orientation,
@@ -3390,6 +3533,219 @@ final class EventRepository {
     sqlite3_finalize(statement)
     }
 
+    /// Top-level events whose date range fully contains `[rangeStart, rangeEnd]`.
+    func findEventsContainingDateRange(
+        rangeStart: Date,
+        rangeEnd: Date,
+        excludingEventId: Int?
+    ) -> [IndexedEvent] {
+        sync {
+            findEventsContainingDateRangeUnsafe(
+                rangeStart: rangeStart,
+                rangeEnd: rangeEnd,
+                excludingEventId: excludingEventId
+            )
+        }
+    }
+
+    private func findEventsContainingDateRangeUnsafe(
+        rangeStart: Date,
+        rangeEnd: Date,
+        excludingEventId: Int?
+    ) -> [IndexedEvent] {
+        let earliestISO = Self.iso8601Formatter.string(from: min(rangeStart, rangeEnd))
+        let latestISO = Self.iso8601Formatter.string(from: max(rangeStart, rangeEnd))
+
+        // Compare on date-only prefixes so date-only and full-ISO event rows both match.
+        let earliestDay = String(earliestISO.prefix(10))
+        let latestDay = String(latestISO.prefix(10))
+
+        var sql = """
+        SELECT eventId
+        FROM events
+        WHERE isDeleted = 0
+          AND parentEventId IS NULL
+          AND TRIM(COALESCE(startDate, '')) != ''
+          AND TRIM(COALESCE(endDate, '')) != ''
+          AND substr(startDate, 1, 10) <= ?
+          AND substr(endDate, 1, 10) >= ?
+        """
+        if excludingEventId != nil {
+            sql += "\n          AND eventId != ?"
+        }
+        sql += """
+
+        ORDER BY ABS(
+            julianday(substr(startDate, 1, 10)) - julianday(?)
+        ) ASC
+        LIMIT 40;
+        """
+
+        var statement: OpaquePointer?
+        var eventIds: [Int] = []
+
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            // Event calendar span must fully contain [earliestDay, latestDay].
+            sqlite3_bind_text(statement, 1, (earliestDay as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, 2, (latestDay as NSString).utf8String, -1, nil)
+            if let excludingEventId {
+                sqlite3_bind_int(statement, 3, Int32(excludingEventId))
+                sqlite3_bind_text(statement, 4, (earliestDay as NSString).utf8String, -1, nil)
+            } else {
+                sqlite3_bind_text(statement, 3, (earliestDay as NSString).utf8String, -1, nil)
+            }
+
+            while sqlite3_step(statement) == SQLITE_ROW {
+                eventIds.append(Int(sqlite3_column_int(statement, 0)))
+            }
+        }
+        sqlite3_finalize(statement)
+
+        return eventIds.compactMap { getEvent(eventId: $0) }
+    }
+
+    /// Creates a top-level event, optionally detaches from `fromEventId`, then attaches photos.
+    func createEventForShiftedPhotos(
+        photoIds: [String],
+        fromEventId: Int?,
+        rangeStart: Date,
+        rangeEnd: Date,
+        locationId: Int?,
+        latitude: Double?,
+        longitude: Double?
+    ) -> IndexedEvent? {
+        sync {
+            createEventForShiftedPhotosUnsafe(
+                photoIds: photoIds,
+                fromEventId: fromEventId,
+                rangeStart: rangeStart,
+                rangeEnd: rangeEnd,
+                locationId: locationId,
+                latitude: latitude,
+                longitude: longitude
+            )
+        }
+    }
+
+    private func createEventForShiftedPhotosUnsafe(
+        photoIds: [String],
+        fromEventId: Int?,
+        rangeStart: Date,
+        rangeEnd: Date,
+        locationId: Int?,
+        latitude: Double?,
+        longitude: Double?
+    ) -> IndexedEvent? {
+        let start = min(rangeStart, rangeEnd)
+        let end = max(rangeStart, rangeEnd)
+        let startISO = Self.iso8601Formatter.string(from: start)
+        let endISO = Self.iso8601Formatter.string(from: end)
+        let name = EventDateParser.displayDateRange(startDate: startISO, endDate: endISO)
+            ?? Self.iso8601Formatter.string(from: start)
+
+        let eventId = insertEventRow(
+            name: name,
+            startDate: startISO,
+            endDate: endISO,
+            latitude: latitude,
+            longitude: longitude,
+            locationId: locationId,
+            clusteredByTimeOnly: locationId == nil && latitude == nil
+        )
+
+        for photoId in photoIds {
+            if let fromEventId {
+                let deleteSQL = """
+                DELETE FROM photo_events
+                WHERE photoId = ?
+                  AND eventId = ?;
+                """
+                var deleteStatement: OpaquePointer?
+                if sqlite3_prepare_v2(db, deleteSQL, -1, &deleteStatement, nil) == SQLITE_OK {
+                    sqlite3_bind_text(deleteStatement, 1, (photoId as NSString).utf8String, -1, nil)
+                    sqlite3_bind_int(deleteStatement, 2, Int32(fromEventId))
+                    sqlite3_step(deleteStatement)
+                }
+                sqlite3_finalize(deleteStatement)
+            }
+
+            attachPhotoToEvent(
+                photoId: photoId,
+                eventId: eventId,
+                assignmentMethod: .manualDateAdjust
+            )
+            markPhotoEventAssigned(photoId: photoId)
+        }
+
+        var touched = Set<Int>([eventId])
+        if let fromEventId {
+            touched.insert(fromEventId)
+        }
+        refreshSummariesAndCovers(for: touched)
+        cleanupEmptyEvents()
+        return getEvent(eventId: eventId)
+    }
+
+    /// Moves photos from one event into another; expands destination dates; refreshes both.
+    func movePhotosToEvent(
+        photoIds: [String],
+        fromEventId: Int?,
+        toEventId: Int,
+        photoDates: [String: Date]
+    ) {
+        sync {
+            movePhotosToEventUnsafe(
+                photoIds: photoIds,
+                fromEventId: fromEventId,
+                toEventId: toEventId,
+                photoDates: photoDates
+            )
+        }
+    }
+
+    private func movePhotosToEventUnsafe(
+        photoIds: [String],
+        fromEventId: Int?,
+        toEventId: Int,
+        photoDates: [String: Date]
+    ) {
+        for photoId in photoIds {
+            if let fromEventId {
+                // Inline remove without cleanupEmptyEvents until the end.
+                let deleteSQL = """
+                DELETE FROM photo_events
+                WHERE photoId = ?
+                  AND eventId = ?;
+                """
+                var deleteStatement: OpaquePointer?
+                if sqlite3_prepare_v2(db, deleteSQL, -1, &deleteStatement, nil) == SQLITE_OK {
+                    sqlite3_bind_text(deleteStatement, 1, (photoId as NSString).utf8String, -1, nil)
+                    sqlite3_bind_int(deleteStatement, 2, Int32(fromEventId))
+                    sqlite3_step(deleteStatement)
+                }
+                sqlite3_finalize(deleteStatement)
+            }
+
+            attachPhotoToEvent(
+                photoId: photoId,
+                eventId: toEventId,
+                assignmentMethod: .manualDateAdjust
+            )
+            markPhotoEventAssigned(photoId: photoId)
+
+            if let photoDate = photoDates[photoId] {
+                expandEventDatesAfterAttach(eventId: toEventId, photoDate: photoDate)
+            }
+        }
+
+        var touched = Set<Int>([toEventId])
+        if let fromEventId {
+            touched.insert(fromEventId)
+        }
+        refreshSummariesAndCovers(for: touched)
+        cleanupEmptyEvents()
+    }
+
 
     func updateEventsFromLocation(locationId: Int) {
     let sql = """
@@ -3615,6 +3971,16 @@ final class EventRepository {
                 category: EventAttributeField.milestoneType.tagCategory,
                 tagValueClause: "AND ht.tagValue IN (\(inList))"
             )
+        case .anyBirthdayMilestone:
+            return attributeTagExistsSQL(
+                category: EventAttributeField.milestoneType.tagCategory,
+                tagValueClause: """
+                AND (
+                    LOWER(ht.tagValue) = 'birthday'
+                    OR LOWER(ht.tagValue) LIKE '% birthday'
+                )
+                """
+            )
         case .trips:
             return "AND COALESCE(e.isTripEvent, 0) = 1"
         case .anyActivity:
@@ -3681,22 +4047,23 @@ final class EventRepository {
         """
     }
 
-    /// Event date window overlaps birthday month/day (±3 days) for years near the event.
+    /// Event date window overlaps birthday month/day (7 days before … 3 days after).
     private func birthdayPersonDateOverlapSQL(
         eventAlias: String,
         personAlias: String
     ) -> String {
-        let windowDays = 3
+        let daysBefore = MilestonePictureSearchDefaults.birthdayDaysBefore
+        let daysAfter = MilestonePictureSearchDefaults.birthdayDaysAfter
         func yearOverlap(_ yearSQL: String) -> String {
             """
             (
                 date(substr(\(eventAlias).startDate, 1, 10)) <= date(
                     printf('%04d-', \(yearSQL)) || substr(\(personAlias).birthDate, 6, 5),
-                    '+\(windowDays) days'
+                    '+\(daysAfter) days'
                 )
                 AND date(substr(\(eventAlias).endDate, 1, 10)) >= date(
                     printf('%04d-', \(yearSQL)) || substr(\(personAlias).birthDate, 6, 5),
-                    '-\(windowDays) days'
+                    '-\(daysBefore) days'
                 )
             )
             """
@@ -3713,25 +4080,24 @@ final class EventRepository {
 
     private func birthdayPersonExistsSQL(personId: Int) -> String {
         let dateOverlapSQL = birthdayPersonDateOverlapSQL(eventAlias: "e", personAlias: "p")
+        let milestoneCategory = EventAttributeField.milestoneType.tagCategory
+        // Canonical tag is "{displayName}'s Birthday" — match via SQL concat so we stay in sync
+        // with MilestonePictureSearchDefaults.personBirthdayTagValue.
         return """
         AND EXISTS (
             SELECT 1
             FROM people p
             WHERE p.personId = \(personId)
-              AND p.birthDate IS NOT NULL
-              AND TRIM(p.birthDate) != ''
-              AND length(p.birthDate) >= 10
-              AND \(dateOverlapSQL)
               AND (
                   EXISTS (
                       SELECT 1
-                      FROM photo_events pe_b
-                      JOIN photo_people pp ON pp.photoId = pe_b.photoId
-                      JOIN photos ph_b ON ph_b.id = pp.photoId AND ph_b.isDeleted = 0
-                      WHERE pp.personId = p.personId
+                      FROM event_tags et_bday
+                      WHERE et_bday.isRejected = 0
+                        AND et_bday.tagCategory = '\(escapeSQLLiteral(milestoneCategory))'
+                        AND et_bday.tagValue = (TRIM(p.displayName) || '''s Birthday') COLLATE NOCASE
                         AND (
-                            pe_b.eventId = e.eventId
-                            OR pe_b.eventId IN (
+                            et_bday.eventId = e.eventId
+                            OR et_bday.eventId IN (
                                 SELECT child.eventId
                                 FROM events child
                                 WHERE child.parentEventId = e.eventId
@@ -3739,13 +4105,37 @@ final class EventRepository {
                             )
                         )
                   )
-                  OR EXISTS (
-                      SELECT 1
-                      FROM event_tags et_main
-                      WHERE et_main.eventId = e.eventId
-                        AND et_main.isRejected = 0
-                        AND et_main.tagCategory IN ('eventMainPerson', 'eventMainPerson2')
-                        AND TRIM(et_main.tagValue) = p.displayName
+                  OR (
+                      p.birthDate IS NOT NULL
+                      AND TRIM(p.birthDate) != ''
+                      AND length(p.birthDate) >= 10
+                      AND \(dateOverlapSQL)
+                      AND (
+                          EXISTS (
+                              SELECT 1
+                              FROM photo_events pe_b
+                              JOIN photo_people pp ON pp.photoId = pe_b.photoId
+                              JOIN photos ph_b ON ph_b.id = pp.photoId AND ph_b.isDeleted = 0
+                              WHERE pp.personId = p.personId
+                                AND (
+                                    pe_b.eventId = e.eventId
+                                    OR pe_b.eventId IN (
+                                        SELECT child.eventId
+                                        FROM events child
+                                        WHERE child.parentEventId = e.eventId
+                                          AND child.isDeleted = 0
+                                    )
+                                )
+                          )
+                          OR EXISTS (
+                              SELECT 1
+                              FROM event_tags et_main
+                              WHERE et_main.eventId = e.eventId
+                                AND et_main.isRejected = 0
+                                AND et_main.tagCategory IN ('eventMainPerson', 'eventMainPerson2')
+                                AND TRIM(et_main.tagValue) = p.displayName
+                          )
+                      )
                   )
               )
         )
@@ -3793,7 +4183,7 @@ final class EventRepository {
     private func listScopeFilterSQL(filter: EventListFilter) -> String {
         switch filter {
         case .allEvents, .anyHoliday, .holidayTag, .anyMilestone, .milestoneTag, .milestoneTags,
-             .trips, .anyActivity, .activityTag, .eventTypeTag, .eventTypeTags,
+             .anyBirthdayMilestone, .trips, .anyActivity, .activityTag, .eventTypeTag, .eventTypeTags,
              .birthdayPerson, .location:
             return "AND e.parentEventId IS NULL"
         }

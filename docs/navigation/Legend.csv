@@ -1,0 +1,11 @@
+column,allowed_values,notes
+tab,Media | Events | Developer | Search,Which tab owns the screen
+how_opened,tab_root | NavigationLink | eventsTabFilter_mirror | fullScreenCover | sheet,
+when,always | if_not_done | if_stale | on_year_expand | on_disappear,EntryTasks.when
+blocks_ui,spinner | show_stale | background | none,EntryTasks.blocks_ui
+status,current | keep | change | add | remove,Edit status for planning; start from current
+screen_id,photos.* | events.* | developer.* | shared.*,Dot path; keep stable when renaming titles
+tab_bar,full (Media|Events|Developer|Search) | landing (Help|Developer),Landing hubs vs topic/full tabs
+,,
+HOW_TO_EDIT,,Leave status=current if unchanged. Set change and edit cells. Add rows with status=add. Mark obsolete remove.
+HANDOFF,,Edit this workbook (or CSV exports). Prefer sheet edits over long prose. Deltas can be notes in status=change rows.

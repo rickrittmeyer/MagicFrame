@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import SQLite3
 
@@ -62,6 +63,12 @@ final class PeopleRepository {
         }
     }
 
+    func setProfileFaceInstanceId(personId: Int, faceInstanceId: Int?) {
+        sync {
+            setProfileFaceInstanceIdUnsafe(personId: personId, faceInstanceId: faceInstanceId)
+        }
+    }
+
     func updatePersonNames(
         personId: Int,
         displayName: String,
@@ -108,6 +115,25 @@ final class PeopleRepository {
         }
 
         sqlite3_finalize(statement)
+    }
+
+    func setProfileFaceInstanceIdUnsafe(personId: Int, faceInstanceId: Int?) {
+        guard personId > 0 else { return }
+        let sql = """
+        UPDATE people
+        SET profileFaceInstanceId = ?
+        WHERE personId = ?;
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(statement) }
+        if let faceInstanceId, faceInstanceId > 0 {
+            sqlite3_bind_int(statement, 1, Int32(faceInstanceId))
+        } else {
+            sqlite3_bind_null(statement, 1)
+        }
+        sqlite3_bind_int(statement, 2, Int32(personId))
+        sqlite3_step(statement)
     }
 
     func updatePersonNamesUnsafe(
@@ -256,12 +282,49 @@ final class PeopleRepository {
         let birthDateISO: String
     }
 
+    /// Named people for the People landing grid (sorted by photo appearances).
+    struct PeopleLandingItem: Sendable, Identifiable {
+        let personId: Int
+        let displayName: String
+        let firstName: String?
+        let lastName: String?
+        let maidenName: String?
+        let birthDateISO: String?
+        let photoCount: Int
+        let avatarPhotoId: String?
+        let avatarBoundingBox: CGRect?
+
+        var id: Int { personId }
+
+        var personRecord: PersonRecord {
+            PersonRecord(
+                personId: personId,
+                displayName: displayName,
+                firstName: firstName,
+                lastName: lastName,
+                maidenName: maidenName
+            )
+        }
+    }
+
     func fetchAllPeople() -> [PersonRecord] {
         sync { fetchAllPeopleUnsafe() }
     }
 
+    func fetchPeopleLandingItems() -> [PeopleLandingItem] {
+        sync { fetchPeopleLandingItemsUnsafe() }
+    }
+
+    func fetchPersonDetail(personId: Int) -> PeopleLandingItem? {
+        sync { fetchPeopleLandingItemsUnsafe(personId: personId).first }
+    }
+
     func fetchPeopleWithBirthDates() -> [PersonBirthdayRecord] {
         sync { fetchPeopleWithBirthDatesUnsafe() }
+    }
+
+    func fetchPersonBirthdayRecord(personId: Int) -> PersonBirthdayRecord? {
+        sync { fetchPersonBirthdayRecordUnsafe(personId: personId) }
     }
 
     func fetchPersonUnsafe(personId: Int) -> PersonRecord? {
@@ -332,6 +395,195 @@ final class PeopleRepository {
 
         sqlite3_finalize(statement)
         return records
+    }
+
+    func fetchPersonBirthdayRecordUnsafe(personId: Int) -> PersonBirthdayRecord? {
+        let sql = """
+        SELECT personId, displayName, birthDate
+        FROM people
+        WHERE personId = ?
+          AND birthDate IS NOT NULL
+          AND TRIM(birthDate) != ''
+        LIMIT 1;
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_int(statement, 1, Int32(personId))
+        guard sqlite3_step(statement) == SQLITE_ROW,
+              let name = sqliteOptionalText(statement, column: 1),
+              let birthDateISO = sqliteOptionalText(statement, column: 2) else {
+            return nil
+        }
+        return PersonBirthdayRecord(
+            personId: Int(sqlite3_column_int(statement, 0)),
+            name: name,
+            birthDateISO: birthDateISO
+        )
+    }
+
+    /// Named people with photo counts + clearest solo-leaning face avatar.
+    func fetchPeopleLandingItemsUnsafe(personId: Int? = nil) -> [PeopleLandingItem] {
+        let avatarByPerson = fetchBestAvatarFacesByPersonUnsafe(personId: personId)
+        let personFilter = personId.map { "AND p.personId = \($0)" } ?? ""
+        let sql = """
+        SELECT
+            p.personId,
+            p.displayName,
+            p.firstName,
+            p.lastName,
+            p.maidenName,
+            p.birthDate,
+            (
+                SELECT COUNT(DISTINCT pp.photoId)
+                FROM photo_people pp
+                WHERE pp.personId = p.personId
+            ) AS photoCount
+        FROM people p
+        WHERE TRIM(COALESCE(p.displayName, '')) != ''
+          \(personFilter)
+        ORDER BY photoCount DESC, p.displayName COLLATE NOCASE ASC;
+        """
+
+        var statement: OpaquePointer?
+        var records: [PeopleLandingItem] = []
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(statement) }
+
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let displayName = sqliteOptionalText(statement, column: 1),
+                  !displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                continue
+            }
+            let id = Int(sqlite3_column_int(statement, 0))
+            let avatar = avatarByPerson[id]
+            records.append(
+                PeopleLandingItem(
+                    personId: id,
+                    displayName: displayName,
+                    firstName: sqliteOptionalText(statement, column: 2),
+                    lastName: sqliteOptionalText(statement, column: 3),
+                    maidenName: sqliteOptionalText(statement, column: 4),
+                    birthDateISO: sqliteOptionalText(statement, column: 5),
+                    photoCount: Int(sqlite3_column_int(statement, 6)),
+                    avatarPhotoId: avatar?.photoId,
+                    avatarBoundingBox: avatar?.box
+                )
+            )
+        }
+        return records
+    }
+
+    private struct AvatarFaceRow {
+        let photoId: String
+        let box: CGRect
+    }
+
+    /// User-chosen profile faces first; otherwise solo-face / quality / size auto-pick.
+    private func fetchBestAvatarFacesByPersonUnsafe(personId: Int?) -> [Int: AvatarFaceRow] {
+        var map = fetchProfileAvatarFacesUnsafe(personId: personId)
+        let personFilter = personId.map { "AND fi.personId = \($0)" } ?? ""
+        let sql = """
+        SELECT personId, photoId, bboxX, bboxY, bboxWidth, bboxHeight
+        FROM (
+            SELECT
+                fi.personId,
+                fi.photoId,
+                fi.bboxX,
+                fi.bboxY,
+                fi.bboxWidth,
+                fi.bboxHeight,
+                ROW_NUMBER() OVER (
+                    PARTITION BY fi.personId
+                    ORDER BY
+                        CASE
+                            WHEN (
+                                SELECT COUNT(*) FROM face_instances o WHERE o.photoId = fi.photoId
+                            ) = 1 THEN 0
+                            ELSE 1
+                        END ASC,
+                        COALESCE(fi.quality, 0) DESC,
+                        (fi.bboxWidth * fi.bboxHeight) DESC,
+                        fi.faceInstanceId DESC
+                ) AS rn
+            FROM face_instances fi
+            WHERE fi.personId IS NOT NULL
+              \(personFilter)
+        )
+        WHERE rn = 1;
+        """
+
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return map }
+        defer { sqlite3_finalize(statement) }
+
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let id = Int(sqlite3_column_int(statement, 0))
+            if map[id] != nil { continue }
+            guard let photoId = sqliteOptionalText(statement, column: 1) else { continue }
+            let box = CGRect(
+                x: sqlite3_column_double(statement, 2),
+                y: sqlite3_column_double(statement, 3),
+                width: sqlite3_column_double(statement, 4),
+                height: sqlite3_column_double(statement, 5)
+            )
+            map[id] = AvatarFaceRow(photoId: photoId, box: box)
+        }
+        return map
+    }
+
+    private func fetchProfileAvatarFacesUnsafe(personId: Int?) -> [Int: AvatarFaceRow] {
+        let personFilter = personId.map { "AND p.personId = \($0)" } ?? ""
+        let sql = """
+        SELECT p.personId, fi.photoId, fi.bboxX, fi.bboxY, fi.bboxWidth, fi.bboxHeight
+        FROM people p
+        JOIN face_instances fi ON fi.faceInstanceId = p.profileFaceInstanceId
+        WHERE p.profileFaceInstanceId IS NOT NULL
+          \(personFilter);
+        """
+        var statement: OpaquePointer?
+        var map: [Int: AvatarFaceRow] = [:]
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [:] }
+        defer { sqlite3_finalize(statement) }
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let id = Int(sqlite3_column_int(statement, 0))
+            guard let photoId = sqliteOptionalText(statement, column: 1) else { continue }
+            map[id] = AvatarFaceRow(
+                photoId: photoId,
+                box: CGRect(
+                    x: sqlite3_column_double(statement, 2),
+                    y: sqlite3_column_double(statement, 3),
+                    width: sqlite3_column_double(statement, 4),
+                    height: sqlite3_column_double(statement, 5)
+                )
+            )
+        }
+        return map
+    }
+
+    /// Best face for this person on a specific photo (for "Use as Profile Picture").
+    func bestFaceInstanceIdForPersonOnPhotoUnsafe(personId: Int, photoId: String) -> Int? {
+        let sql = """
+        SELECT faceInstanceId
+        FROM face_instances
+        WHERE personId = ?
+          AND photoId = ?
+        ORDER BY COALESCE(quality, 0) DESC,
+                 (bboxWidth * bboxHeight) DESC,
+                 faceInstanceId DESC
+        LIMIT 1;
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_int(statement, 1, Int32(personId))
+        sqlite3_bind_text(statement, 2, (photoId as NSString).utf8String, -1, nil)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        return Int(sqlite3_column_int(statement, 0))
+    }
+
+    func bestFaceInstanceIdForPersonOnPhoto(personId: Int, photoId: String) -> Int? {
+        sync { bestFaceInstanceIdForPersonOnPhotoUnsafe(personId: personId, photoId: photoId) }
     }
 
     func getAllPersonNamesUnsafe() -> [String] {

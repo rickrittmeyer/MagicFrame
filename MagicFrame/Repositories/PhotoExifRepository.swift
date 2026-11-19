@@ -38,6 +38,37 @@ final class PhotoExifRepository {
         }
     }
 
+    /// Camera make/model for event-detail sort grouping.
+    func fetchCameraLabelsUnsafe(photoIds: [String]) -> [String: (make: String?, model: String?)] {
+        guard !photoIds.isEmpty, let db else { return [:] }
+        let placeholders = Array(repeating: "?", count: photoIds.count).joined(separator: ", ")
+        let sql = """
+        SELECT photoId, cameraMake, cameraModel
+        FROM photo_exif
+        WHERE photoId IN (\(placeholders));
+        """
+        var statement: OpaquePointer?
+        var result: [String: (make: String?, model: String?)] = [:]
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [:] }
+        defer { sqlite3_finalize(statement) }
+        for (index, photoId) in photoIds.enumerated() {
+            sqlite3_bind_text(statement, Int32(index + 1), (photoId as NSString).utf8String, -1, nil)
+        }
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let photoId = String(cString: sqlite3_column_text(statement, 0))
+            let make =
+                sqlite3_column_type(statement, 1) == SQLITE_NULL
+                ? nil
+                : String(cString: sqlite3_column_text(statement, 1))
+            let model =
+                sqlite3_column_type(statement, 2) == SQLITE_NULL
+                ? nil
+                : String(cString: sqlite3_column_text(statement, 2))
+            result[photoId] = (make, model)
+        }
+        return result
+    }
+
     private func fetchPhotoIdsNeedingExifUnsafe() -> [String] {
         let sql = """
         SELECT p.id

@@ -216,17 +216,23 @@ private final class PhotoFaceChromeView: UIView, UITextFieldDelegate {
 
         boxView.backgroundColor = .clear
         boxView.layer.borderColor = UIColor.systemYellow.cgColor
-        boxView.layer.borderWidth = 2
+        boxView.layer.borderWidth = 1
         boxView.isUserInteractionEnabled = true
         addSubview(boxView)
 
-        nameButton.addTarget(self, action: #selector(beginEditingTapped), for: .touchUpInside)
+        nameButton.addTarget(self, action: #selector(nameChipTapped), for: .touchUpInside)
+        let longPress = UILongPressGestureRecognizer(
+            target: self,
+            action: #selector(nameChipLongPressed(_:))
+        )
+        longPress.minimumPressDuration = 0.35
+        nameButton.addGestureRecognizer(longPress)
         addSubview(nameButton)
 
         nameField.borderStyle = .none
         nameField.backgroundColor = .white
         nameField.textColor = .black
-        nameField.font = .systemFont(ofSize: 12, weight: .semibold)
+        nameField.font = .systemFont(ofSize: 11, weight: .semibold)
         nameField.layer.cornerRadius = 16
         nameField.clipsToBounds = true
         nameField.leftView = UIView(frame: CGRect(x: 0, y: 0, width: 8, height: 1))
@@ -280,10 +286,9 @@ private final class PhotoFaceChromeView: UIView, UITextFieldDelegate {
 
     func updateFace(_ face: PhotoFaceAnnotation) {
         self.face = face
-        let title = face.isNamed ? (face.personDisplayName ?? "Named") : "Name"
         if !isEditingName {
             var config = nameButton.configuration ?? .filled()
-            config.title = title
+            config.title = face.idleNameChipTitle
             nameButton.configuration = config
         }
     }
@@ -315,9 +320,9 @@ private final class PhotoFaceChromeView: UIView, UITextFieldDelegate {
         lastFaceRectInImage = faceRect
 
         // Screen-constant metrics expressed in image points.
-        let nameH: CGFloat = 32 * inv
-        let nameMinW: CGFloat = 72 * inv
-        let gap: CGFloat = 8 * inv
+        let nameH: CGFloat = 24 * inv
+        let nameMinW: CGFloat = 52 * inv
+        let gap: CGFloat = 4 * inv
         let listW: CGFloat = 280 * inv
         let rowH: CGFloat = 48 * inv
         let listPad: CGFloat = 6 * inv
@@ -325,14 +330,14 @@ private final class PhotoFaceChromeView: UIView, UITextFieldDelegate {
         // Title + Display/First/Last (compact) + buttons.
         let cardH: CGFloat = 200 * inv
 
-        let nameFont = UIFont.systemFont(ofSize: 12 * inv, weight: .semibold)
+        let nameFont = UIFont.systemFont(ofSize: 11 * inv, weight: .semibold)
         let suggestionFont = UIFont.systemFont(ofSize: 14 * inv, weight: .medium)
         let nameTitle = isEditingName
             ? (nameField.text?.isEmpty == false ? nameField.text! : "Name")
-            : (nameButton.configuration?.title ?? "Name")
+            : face.idleNameChipTitle
         let nameTextW = (nameTitle as NSString).size(withAttributes: [.font: nameFont]).width
-        let nameW = max(nameMinW, nameTextW + 28 * inv)
-        let fieldW = max(nameW, 140 * inv)
+        let nameW = max(nameMinW, nameTextW + 16 * inv)
+        let fieldW = max(nameW, 120 * inv)
 
         let visibleMatches = Array(matches.prefix(6))
         let suggestionsListH: CGFloat = {
@@ -340,7 +345,10 @@ private final class PhotoFaceChromeView: UIView, UITextFieldDelegate {
             return listPad * 2 + CGFloat(visibleMatches.count) * rowH
         }()
 
-        var contentHeight = faceRect.height + gap + nameH
+        let circleSide = max(faceRect.width, faceRect.height)
+        let showsCircle = !face.isNamed
+        let markHeight = showsCircle ? circleSide : faceRect.height
+        var contentHeight = markHeight + gap + nameH
         if suggestionsListH > 0 {
             contentHeight += gap + suggestionsListH
         }
@@ -355,29 +363,38 @@ private final class PhotoFaceChromeView: UIView, UITextFieldDelegate {
                 faceRect.width,
                 fieldW,
                 suggestionsListH > 0 ? listW : 0,
-                showingNewPersonCard ? cardW : 0
+                showingNewPersonCard ? cardW : 0,
+                showsCircle ? circleSide : 0
             )
         } else {
-            contentWidth = max(faceRect.width, nameW)
+            contentWidth = max(faceRect.width, nameW, showsCircle ? circleSide : 0)
         }
+        let circleOverflowY = showsCircle ? max(0, (circleSide - faceRect.height) / 2) : 0
         let originX = faceRect.midX - contentWidth / 2
-        let originY = faceRect.minY
+        let originY = faceRect.minY - circleOverflowY
         frame = CGRect(x: originX, y: originY, width: contentWidth, height: contentHeight)
 
         let localFace = CGRect(
             x: faceRect.minX - originX,
-            y: 0,
+            y: faceRect.minY - originY,
             width: faceRect.width,
             height: faceRect.height
         )
-        boxView.frame = localFace
-        boxView.layer.cornerRadius = 4 * inv
-        boxView.isHidden = face.isNamed
-        // Expand hit area to ~44pt on screen without changing the drawn box.
+        let circleFrame = CGRect(
+            x: localFace.midX - circleSide / 2,
+            y: localFace.midY - circleSide / 2,
+            width: circleSide,
+            height: circleSide
+        )
+        boxView.frame = circleFrame
+        boxView.layer.cornerRadius = circleSide / 2
+        boxView.layer.borderWidth = 1 * inv
+        boxView.isHidden = !showsCircle
+        // Expand hit area to ~44pt on screen without changing the drawn circle.
         let minHit = 44 * inv
-        boxView.hitOutset = max(0, (minHit - min(localFace.width, localFace.height)) * 0.5)
+        boxView.hitOutset = max(0, (minHit - circleSide) * 0.5)
 
-        let nameY = localFace.maxY + gap
+        let nameY = (showsCircle ? circleFrame.maxY : localFace.maxY) + gap
         let capsuleRadius = nameH / 2
 
         nameButton.frame = CGRect(
@@ -392,9 +409,9 @@ private final class PhotoFaceChromeView: UIView, UITextFieldDelegate {
         nameConfig.baseForegroundColor = .black
         nameConfig.cornerStyle = .capsule
         nameConfig.contentInsets = NSDirectionalEdgeInsets(
-            top: 4 * inv, leading: 10 * inv, bottom: 4 * inv, trailing: 10 * inv
+            top: 2 * inv, leading: 8 * inv, bottom: 2 * inv, trailing: 8 * inv
         )
-        nameConfig.title = face.isNamed ? (face.personDisplayName ?? "Named") : "Name"
+        nameConfig.title = face.idleNameChipTitle
         nameConfig.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { incoming in
             var out = incoming
             out.font = nameFont
@@ -411,10 +428,10 @@ private final class PhotoFaceChromeView: UIView, UITextFieldDelegate {
         nameField.font = nameFont
         nameField.layer.cornerRadius = capsuleRadius
         if let left = nameField.leftView {
-            left.frame = CGRect(x: 0, y: 0, width: 10 * inv, height: nameH)
+            left.frame = CGRect(x: 0, y: 0, width: 8 * inv, height: nameH)
         }
         if let right = nameField.rightView {
-            right.frame = CGRect(x: 0, y: 0, width: 10 * inv, height: nameH)
+            right.frame = CGRect(x: 0, y: 0, width: 8 * inv, height: nameH)
         }
 
         var belowY = nameY + nameH
@@ -494,7 +511,31 @@ private final class PhotoFaceChromeView: UIView, UITextFieldDelegate {
         cancelEditing()
     }
 
-    @objc private func beginEditingTapped() {
+    /// Tap: confirm high-confidence `Rick?`, otherwise open the name field.
+    @objc private func nameChipTapped() {
+        guard let face else { return }
+        if face.hasConfidentNameSuggestion,
+           let display = face.suggestedDisplayName?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !display.isEmpty {
+            onAssign?(
+                face.faceInstanceId,
+                display,
+                face.suggestedFirstName,
+                face.suggestedLastName,
+                face.suggestedMaidenName
+            )
+            return
+        }
+        beginEditingName()
+    }
+
+    /// Long-press: always open typing so a wrong `Rick?` can be overridden.
+    @objc private func nameChipLongPressed(_ gesture: UILongPressGestureRecognizer) {
+        guard gesture.state == .began else { return }
+        beginEditingName()
+    }
+
+    private func beginEditingName() {
         guard let face else { return }
         let faceRect = lastFaceRectInImage.width > 0
             ? lastFaceRectInImage
@@ -505,7 +546,14 @@ private final class PhotoFaceChromeView: UIView, UITextFieldDelegate {
         showingNewPersonCard = false
         newPersonCard.isHidden = true
         knownPeople = AppDependencies.database.fetchAllPeople()
-        matches = []
+        // Seed visual suggestion first so override still shows Rick at the top of the list.
+        if face.hasConfidentNameSuggestion,
+           let suggestedId = face.suggestedPersonId,
+           let suggested = knownPeople.first(where: { $0.personId == suggestedId }) {
+            matches = [suggested]
+        } else {
+            matches = []
+        }
         nameButton.isHidden = true
         nameField.isHidden = false
         nameField.text = face.isNamed ? (face.personDisplayName ?? "") : ""
@@ -523,12 +571,27 @@ private final class PhotoFaceChromeView: UIView, UITextFieldDelegate {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let newMatches: [PeopleRepository.PersonRecord]
         if query.isEmpty {
-            newMatches = []
+            // Keep visual suggestion visible while the field is empty (long-press override).
+            if let face,
+               face.hasConfidentNameSuggestion,
+               let suggestedId = face.suggestedPersonId,
+               let suggested = knownPeople.first(where: { $0.personId == suggestedId }) {
+                newMatches = [suggested]
+            } else {
+                newMatches = []
+            }
         } else {
-            newMatches = knownPeople
+            var filtered = knownPeople
                 .filter { $0.displayName.localizedCaseInsensitiveContains(query) }
-                .prefix(8)
-                .map { $0 }
+            if let face,
+               face.hasConfidentNameSuggestion,
+               let suggestedId = face.suggestedPersonId,
+               let suggested = knownPeople.first(where: { $0.personId == suggestedId }),
+               filtered.contains(where: { $0.personId == suggestedId }) {
+                filtered.removeAll { $0.personId == suggestedId }
+                filtered.insert(suggested, at: 0)
+            }
+            newMatches = Array(filtered.prefix(8))
         }
         // Avoid work if matches unchanged (same ids).
         let oldIds = matches.map(\.personId)

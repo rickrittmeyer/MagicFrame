@@ -218,6 +218,123 @@ final class PhotoDatabase: @unchecked Sendable {
         return report
     }
 
+    func searchPhotos(matching query: MediaSearchQuery) -> MediaPhotoSearchReport {
+        MediaPhotoSearchService(database: databaseManager).search(query)
+    }
+
+    func mediaSearchSuggestionValues(
+        field: MediaSearchField,
+        query: String,
+        limit: Int = 30
+    ) -> [String] {
+        MediaPhotoSearchService(database: databaseManager)
+            .suggestionValues(field: field, query: query, limit: limit)
+    }
+
+    func fetchAllMediaSavedSearches(enabledOnly: Bool = false) -> [MediaSavedSearch] {
+        container.mediaSavedSearches.fetchAll(enabledOnly: enabledOnly)
+    }
+
+    func fetchMediaSavedSearch(id: Int) -> MediaSavedSearch? {
+        container.mediaSavedSearches.fetch(id: id)
+    }
+
+    @discardableResult
+    func saveMediaSavedSearch(_ search: MediaSavedSearch) -> Int {
+        container.mediaSavedSearches.save(search)
+    }
+
+    func deleteMediaSavedSearch(id: Int) {
+        container.mediaSavedSearches.delete(id: id)
+    }
+
+    /// Upserts a Media Saved Search from a Picture Search definition and links legacy id.
+    @discardableResult
+    func upsertMediaSavedSearch(from definition: PictureSearchDefinition) -> MediaSavedSearch {
+        var saved = MediaSearchQueryBuilder.mediaSavedSearch(from: definition)
+        if let existing = container.mediaSavedSearches.fetch(named: definition.name) {
+            saved.mediaSavedSearchId = existing.mediaSavedSearchId
+            saved.legacyPictureSearchId = definition.pictureSearchId ?? existing.legacyPictureSearchId
+            // Keep user-edited query JSON; only refresh metadata / legacy link.
+            saved.query = existing.query
+        } else {
+            saved.legacyPictureSearchId = definition.pictureSearchId
+        }
+        let id = container.mediaSavedSearches.save(saved)
+        return container.mediaSavedSearches.fetch(id: id) ?? saved
+    }
+
+    /// One-time-ish: create Media Saved Searches for any Picture Search rows that lack a counterpart.
+    func migratePictureSearchesToMediaSavedSearchesIfNeeded() {
+        let existingNames = Set(
+            container.mediaSavedSearches.fetchAll(enabledOnly: false).map { $0.name.lowercased() }
+        )
+        for definition in container.pictureSearches.fetchAllPictureSearches() {
+            let key = definition.name.lowercased()
+            guard !existingNames.contains(key) else { continue }
+            _ = upsertMediaSavedSearch(from: definition)
+        }
+    }
+
+    func runMediaSavedSearch(_ search: MediaSavedSearch) -> PictureSearchRunReport {
+        let report = SavedMediaSearchRunner(database: databaseManager).run(search)
+        if search.performFaceDetect {
+            maybeEnqueueFaceDetectAfterMediaSavedSearch(search: search, report: report)
+        }
+        return report
+    }
+
+    private func maybeEnqueueFaceDetectAfterMediaSavedSearch(
+        search: MediaSavedSearch,
+        report: PictureSearchRunReport
+    ) {
+        guard search.performFaceDetect, !report.photoMatches.isEmpty else { return }
+        // Reuse picture-search face enqueue when a linked definition exists.
+        if let legacyId = search.legacyPictureSearchId,
+           let definition = container.pictureSearches.fetchPictureSearch(pictureSearchId: legacyId) {
+            maybeEnqueueFaceDetectAfterPictureSearch(definition: definition, report: report)
+        }
+    }
+
+    /// Vision OCR for event photos (incl. trip children). Skips current `textRecognitionVersion`,
+    /// writes `photo_ocr_text`, marks `photos.textRecognitionVersion`.
+    func scanEventPhotosForText(
+        eventId: Int,
+        includeHiddenPhotos: Bool,
+        progress: (@Sendable (Int, Int) -> Void)? = nil
+    ) async -> PhotoTextRecognitionScanReport {
+        let allPhotoIds = getPhotosForEvent(
+            eventId: eventId,
+            includeHidden: includeHiddenPhotos
+        ).map(\.id)
+
+        let algorithmVersion = PhotoTextRecognitionAnalyzer.algorithmVersion
+        let unanalyzedPhotoIds = dbQueue.sync {
+            allPhotoIds.filter {
+                photoRepository.textRecognitionVersionUnsafe(photoId: $0) < algorithmVersion
+            }
+        }
+
+        if unanalyzedPhotoIds.isEmpty {
+            return PhotoTextRecognitionScanReport(
+                photoCount: allPhotoIds.count,
+                photosScanned: 0,
+                photosSkippedAnalyzed: allPhotoIds.count,
+                photosFailed: 0,
+                observationsWritten: 0,
+                photosWithText: 0,
+                stoppedEarly: false
+            )
+        }
+
+        let service = PhotoTextRecognitionScanService(
+            database: databaseManager,
+            photos: photoRepository,
+            ocrText: PhotoOCRTextRepository(database: databaseManager)
+        )
+        return await service.scan(photoIds: unanalyzedPhotoIds, progress: progress)
+    }
+
     func searchPhotosByVisionTag(_ query: String, limit: Int = 500) -> [VisionTagPhotoMatch] {
         dbQueue.sync {
             container.objectTags.searchPhotosByVisionTagUnsafe(query: query, limit: limit)
@@ -265,19 +382,21 @@ final class PhotoDatabase: @unchecked Sendable {
     }
 
     func runPictureSearch(_ definition: PictureSearchDefinition) -> PictureSearchRunReport {
-        let report = container.pictureSearches.runPictureSearch(definition)
+        // Persist/refresh legacy picture search row for score-card + run linkage, then query via Media Search.
+        let savedDefinitionId = container.pictureSearches.savePictureSearch(definition)
+        var definition = definition
+        definition.pictureSearchId = savedDefinitionId
+        let mediaSearch = upsertMediaSavedSearch(from: definition)
+        let report = SavedMediaSearchRunner(database: databaseManager).run(mediaSearch)
         maybeEnqueueFaceDetectAfterPictureSearch(definition: definition, report: report)
         return report
     }
 
     func runPictureSearch(pictureSearchId: Int) -> PictureSearchRunReport? {
-        guard let report = container.pictureSearches.runPictureSearch(pictureSearchId: pictureSearchId) else {
+        guard let definition = container.pictureSearches.fetchPictureSearch(pictureSearchId: pictureSearchId) else {
             return nil
         }
-        if let definition = container.pictureSearches.fetchPictureSearch(pictureSearchId: report.pictureSearchId) {
-            maybeEnqueueFaceDetectAfterPictureSearch(definition: definition, report: report)
-        }
-        return report
+        return runPictureSearch(definition)
     }
 
     func fetchLatestPictureSearchRun(pictureSearchId: Int) -> PictureSearchRunReport? {
@@ -285,85 +404,215 @@ final class PhotoDatabase: @unchecked Sendable {
     }
 
     func ensureWeddingPictureSearch() -> PictureSearchDefinition {
-        container.pictureSearches.ensureWeddingPictureSearch()
+        let definition = container.pictureSearches.ensureWeddingPictureSearch()
+        _ = upsertMediaSavedSearch(from: definition)
+        return definition
     }
 
     func runWeddingPictureSearch() -> (definition: PictureSearchDefinition, report: PictureSearchRunReport) {
-        let result = container.pictureSearches.runWeddingPictureSearch()
-        maybeEnqueueFaceDetectAfterPictureSearch(definition: result.definition, report: result.report)
-        return result
+        let definition = ensureWeddingPictureSearch()
+        let report = runPictureSearch(definition)
+        return (definition, report)
     }
 
     func ensureChristmasPictureSearch() -> PictureSearchDefinition {
-        container.pictureSearches.ensureChristmasPictureSearch()
+        let definition = container.pictureSearches.ensureChristmasPictureSearch()
+        _ = upsertMediaSavedSearch(from: definition)
+        return definition
     }
 
     func runChristmasPictureSearch() -> (definition: PictureSearchDefinition, report: PictureSearchRunReport) {
-        let result = container.pictureSearches.runChristmasPictureSearch()
-        maybeEnqueueFaceDetectAfterPictureSearch(definition: result.definition, report: result.report)
-        return result
+        let definition = ensureChristmasPictureSearch()
+        let report = runPictureSearch(definition)
+        return (definition, report)
     }
 
     func ensureHolidayPictureSearch(tagValue: String) -> PictureSearchDefinition? {
-        container.pictureSearches.ensureHolidayPictureSearch(tagValue: tagValue)
+        guard let definition = container.pictureSearches.ensureHolidayPictureSearch(tagValue: tagValue) else {
+            return nil
+        }
+        _ = upsertMediaSavedSearch(from: definition)
+        return definition
     }
 
     func runHolidayPictureSearch(
         tagValue: String
     ) -> (definition: PictureSearchDefinition, report: PictureSearchRunReport)? {
-        guard let result = container.pictureSearches.runHolidayPictureSearch(tagValue: tagValue) else {
-            return nil
-        }
-        maybeEnqueueFaceDetectAfterPictureSearch(definition: result.definition, report: result.report)
-        return result
+        guard let definition = ensureHolidayPictureSearch(tagValue: tagValue) else { return nil }
+        let report = runPictureSearch(definition)
+        return (definition, report)
     }
 
     func ensureMilestonePictureSearch(topicId: String) -> PictureSearchDefinition? {
-        container.pictureSearches.ensureMilestonePictureSearch(topicId: topicId)
+        guard let definition = container.pictureSearches.ensureMilestonePictureSearch(topicId: topicId) else {
+            return nil
+        }
+        _ = upsertMediaSavedSearch(from: definition)
+        return definition
     }
 
     func runMilestonePictureSearch(
         topicId: String
     ) -> (definition: PictureSearchDefinition, report: PictureSearchRunReport)? {
-        guard let result = container.pictureSearches.runMilestonePictureSearch(topicId: topicId) else {
-            return nil
-        }
-        maybeEnqueueFaceDetectAfterPictureSearch(definition: result.definition, report: result.report)
-        return result
+        guard let definition = ensureMilestonePictureSearch(topicId: topicId) else { return nil }
+        let report = runPictureSearch(definition)
+        return (definition, report)
     }
 
     func ensureOutingPictureSearch(topicId: String) -> PictureSearchDefinition? {
-        container.pictureSearches.ensureOutingPictureSearch(topicId: topicId)
+        guard let definition = container.pictureSearches.ensureOutingPictureSearch(topicId: topicId) else {
+            return nil
+        }
+        _ = upsertMediaSavedSearch(from: definition)
+        return definition
     }
 
     func runOutingPictureSearch(
         topicId: String
     ) -> (definition: PictureSearchDefinition, report: PictureSearchRunReport)? {
-        guard let result = container.pictureSearches.runOutingPictureSearch(topicId: topicId) else {
-            return nil
-        }
-        maybeEnqueueFaceDetectAfterPictureSearch(definition: result.definition, report: result.report)
-        return result
+        guard let definition = ensureOutingPictureSearch(topicId: topicId) else { return nil }
+        let report = runPictureSearch(definition)
+        return (definition, report)
     }
 
     func ensurePersonBirthdayPictureSearch(
         person: PeopleRepository.PersonBirthdayRecord
     ) -> PictureSearchDefinition? {
-        container.pictureSearches.ensurePersonBirthdayPictureSearch(person: person)
+        guard let definition = container.pictureSearches.ensurePersonBirthdayPictureSearch(person: person) else {
+            return nil
+        }
+        _ = upsertMediaSavedSearch(from: definition)
+        return definition
     }
 
     func runPersonBirthdayPictureSearch(
         person: PeopleRepository.PersonBirthdayRecord
     ) -> (definition: PictureSearchDefinition, report: PictureSearchRunReport)? {
-        guard let result = container.pictureSearches.runPersonBirthdayPictureSearch(person: person) else {
-            return nil
-        }
-        maybeEnqueueFaceDetectAfterPictureSearch(definition: result.definition, report: result.report)
-        return result
+        guard let definition = ensurePersonBirthdayPictureSearch(person: person) else { return nil }
+        let report = runPictureSearch(definition)
+        return (definition, report)
     }
 
     func fetchPersonBirthdayRecord(personId: Int) -> PeopleRepository.PersonBirthdayRecord? {
-        fetchPeopleWithBirthDates().first { $0.personId == personId }
+        peopleRepository.fetchPersonBirthdayRecord(personId: personId)
+    }
+
+    /// Saves birth date and ensures `{Name}'s Birthday` Picture Search + scorecard exist.
+    @discardableResult
+    func setPersonBirthDate(personId: Int, birthDateISO: String) -> PictureSearchDefinition? {
+        let trimmed = birthDateISO.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard personId > 0, !trimmed.isEmpty else { return nil }
+        peopleRepository.setBirthDate(personId: personId, birthDateISO: trimmed)
+        return ensurePersonBirthdaySearchAndScoreCard(personId: personId)
+    }
+
+    /// Creates/updates Picture Search + Milestone scorecard for `{Name}'s Birthday`.
+    @discardableResult
+    func ensurePersonBirthdaySearchAndScoreCard(personId: Int) -> PictureSearchDefinition? {
+        guard let person = peopleRepository.fetchPersonBirthdayRecord(personId: personId),
+              let definition = ensurePersonBirthdayPictureSearch(person: person) else {
+            return nil
+        }
+        let tagValue = definition.targetEventType.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tagValue.isEmpty {
+            addCustomEventAttributeOption(tagValue, for: .milestoneType)
+        }
+        let names = Dictionary(
+            uniqueKeysWithValues: fetchAllPeople().map { ($0.personId, $0.name) }
+        )
+        _ = ensureEventScoreCardSettings(for: definition, personNamesById: names)
+        // Guarantee lookup by Milestone + tag value (browser / AI Assist).
+        _ = ensureEventScoreCardSettings(
+            tagCategory: definition.targetTagCategory,
+            tagValue: tagValue,
+            personNamesById: names
+        )
+        return definition
+    }
+
+    /// Sets profile avatar from a face of this person on `photoId`. Returns false if no face found.
+    @discardableResult
+    func setPersonProfilePicture(personId: Int, photoId: String) -> Bool {
+        guard let faceId = peopleRepository.bestFaceInstanceIdForPersonOnPhoto(
+            personId: personId,
+            photoId: photoId
+        ) else {
+            return false
+        }
+        peopleRepository.setProfileFaceInstanceId(personId: personId, faceInstanceId: faceId)
+        return true
+    }
+
+    func updatePersonProfile(
+        personId: Int,
+        displayName: String,
+        firstName: String?,
+        lastName: String?,
+        maidenName: String?
+    ) {
+        peopleRepository.updatePersonNames(
+            personId: personId,
+            displayName: displayName,
+            firstName: firstName,
+            lastName: lastName,
+            maidenName: maidenName
+        )
+        // If they already have a birth date, keep birthday search/scorecard name in sync.
+        _ = ensurePersonBirthdaySearchAndScoreCard(personId: personId)
+    }
+
+    func fetchPeopleLandingItems() -> [PeopleRepository.PeopleLandingItem] {
+        peopleRepository.fetchPeopleLandingItems()
+    }
+
+    func fetchPersonDetail(personId: Int) -> PeopleRepository.PeopleLandingItem? {
+        peopleRepository.fetchPersonDetail(personId: personId)
+    }
+
+    func fetchRelationships(involvingPersonId personId: Int) -> [PeopleRelationship] {
+        container.peopleRelationships.fetchRelationships(involvingPersonId: personId)
+    }
+
+    @discardableResult
+    func upsertParentChildRelationship(
+        parentPersonId: Int,
+        childPersonId: Int,
+        parentRole: PeopleRelationshipRole
+    ) -> PeopleRelationship? {
+        container.peopleRelationships.upsertParentChild(
+            parentPersonId: parentPersonId,
+            childPersonId: childPersonId,
+            parentRole: parentRole
+        )
+    }
+
+    @discardableResult
+    func upsertSiblingRelationship(
+        personIdA: Int,
+        personIdB: Int
+    ) -> PeopleRelationship? {
+        container.peopleRelationships.upsertSibling(personIdA: personIdA, personIdB: personIdB)
+    }
+
+    @discardableResult
+    func upsertRomanticRelationship(
+        personIdA: Int,
+        personIdB: Int,
+        relationshipType: PeopleRelationshipType,
+        roleA: PeopleRelationshipRole,
+        roleB: PeopleRelationshipRole
+    ) -> PeopleRelationship? {
+        container.peopleRelationships.upsertRomanticPair(
+            personIdA: personIdA,
+            personIdB: personIdB,
+            relationshipType: relationshipType,
+            roleA: roleA,
+            roleB: roleB
+        )
+    }
+
+    func deletePeopleRelationship(relationshipId: Int) {
+        container.peopleRelationships.deleteRelationship(relationshipId: relationshipId)
     }
 
     func fetchUnanalyzedPhotoIdsMatchingDateSearch(
@@ -747,7 +996,7 @@ final class PhotoDatabase: @unchecked Sendable {
               let definition = ensurePersonBirthdayPictureSearch(person: person) else {
             return nil
         }
-        let title = "\(person.name) Birthday"
+        let title = MilestonePictureSearchDefaults.personBirthdayTagValue(displayName: person.name)
 
         var visionReport: PhotoVisionTagScanReport?
         if definition.hasUsableVisionTags {
@@ -773,16 +1022,16 @@ final class PhotoDatabase: @unchecked Sendable {
         )
     }
 
-    /// Events path for one person's birthday: reuse Picture Search → score Birthday candidates.
+    /// Events path for one person's birthday: ensure scorecard → Picture Search → score candidates.
     func runPersonBirthdayEventsPipeline(
         personId: Int,
         status: (@Sendable (String) -> Void)? = nil
     ) async -> HolidayEventsPipelineResult? {
         guard let person = fetchPersonBirthdayRecord(personId: personId),
-              let definition = ensurePersonBirthdayPictureSearch(person: person) else {
+              let definition = ensurePersonBirthdaySearchAndScoreCard(personId: personId) else {
             return nil
         }
-        let title = "\(person.name) Birthday"
+        let title = MilestonePictureSearchDefaults.personBirthdayTagValue(displayName: person.name)
 
         if definition.hasUsableVisionTags {
             status?("Tagging \(title) photos…")
@@ -850,6 +1099,35 @@ final class PhotoDatabase: @unchecked Sendable {
         )
     }
 
+    func ensureEventScoreCardSettings(
+        tagCategory: String,
+        tagValue: String,
+        personNamesById: [Int: String] = [:]
+    ) -> PictureSearchEventScoreCardSettings {
+        let names = personNamesById.isEmpty
+            ? Dictionary(uniqueKeysWithValues: fetchAllPeople().map { ($0.personId, $0.name) })
+            : personNamesById
+        return container.pictureSearches.ensureEventScoreCardSettings(
+            tagCategory: tagCategory,
+            tagValue: tagValue,
+            personNamesById: names
+        )
+    }
+
+    func fetchEventScoreCardSettings(
+        tagCategory: String,
+        tagValue: String
+    ) -> PictureSearchEventScoreCardSettings? {
+        container.pictureSearches.fetchEventScoreCardSettings(
+            tagCategory: tagCategory,
+            tagValue: tagValue
+        )
+    }
+
+    func fetchAllEventScoreCardSettings() -> [PictureSearchEventScoreCardSettings] {
+        container.pictureSearches.fetchAllEventScoreCardSettings()
+    }
+
     @discardableResult
     func saveEventScoreCardSettings(
         _ settings: PictureSearchEventScoreCardSettings
@@ -879,6 +1157,42 @@ final class PhotoDatabase: @unchecked Sendable {
             floatingHoliday: floatingHoliday,
             progress: progress
         )
+    }
+
+    @discardableResult
+    func scoreEventAgainstScoreCard(
+        eventId: Int,
+        scoreCard: PictureSearchEventScoreCardSettings
+    ) -> PictureSearchEventTypeScore {
+        let floatingHoliday: FloatingHolidayDefinition? = {
+            guard let floatingId = scoreCard.dateSearch.floatingHolidayId else { return nil }
+            return container.pictureSearches.fetchFloatingHolidays()
+                .first { $0.floatingHolidayId == floatingId }
+        }()
+        let service = PictureSearchEventTypeCheckService(
+            database: databaseManager,
+            eventTags: container.eventTags
+        )
+        return service.scoreEvent(
+            eventId: eventId,
+            scoreCard: scoreCard,
+            floatingHoliday: floatingHoliday
+        )
+    }
+
+    @discardableResult
+    func resolveAndApplyWeddingCouple(eventId: Int) -> WeddingCoupleResolution {
+        WeddingCoupleResolutionService(
+            database: databaseManager,
+            eventTags: container.eventTags
+        ).resolveAndApply(eventId: eventId)
+    }
+
+    func weddingCouplePhotoId(eventId: Int) -> String? {
+        WeddingCoupleResolutionService(
+            database: databaseManager,
+            eventTags: container.eventTags
+        ).weddingCouplePhotoId(eventId: eventId)
     }
 
     func upsertPerson(name: String) -> Int {
@@ -949,6 +1263,7 @@ final class PhotoDatabase: @unchecked Sendable {
     }
 
     /// On event open: create/link a location if needed, then reverse-geocode when incomplete.
+    /// Also assign-only snaps member photos to `photos.locationId` (no per-photo Apple geocode).
     /// Returns `true` when place/city/state were newly written (UI should refresh).
     func ensureEventLocationGeocoded(eventId: Int) async -> Bool {
         enum Prep {
@@ -994,32 +1309,166 @@ final class PhotoDatabase: @unchecked Sendable {
             )
         }
 
+        let didUpdate: Bool
         switch prep {
         case .alreadyUpToDate:
-            return false
+            didUpdate = false
         case .refreshedFromExistingLocation:
-            return true
+            didUpdate = true
         case .needsReverseGeocode(let target):
             if tryCopyNearbyGeocode(
                 locationId: target.locationId,
                 latitude: target.latitude,
                 longitude: target.longitude
             ) {
-                return true
-            }
-
-            if locationRepository.isLocationGeocodeComplete(locationId: target.locationId) {
+                didUpdate = true
+            } else if locationRepository.isLocationGeocodeComplete(locationId: target.locationId) {
                 eventRepository.updateEventsFromLocation(locationId: target.locationId)
-                return true
+                didUpdate = true
+            } else {
+                didUpdate = await reverseGeocodeAndComplete(
+                    eventId: eventId,
+                    locationId: target.locationId,
+                    latitude: target.latitude,
+                    longitude: target.longitude
+                )
             }
+        }
 
-            return await reverseGeocodeAndComplete(
+        dbQueue.sync {
+            assignPhotoLocationsForEventUnsafe(eventId: eventId)
+        }
+        return didUpdate
+    }
+
+    /// Preview header location line; may assign `photos.locationId` from GPS (local only).
+    func photoPreviewLocationLine(photoId: String) -> String {
+        dbQueue.sync {
+            photoPreviewLocationLineUnsafe(photoId: photoId)
+        }
+    }
+
+    func fetchPhotoInfoDetail(photoId: String) -> PhotoInfoDetail? {
+        PhotoInfoRepository(database: databaseManager).fetchDetail(photoId: photoId)
+    }
+
+    /// Prefer the event's location within `photoEventLocationSnapMiles`, else findOrCreate.
+    private func assignPhotoLocationsForEventUnsafe(eventId: Int) {
+        let rows = photoRepository.photosWithGPSForEventUnsafe(eventId: eventId)
+        for row in rows {
+            let locationId: Int
+            if let eventLocationId = eventLocationIdIfWithinPhotoSnap(
                 eventId: eventId,
-                locationId: target.locationId,
-                latitude: target.latitude,
-                longitude: target.longitude
+                latitude: row.latitude,
+                longitude: row.longitude
+            ) {
+                locationId = eventLocationId
+            } else if row.locationId != nil {
+                continue
+            } else {
+                let created = locationRepository.findOrCreateLocation(
+                    latitude: row.latitude,
+                    longitude: row.longitude,
+                    at: row.captureDate
+                )
+                guard created > 0 else { continue }
+                locationId = created
+            }
+            if row.locationId != locationId {
+                photoRepository.setPhotoLocationIdUnsafe(photoId: row.photoId, locationId: locationId)
+            }
+        }
+    }
+
+    private func ensurePhotoLocationAssignedUnsafe(photoId: String) -> Int? {
+        guard let row = photoRepository.photoLocationAssignRowUnsafe(photoId: photoId) else {
+            return nil
+        }
+        guard let latitude = row.latitude, let longitude = row.longitude else {
+            return row.locationId
+        }
+
+        if let eventId = eventRepository.getEventIdForPhotoUnsafe(photoId: photoId),
+           let eventLocationId = eventLocationIdIfWithinPhotoSnap(
+               eventId: eventId,
+               latitude: latitude,
+               longitude: longitude
+           ) {
+            if row.locationId != eventLocationId {
+                photoRepository.setPhotoLocationIdUnsafe(photoId: photoId, locationId: eventLocationId)
+            }
+            return eventLocationId
+        }
+
+        if let locationId = row.locationId {
+            return locationId
+        }
+
+        let locationId = locationRepository.findOrCreateLocation(
+            latitude: latitude,
+            longitude: longitude,
+            at: row.captureDate ?? Date()
+        )
+        guard locationId > 0 else { return nil }
+        photoRepository.setPhotoLocationIdUnsafe(photoId: photoId, locationId: locationId)
+        return locationId
+    }
+
+    private func eventLocationIdIfWithinPhotoSnap(
+        eventId: Int,
+        latitude: Double,
+        longitude: Double
+    ) -> Int? {
+        guard let event = eventRepository.getEvent(eventId: eventId),
+              let locationId = event.locationId else {
+            return nil
+        }
+        let location = locationRepository.getLocation(locationId: locationId)
+        guard let locLat = location?.latitude ?? event.latitude,
+              let locLon = location?.longitude ?? event.longitude else {
+            return nil
+        }
+        let distance = locationRepository.distanceInMiles(
+            lat1: latitude,
+            lon1: longitude,
+            lat2: locLat,
+            lon2: locLon
+        )
+        guard distance <= eventTuningUnsafe().photoEventLocationSnapMiles else {
+            return nil
+        }
+        return locationId
+    }
+
+    private func photoPreviewLocationLineUnsafe(photoId: String) -> String {
+        guard let row = photoRepository.photoLocationAssignRowUnsafe(photoId: photoId),
+              let latitude = row.latitude,
+              let longitude = row.longitude else {
+            // Never fall back to the parent event location for GPS-less photos.
+            return PhotoPreviewLocationFormatting.noGPSData
+        }
+
+        let assignedLocationId = ensurePhotoLocationAssignedUnsafe(photoId: photoId)
+        if let locationId = assignedLocationId,
+           let location = locationRepository.getLocation(locationId: locationId) {
+            return PhotoPreviewLocationFormatting.line(
+                nickname: location.nickname,
+                placeName: location.placeName,
+                city: location.city,
+                state: location.state,
+                latitude: location.latitude ?? latitude,
+                longitude: location.longitude ?? longitude
             )
         }
+
+        return PhotoPreviewLocationFormatting.line(
+            nickname: nil,
+            placeName: nil,
+            city: nil,
+            state: nil,
+            latitude: latitude,
+            longitude: longitude
+        )
     }
 
     private func reverseGeocodeAndComplete(
@@ -1562,6 +2011,22 @@ final class PhotoDatabase: @unchecked Sendable {
         eventRepository.updateWeddingDate(eventId: eventId, weddingDate: weddingDate)
     }
 
+    @discardableResult
+    func upsertMarriedCoupleRelationship(
+        bridePersonId: Int,
+        groomPersonId: Int,
+        weddingDateISO: String,
+        sourceEventId: Int?
+    ) -> PeopleRelationship? {
+        container.peopleRelationships.upsertMarriedCouple(
+            bridePersonId: bridePersonId,
+            groomPersonId: groomPersonId,
+            weddingDateISO: weddingDateISO,
+            sourceEventId: sourceEventId,
+            source: "user"
+        )
+    }
+
     func propagateAnniversaryTagsFromWedding(
         sourceEventId: Int,
         person1: String,
@@ -2081,6 +2546,29 @@ final class PhotoDatabase: @unchecked Sendable {
         eventTags.removeEventAttributeTag(eventId: eventId, tag: tag)
     }
 
+    @discardableResult
+    func purgeEventAttributeTag(eventId: Int, category: String, tagValue: String) -> Int {
+        eventTags.purgeEventAttributeTag(
+            eventId: eventId,
+            category: category,
+            tagValue: tagValue
+        )
+    }
+
+    @discardableResult
+    func purgeRejectedAttributeTags(eventId: Int) -> Int {
+        eventTags.purgeRejectedAttributeTags(eventId: eventId)
+    }
+
+    func fetchAllAttributeTagRowsForEvent(eventId: Int) -> [(
+        category: String,
+        tagValue: String,
+        source: String,
+        isRejected: Bool
+    )] {
+        eventTags.fetchAllAttributeTagRowsForEvent(eventId: eventId)
+    }
+
     func fetchSimilarEventAlternatives(
         tagCategory: String,
         tagValue: String
@@ -2306,7 +2794,6 @@ final class PhotoDatabase: @unchecked Sendable {
             var events = eventTags.attachAttributeTagsUnsafe(
                 to: eventRepository.getEventsUnsafe(
                     includeHidden: includeHidden,
-                    forList: true,
                     limit: limit,
                     filter: filter
                 )
@@ -2357,6 +2844,10 @@ final class PhotoDatabase: @unchecked Sendable {
         eventRepository.getSlideshowPhotoIds(for: events)
     }
 
+    func getOnFrameVideoIds(for events: [IndexedEvent]) -> [Int: String] {
+        eventRepository.getOnFrameVideoIds(for: events)
+    }
+
     func setPhotoShowOnFrame(photoId: String, eventId: Int, show: Bool) {
         persistPhotoOnFrameChanges(
             defaultEventId: eventId,
@@ -2372,6 +2863,56 @@ final class PhotoDatabase: @unchecked Sendable {
 
     func getPhotosForEvent(eventId: Int, includeHidden: Bool = false) -> [IndexedPhoto] {
         eventRepository.getPhotosForEvent(eventId: eventId, includeHidden: includeHidden)
+    }
+
+    func fetchEventPhotoSortMetadata(photoIds: [String]) -> (
+        metadata: [String: EventPhotoSortMetadata],
+        locationLabels: [Int: String]
+    ) {
+        dbQueue.sync {
+            let uniqueIds = Array(Set(photoIds))
+            guard !uniqueIds.isEmpty else {
+                return ([:], [:])
+            }
+
+            let sortFields = photoRepository.fetchSortFieldsUnsafe(photoIds: uniqueIds)
+            let cameras = container.photoExif.fetchCameraLabelsUnsafe(photoIds: uniqueIds)
+
+            var metadata: [String: EventPhotoSortMetadata] = [:]
+            metadata.reserveCapacity(uniqueIds.count)
+            var locationIds = Set<Int>()
+
+            for photoId in uniqueIds {
+                let fields = sortFields[photoId]
+                let camera = cameras[photoId]
+                if let locationId = fields?.locationId {
+                    locationIds.insert(locationId)
+                }
+                metadata[photoId] = EventPhotoSortMetadata(
+                    indexedAt: fields?.indexedAt,
+                    cameraMake: camera?.make,
+                    cameraModel: camera?.model,
+                    locationId: fields?.locationId
+                )
+            }
+
+            var locationLabels: [Int: String] = [:]
+            for locationId in locationIds {
+                guard let location = locationRepository.getLocation(locationId: locationId) else {
+                    continue
+                }
+                locationLabels[locationId] = PhotoPreviewLocationFormatting.line(
+                    nickname: location.nickname,
+                    placeName: location.placeName,
+                    city: location.city,
+                    state: location.state,
+                    latitude: location.latitude,
+                    longitude: location.longitude
+                )
+            }
+
+            return (metadata, locationLabels)
+        }
     }
 
     func setSimilarGroupPicks(groupPhotoIds: [String], pickedPhotoIds: Set<String>) {
@@ -2434,12 +2975,25 @@ final class PhotoDatabase: @unchecked Sendable {
         }
     }
 
-    func setPhotosHiddenInEvent(photoIds: [String], hidden: Bool) {
+    @discardableResult
+    func setPhotosHiddenInEvent(photoIds: [String], hidden: Bool) -> [String] {
         eventRepository.setPhotosHiddenInEvent(photoIds: photoIds, hidden: hidden)
     }
 
     func fetchPhotosForBrowser(photoIds: [String]) -> [(photo: IndexedPhoto, mediaType: Int)] {
         photoRepository.fetchPhotosForBrowser(photoIds: photoIds)
+    }
+
+    func fetchPhotosForBrowser(
+        photoIds: [String],
+        year: Int,
+        useImportDate: Bool
+    ) -> [(photo: IndexedPhoto, mediaType: Int, indexedAt: String)] {
+        photoRepository.fetchPhotosForBrowser(
+            photoIds: photoIds,
+            year: year,
+            useImportDate: useImportDate
+        )
     }
 
     func fetchAllPhotosForBrowser() -> [(photo: IndexedPhoto, mediaType: Int, indexedAt: String)] {
@@ -2460,6 +3014,81 @@ final class PhotoDatabase: @unchecked Sendable {
 
     func setPhotosFavorite(photoIds: [String], isFavorite: Bool) {
         photoRepository.setPhotosFavorite(photoIds: photoIds, isFavorite: isFavorite)
+    }
+
+    func softDeletePhotos(photoIds: [String]) {
+        photoRepository.softDeletePhotos(photoIds: photoIds)
+    }
+
+    func shiftPhotoCaptureDates(updates: [(photoId: String, newCreationDate: Date)]) {
+        photoRepository.shiftPhotoCaptureDates(updates: updates)
+    }
+
+    func promoteCaptureDatesAfterPhotosSync(updates: [(photoId: String, newCreationDate: Date)]) {
+        photoRepository.promoteCaptureDatesAfterPhotosSync(updates: updates)
+    }
+
+    func shiftPhotoLocations(
+        updates: [(photoId: String, latitude: Double, longitude: Double, locationId: Int?)]
+    ) {
+        photoRepository.shiftPhotoLocations(updates: updates)
+    }
+
+    func promoteLocationsAfterPhotosSync(
+        updates: [(photoId: String, latitude: Double, longitude: Double)]
+    ) {
+        photoRepository.promoteLocationsAfterPhotosSync(updates: updates)
+    }
+
+    func findEventsContainingDateRange(
+        rangeStart: Date,
+        rangeEnd: Date,
+        excludingEventId: Int?
+    ) -> [IndexedEvent] {
+        eventTags.attachAttributeTags(
+            to: eventRepository.findEventsContainingDateRange(
+                rangeStart: rangeStart,
+                rangeEnd: rangeEnd,
+                excludingEventId: excludingEventId
+            )
+        )
+    }
+
+    func createEventForShiftedPhotos(
+        photoIds: [String],
+        fromEventId: Int?,
+        rangeStart: Date,
+        rangeEnd: Date,
+        locationId: Int?,
+        latitude: Double?,
+        longitude: Double?
+    ) -> IndexedEvent? {
+        guard let event = eventRepository.createEventForShiftedPhotos(
+            photoIds: photoIds,
+            fromEventId: fromEventId,
+            rangeStart: rangeStart,
+            rangeEnd: rangeEnd,
+            locationId: locationId,
+            latitude: latitude,
+            longitude: longitude
+        ) else {
+            return nil
+        }
+        return eventTags.attachAttributeTags(to: [event]).first
+    }
+
+    func movePhotosToEvent(
+        photoIds: [String],
+        fromEventId: Int?,
+        toEventId: Int,
+        photoDates: [String: Date]
+    ) {
+        eventRepository.movePhotosToEvent(
+            photoIds: photoIds,
+            fromEventId: fromEventId,
+            toEventId: toEventId,
+            photoDates: photoDates
+        )
     }
 
     func getEventIdForPhoto(photoId: String) -> Int? {
@@ -2621,12 +3250,26 @@ final class PhotoDatabase: @unchecked Sendable {
         container.faceRecognitionService.fetchUnnamedClusters()
     }
 
-    func fetchFaceAnnotations(forPhotoId photoId: String) -> [PhotoFaceAnnotation] {
-        container.faceRecognitionService.fetchFaceAnnotations(forPhotoId: photoId)
+    func fetchFaceAnnotations(
+        forPhotoId photoId: String,
+        suggestionEventId: Int?
+    ) -> [PhotoFaceAnnotation] {
+        container.faceRecognitionService.fetchFaceAnnotations(
+            forPhotoId: photoId,
+            suggestionEventId: suggestionEventId
+        )
     }
 
-    func ensurePhotoFaceScanned(photoId: String) async -> [PhotoFaceAnnotation] {
-        await container.faceRecognitionService.ensurePhotoFaceScanned(photoId: photoId)
+    func ensurePhotoFaceScanned(
+        photoId: String,
+        suggestionEventId: Int?,
+        upgradeToPreviewScan: Bool
+    ) async -> [PhotoFaceAnnotation] {
+        await container.faceRecognitionService.ensurePhotoFaceScanned(
+            photoId: photoId,
+            suggestionEventId: suggestionEventId,
+            upgradeToPreviewScan: upgradeToPreviewScan
+        )
     }
 
     @discardableResult

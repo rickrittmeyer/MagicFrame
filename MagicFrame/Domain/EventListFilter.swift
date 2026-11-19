@@ -1,7 +1,7 @@
 import Foundation
 
 /// How the events library list loads and presents rows.
-enum EventListFilter: Equatable, Sendable {
+enum EventListFilter: Equatable, Hashable, Sendable {
     case allEvents
     /// Top-level events with any `event_tags` holiday row (on self or a trip child).
     case anyHoliday
@@ -12,6 +12,8 @@ enum EventListFilter: Equatable, Sendable {
     case milestoneTag(value: String)
     /// Top-level events matching any of the given milestone tag values.
     case milestoneTags(values: [String])
+    /// Generic `Birthday` or person-scoped `Vince's Birthday` / legacy `Vince Birthday`.
+    case anyBirthdayMilestone
     /// Top-level trip parent events (`isTripEvent = 1`).
     case trips
     /// Top-level events with any activity tag (on self or a trip child).
@@ -21,7 +23,8 @@ enum EventListFilter: Equatable, Sendable {
     case eventTypeTag(value: String)
     /// Top-level events matching any of the given `eventType` tag values.
     case eventTypeTags(values: [String])
-    /// Top-level events near a person's birthday (±3 days) with photos of that person.
+    /// Top-level events near a person's birthday (7 days before … 3 after), photos of that person,
+    /// main-person match, or milestone tag `{Name}'s Birthday`.
     case birthdayPerson(personId: Int, displayName: String)
     /// Top-level events assigned to a managed location.
     case location(locationId: Int, displayTitle: String)
@@ -29,6 +32,7 @@ enum EventListFilter: Equatable, Sendable {
     static let holidays = EventListFilter.anyHoliday
     static let christmas = EventListFilter.holidayTag(value: "Christmas")
     static let milestones = EventListFilter.anyMilestone
+    static let birthdays = EventListFilter.anyBirthdayMilestone
     static let weddings = EventListFilter.milestoneTag(value: "Wedding")
     static let graduations = EventListFilter.milestoneTag(value: "Graduation")
     static let proms = EventListFilter.milestoneTags(values: ["Senior Prom", "Junior Prom"])
@@ -78,6 +82,8 @@ enum EventListFilter: Equatable, Sendable {
             return Self.milestoneDisplayTitle(for: value)
         case .milestoneTags(let values):
             return Self.milestoneTagsDisplayTitle(for: values)
+        case .anyBirthdayMilestone:
+            return "Birthdays"
         case .trips:
             return "Trips"
         case .anyActivity:
@@ -113,6 +119,8 @@ enum EventListFilter: Equatable, Sendable {
         case .milestoneTags(let values):
             let title = Self.milestoneTagsDisplayTitle(for: values).lowercased()
             return "No \(title) events yet."
+        case .anyBirthdayMilestone:
+            return "No birthday events yet."
         case .trips:
             return "No trip events yet. Trips form when multi-day travel is clustered."
         case .anyActivity:

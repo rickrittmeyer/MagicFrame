@@ -63,11 +63,11 @@ struct HolidayDeveloperView: View {
 
             Section("Picture search") {
                 NavigationLink {
-                    IdentifyEventTypesView(preferredSearchName: pictureSearchName)
+                    MediaSavedSearchesView(preferredSearchName: pictureSearchName)
                 } label: {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Picture Search")
-                        Text("Opens with \(tagValue) Picture Search as the default.")
+                        Text("Opens Media Saved Searches with \(tagValue) preferred.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }

@@ -102,7 +102,9 @@ enum HolidayLandingCatalog {
             ) else {
                 continue
             }
-            let displayName = "\(person.name) Birthday"
+            let displayName = MilestonePictureSearchDefaults.personBirthdayTagValue(
+                displayName: person.name
+            )
             items.append(
                 HolidayLandingItem(
                     kind: .birthdayPerson(personId: person.personId, displayName: displayName),

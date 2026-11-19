@@ -35,6 +35,7 @@ enum SQLiteMigrations {
             longitude REAL,
             userLatitude REAL,
             userLongitude REAL,
+            locationId INTEGER,
 
             isScreenshot INTEGER,
 
@@ -55,6 +56,7 @@ enum SQLiteMigrations {
             captureDateOverride TEXT,
             visionAnalyzed INTEGER DEFAULT 0,
             faceRecognitionVersion INTEGER DEFAULT 0,
+            textRecognitionVersion INTEGER DEFAULT 0,
 
             faceEyesOpenScore REAL,
             faceSmileScore REAL,
@@ -125,7 +127,8 @@ enum SQLiteMigrations {
             firstName TEXT,
             lastName TEXT,
             maidenName TEXT,
-            birthDate TEXT
+            birthDate TEXT,
+            profileFaceInstanceId INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS photo_people (
@@ -168,6 +171,9 @@ enum SQLiteMigrations {
         CREATE INDEX IF NOT EXISTS idx_photos_deleted
         ON photos(isDeleted);
 
+        CREATE INDEX IF NOT EXISTS idx_photos_locationId
+        ON photos(locationId);
+
         CREATE INDEX IF NOT EXISTS idx_photo_events_eventId
         ON photo_events(eventId);
 
@@ -196,10 +202,13 @@ enum SQLiteMigrations {
         migrateFaceRecognitionTablesIfNeeded(on: db)
         migrateEventTagsIfNeeded(on: db)
         migrateEventNameTemplatesIfNeeded(on: db)
+        migratePeopleRelationshipsIfNeeded(on: db)
         migrateSimilarEventTagsIfNeeded(on: db)
         migrateObjectTagTablesIfNeeded(on: db)
+        migratePhotoOCRTextTablesIfNeeded(on: db)
         migrateVisionJobTablesIfNeeded(on: db)
         migratePictureSearchTablesIfNeeded(on: db)
+        migrateMediaSavedSearchTablesIfNeeded(on: db)
         migrateStadiumsTablesIfNeeded(on: db)
         migrateHolidaysTablesIfNeeded(on: db)
     }
@@ -214,7 +223,15 @@ enum SQLiteMigrations {
         addColumnIfNeeded(table: "photos", column: "captureDateOverride", definition: "TEXT", on: db)
         addColumnIfNeeded(table: "photos", column: "userLatitude", definition: "REAL", on: db)
         addColumnIfNeeded(table: "photos", column: "userLongitude", definition: "REAL", on: db)
+        addColumnIfNeeded(table: "photos", column: "locationId", definition: "INTEGER", on: db)
         addColumnIfNeeded(table: "photos", column: "duration", definition: "REAL", on: db)
+        sqlite3_exec(
+            db,
+            "CREATE INDEX IF NOT EXISTS idx_photos_locationId ON photos(locationId);",
+            nil,
+            nil,
+            nil
+        )
 
         addColumnIfNeeded(table: "events", column: "locationId", definition: "INTEGER", on: db)
         addColumnIfNeeded(table: "events", column: "isDeleted", definition: "INTEGER DEFAULT 0", on: db)
@@ -249,6 +266,7 @@ enum SQLiteMigrations {
         // backfill + rename to X* below; never re-add live names after archive.
         ensurePreArchiveEventAttributeColumnsIfNeeded(on: db)
         addColumnIfNeeded(table: "events", column: "weddingDate", definition: "TEXT", on: db)
+        addColumnIfNeeded(table: "events", column: "weddingCouplePhotoId", definition: "TEXT", on: db)
         legacyHooks.migrateLegacyTripEventType()
 
         addColumnIfNeeded(table: "locations", column: "isFavorite", definition: "INTEGER DEFAULT 0", on: db)
@@ -283,6 +301,12 @@ enum SQLiteMigrations {
         addColumnIfNeeded(
             table: "photos",
             column: "faceRecognitionVersion",
+            definition: "INTEGER DEFAULT 0",
+            on: db
+        )
+        addColumnIfNeeded(
+            table: "photos",
+            column: "textRecognitionVersion",
             definition: "INTEGER DEFAULT 0",
             on: db
         )
@@ -322,20 +346,29 @@ enum SQLiteMigrations {
 
         migrateMetadataTablesIfNeeded(on: db)
         addColumnIfNeeded(table: "people", column: "birthDate", definition: "TEXT", on: db)
+        addColumnIfNeeded(table: "people", column: "profileFaceInstanceId", definition: "INTEGER", on: db)
         migratePeopleDisplayNameFieldsIfNeeded(on: db)
         migrateFaceRecognitionTablesIfNeeded(on: db)
         migrateEventTagsIfNeeded(on: db)
         migrateEventTagsDropLegacyScoringColumnsIfNeeded(on: db)
         migrateSimilarEventTagsIfNeeded(on: db)
         migrateEventNameTemplatesIfNeeded(on: db)
+        migratePeopleRelationshipsIfNeeded(on: db)
         migrateObjectTagTablesIfNeeded(on: db)
+        migratePhotoOCRTextTablesIfNeeded(on: db)
         migrateVisionJobTablesIfNeeded(on: db)
         legacyHooks.backfillEventAttributeTagsFromColumns()
         archiveEventAttributeColumnsIfNeeded(on: db)
         dropArchivedEventAttributeColumnsIfNeeded(on: db)
         // After any holidayType column → event_tags backfill, wipe holiday tags once.
         clearAllHolidayEventTagsOnceIfNeeded(on: db)
+        // TEMP troubleshooting: wipe AI-rejection tombstones so scoring can re-apply tags.
+        clearAllRejectedEventTagsOnceIfNeeded(on: db)
+        // TEMP: wipe all Milestone + Holiday event tags (user + AI). Remove this call + function after it has run once on device.
+        clearAllMilestoneAndHolidayEventTagsOnceIfNeeded(on: db)
+        migrateTripTypeTagCategoryToTripsIfNeeded(on: db)
         migratePictureSearchTablesIfNeeded(on: db)
+        migrateMediaSavedSearchTablesIfNeeded(on: db)
         migrateStadiumsTablesIfNeeded(on: db)
         migrateHolidaysTablesIfNeeded(on: db)
         backfillVisionAnalyzedFromObjectTagsIfNeeded(on: db)
@@ -517,6 +550,143 @@ enum SQLiteMigrations {
         setAppMetadataValue(key: metadataKey, value: "1", on: db)
     }
 
+    /// One-time: rename `tripType` tag category → `Trips` (event_tags + related tables).
+    /// Live `events.tripType` / `XtripType` columns are dropped by
+    /// `dropArchivedEventAttributeColumnsIfNeeded` (legacy column list).
+    private static func migrateTripTypeTagCategoryToTripsIfNeeded(on db: OpaquePointer) {
+        let metadataKey = "tripTypeTagCategoryMigratedToTripsV1"
+        guard appMetadataValue(key: metadataKey, on: db) != "1" else { return }
+
+        let legacyCategory = "tripType"
+        let newCategory = EventAttributeField.tripType.tagCategory
+
+        func rewriteTagCategory(table: String) {
+            guard tableExists(table, on: db),
+                  columnExists(table: table, column: "tagCategory", on: db) else {
+                return
+            }
+
+            // Drop legacy rows that would collide with an existing Trips row.
+            if table == "event_tags",
+               columnExists(table: table, column: "eventId", on: db),
+               columnExists(table: table, column: "tagValue", on: db) {
+                let deleteSQL = """
+                DELETE FROM event_tags
+                WHERE tagCategory = ? COLLATE NOCASE
+                  AND EXISTS (
+                    SELECT 1 FROM event_tags AS existing
+                    WHERE existing.eventId = event_tags.eventId
+                      AND existing.tagCategory = ? COLLATE NOCASE
+                      AND existing.tagValue = event_tags.tagValue COLLATE NOCASE
+                  );
+                """
+                var deleteStatement: OpaquePointer?
+                if sqlite3_prepare_v2(db, deleteSQL, -1, &deleteStatement, nil) == SQLITE_OK {
+                    sqlite3_bind_text(
+                        deleteStatement,
+                        1,
+                        (legacyCategory as NSString).utf8String,
+                        -1,
+                        nil
+                    )
+                    sqlite3_bind_text(
+                        deleteStatement,
+                        2,
+                        (newCategory as NSString).utf8String,
+                        -1,
+                        nil
+                    )
+                    sqlite3_step(deleteStatement)
+                }
+                sqlite3_finalize(deleteStatement)
+            }
+
+            if table == "event_name_templates" || table == "similar_event_tags",
+               columnExists(table: table, column: "tagValue", on: db) {
+                let deleteSQL = """
+                DELETE FROM \(table)
+                WHERE tagCategory = ? COLLATE NOCASE
+                  AND EXISTS (
+                    SELECT 1 FROM \(table) AS existing
+                    WHERE existing.tagCategory = ? COLLATE NOCASE
+                      AND existing.tagValue = \(table).tagValue COLLATE NOCASE
+                  );
+                """
+                var deleteStatement: OpaquePointer?
+                if sqlite3_prepare_v2(db, deleteSQL, -1, &deleteStatement, nil) == SQLITE_OK {
+                    sqlite3_bind_text(
+                        deleteStatement,
+                        1,
+                        (legacyCategory as NSString).utf8String,
+                        -1,
+                        nil
+                    )
+                    sqlite3_bind_text(
+                        deleteStatement,
+                        2,
+                        (newCategory as NSString).utf8String,
+                        -1,
+                        nil
+                    )
+                    sqlite3_step(deleteStatement)
+                }
+                sqlite3_finalize(deleteStatement)
+            }
+
+            let updateSQL = """
+            UPDATE \(table)
+            SET tagCategory = ?
+            WHERE tagCategory = ? COLLATE NOCASE;
+            """
+            var statement: OpaquePointer?
+            if sqlite3_prepare_v2(db, updateSQL, -1, &statement, nil) == SQLITE_OK {
+                sqlite3_bind_text(statement, 1, (newCategory as NSString).utf8String, -1, nil)
+                sqlite3_bind_text(statement, 2, (legacyCategory as NSString).utf8String, -1, nil)
+                sqlite3_step(statement)
+            }
+            sqlite3_finalize(statement)
+        }
+
+        rewriteTagCategory(table: "event_tags")
+        rewriteTagCategory(table: "event_name_templates")
+        rewriteTagCategory(table: "similar_event_tags")
+
+        if tableExists("picture_searches", on: db),
+           columnExists(table: "picture_searches", column: "targetTagCategory", on: db) {
+            let sql = """
+            UPDATE picture_searches
+            SET targetTagCategory = ?
+            WHERE targetTagCategory = ? COLLATE NOCASE;
+            """
+            var statement: OpaquePointer?
+            if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+                sqlite3_bind_text(statement, 1, (newCategory as NSString).utf8String, -1, nil)
+                sqlite3_bind_text(statement, 2, (legacyCategory as NSString).utf8String, -1, nil)
+                sqlite3_step(statement)
+            }
+            sqlite3_finalize(statement)
+        }
+
+        if tableExists("event_score_cards", on: db),
+           columnExists(table: "event_score_cards", column: "targetTagCategory", on: db) {
+            let sql = """
+            UPDATE event_score_cards
+            SET targetTagCategory = ?
+            WHERE targetTagCategory = ? COLLATE NOCASE;
+            """
+            var statement: OpaquePointer?
+            if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+                sqlite3_bind_text(statement, 1, (newCategory as NSString).utf8String, -1, nil)
+                sqlite3_bind_text(statement, 2, (legacyCategory as NSString).utf8String, -1, nil)
+                sqlite3_step(statement)
+            }
+            sqlite3_finalize(statement)
+        }
+
+        setAppMetadataValue(key: metadataKey, value: "1", on: db)
+        print("Migrated tripType tag category → Trips")
+    }
+
     /// One-time: delete every `event_tags` holiday row (user + AI + rejected).
     private static func clearAllHolidayEventTagsOnceIfNeeded(on db: OpaquePointer) {
         let metadataKey = "holidayEventTagsClearedV1"
@@ -551,6 +721,71 @@ enum SQLiteMigrations {
 
         setAppMetadataValue(key: metadataKey, value: "1", on: db)
         print("Cleared \(deleted) holiday event_tags row(s) (one-time)")
+    }
+
+    /// TEMP troubleshooting: delete AI-rejection tombstones so scoring can re-apply tags.
+    private static func clearAllRejectedEventTagsOnceIfNeeded(on db: OpaquePointer) {
+        let metadataKey = "rejectedEventTagsClearedV1"
+        guard appMetadataValue(key: metadataKey, on: db) != "1" else { return }
+        guard tableExists("event_tags", on: db) else {
+            setAppMetadataValue(key: metadataKey, value: "1", on: db)
+            return
+        }
+
+        let sql = "DELETE FROM event_tags WHERE COALESCE(isRejected, 0) = 1;"
+        var deleted = 0
+        if sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK {
+            deleted = Int(sqlite3_changes(db))
+        } else {
+            print(
+                "clearAllRejectedEventTagsOnceIfNeeded failed:"
+                    + " \(String(cString: sqlite3_errmsg(db)))"
+            )
+            return
+        }
+
+        setAppMetadataValue(key: metadataKey, value: "1", on: db)
+        print("Cleared \(deleted) rejected event_tags tombstone(s) (one-time)")
+    }
+
+    /// TEMP troubleshooting: delete all Milestone + Holiday tags (user + AI + rejected).
+    /// Remove this function and its call site after it has run once on each device.
+    private static func clearAllMilestoneAndHolidayEventTagsOnceIfNeeded(on db: OpaquePointer) {
+        let metadataKey = "milestoneHolidayEventTagsClearedV1"
+        guard appMetadataValue(key: metadataKey, on: db) != "1" else { return }
+        guard tableExists("event_tags", on: db) else {
+            setAppMetadataValue(key: metadataKey, value: "1", on: db)
+            return
+        }
+
+        let milestone = EventAttributeField.milestoneType.tagCategory
+        let holiday = EventAttributeField.holidayType.tagCategory
+        let sql = """
+        DELETE FROM event_tags
+        WHERE tagCategory = ? COLLATE NOCASE
+           OR tagCategory = ? COLLATE NOCASE;
+        """
+
+        var statement: OpaquePointer?
+        var deleted = 0
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            sqlite3_bind_text(statement, 1, (milestone as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, 2, (holiday as NSString).utf8String, -1, nil)
+            if sqlite3_step(statement) == SQLITE_DONE {
+                deleted = Int(sqlite3_changes(db))
+            }
+        } else {
+            print(
+                "clearAllMilestoneAndHolidayEventTagsOnceIfNeeded prepare failed:"
+                    + " \(String(cString: sqlite3_errmsg(db)))"
+            )
+            sqlite3_finalize(statement)
+            return
+        }
+        sqlite3_finalize(statement)
+
+        setAppMetadataValue(key: metadataKey, value: "1", on: db)
+        print("Cleared \(deleted) milestone/holiday event_tags row(s) (one-time TEMP)")
     }
 
     /// Removes the retired occasions system tables (order respects FKs).
@@ -1466,6 +1701,70 @@ enum SQLiteMigrations {
 
 
 
+    private static func migratePhotoOCRTextTablesIfNeeded(on db: OpaquePointer) {
+        let sql = """
+        CREATE TABLE IF NOT EXISTS photo_ocr_text (
+            photoId TEXT PRIMARY KEY,
+            fullText TEXT NOT NULL,
+            observationCount INTEGER NOT NULL DEFAULT 0,
+            algorithmVersion INTEGER NOT NULL,
+            indexedAt TEXT NOT NULL,
+            FOREIGN KEY (photoId) REFERENCES photos(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_photos_textRecognitionVersion
+            ON photos(textRecognitionVersion);
+        """
+
+        if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
+            print(
+                "Photo OCR text table migration failed:"
+                    + " \(String(cString: sqlite3_errmsg(db)))"
+            )
+        }
+    }
+
+    private static func migrateMediaSavedSearchTablesIfNeeded(on db: OpaquePointer) {
+        let sql = """
+        CREATE TABLE IF NOT EXISTS media_saved_searches (
+            mediaSavedSearchId INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            targetTagCategory TEXT NOT NULL DEFAULT '',
+            targetTagValue TEXT NOT NULL DEFAULT '',
+            queryJSON TEXT NOT NULL,
+            isEnabled INTEGER NOT NULL DEFAULT 1,
+            performFaceDetect INTEGER NOT NULL DEFAULT 0,
+            legacyPictureSearchId INTEGER,
+            createdAt TEXT NOT NULL,
+            updatedAt TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_media_saved_searches_tag
+        ON media_saved_searches(targetTagCategory, targetTagValue);
+
+        CREATE INDEX IF NOT EXISTS idx_media_saved_searches_name
+        ON media_saved_searches(name COLLATE NOCASE);
+        """
+        if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
+            print(
+                "Media saved search table migration failed:"
+                    + " \(String(cString: sqlite3_errmsg(db)))"
+            )
+        }
+        addColumnIfNeeded(
+            table: "picture_search_runs",
+            column: "mediaSavedSearchId",
+            definition: "INTEGER",
+            on: db
+        )
+        addColumnIfNeeded(
+            table: "media_saved_searches",
+            column: "legacyPictureSearchId",
+            definition: "INTEGER",
+            on: db
+        )
+    }
+
     private static func migrateObjectTagTablesIfNeeded(on db: OpaquePointer) {
         let sql = """
         CREATE TABLE IF NOT EXISTS photo_object_tags (
@@ -1569,6 +1868,45 @@ enum SQLiteMigrations {
         }
 
         migrateEventTagsUniqueToIncludeTagValueIfNeeded(on: db)
+    }
+
+    /// Couple / family / friend relationships (wedding date lives on married rows).
+    private static func migratePeopleRelationshipsIfNeeded(on db: OpaquePointer) {
+        let sql = """
+        CREATE TABLE IF NOT EXISTS people_relationships (
+            relationshipId INTEGER PRIMARY KEY AUTOINCREMENT,
+            personIdA INTEGER NOT NULL,
+            personIdB INTEGER NOT NULL,
+            relationshipClass TEXT NOT NULL,
+            relationshipType TEXT NOT NULL,
+            roleA TEXT NOT NULL,
+            roleB TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            startDate TEXT,
+            endDate TEXT,
+            sourceEventId INTEGER,
+            source TEXT NOT NULL DEFAULT 'user',
+            notes TEXT,
+            createdAt TEXT NOT NULL,
+            updatedAt TEXT NOT NULL,
+            FOREIGN KEY (personIdA) REFERENCES people(personId),
+            FOREIGN KEY (personIdB) REFERENCES people(personId),
+            FOREIGN KEY (sourceEventId) REFERENCES events(eventId)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_people_rel_personA
+            ON people_relationships(personIdA);
+        CREATE INDEX IF NOT EXISTS idx_people_rel_personB
+            ON people_relationships(personIdB);
+        CREATE INDEX IF NOT EXISTS idx_people_rel_type_status
+            ON people_relationships(relationshipType, status);
+        CREATE INDEX IF NOT EXISTS idx_people_rel_source_event
+            ON people_relationships(sourceEventId);
+        """
+
+        if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
+            print("people_relationships migration failed: \(String(cString: sqlite3_errmsg(db)))")
+        }
     }
 
     /// Suggested event-name patterns by tag (Wedding, Senior Prom, …).

@@ -1,0 +1,36 @@
+screen_id,step,when,task,details,blocks_ui,status
+app.shell,1,always,startup_pipeline,vm.onAppear(); visionJobCoordinator.startIfNeeded(),background,current
+app.shell,2,if_not_done,load_events_for_ui,After isStartupComplete: loadEventsForUIIfNeeded(),background,current
+photos.home,1,always,clear_events_tab_focus,clearEventsTabFocus(),none,current
+photos.home,2,always,refresh_home_counts,refreshHomeCategoryCounts(),background,current
+photos.all-media,1,always,load_picture_browser,PictureBrowserViewModel.load() for full library,spinner,current
+photos.holidays,1,always,clear_events_tab_focus,onAppear clearEventsTabFocus(),none,current
+photos.holidays,2,always,refresh_holiday_landing,scheduleHolidayLandingRefresh() → DB holiday catalog + birthday cards,background,current
+photos.holidays,3,on_disappear,cancel_holiday_landing_refresh,cancel scheduled refresh,none,current
+photos.holidays.christmas.photos,1,always,focus_events_tab_filter,onAppear: focusEventsTabOnHoliday('Christmas') so Events tab mirrors Christmas Events,none,current
+photos.holidays.christmas.photos,2,if_not_done,vision_prep_holiday_tags,prepareHolidayVisionTagsIfNeeded for Christmas date window / vision tag criteria (idempotent if already tagged),spinner,current
+photos.holidays.christmas.photos,3,always,run_holiday_picture_search,runHolidayPictureSearch('Christmas'); may enqueue face detect if performFaceDetect on definition,spinner,current
+photos.holidays.christmas.photos,4,always,display_picture_browser,Show PictureBrowserView; title Christmas Photos and Videos / Christmas Photos / Christmas Videos by filter; select Footer ADD Share (status=change),none,current
+events.holidays.christmas,1,always,begin_event_list_load,beginEventListLoad(.holidayTag Christmas); sets activeHolidayVisionConfig,spinner,current
+events.holidays.christmas,2,if_not_done,vision_prep_holiday_tags,Same vision prep as photos path if tags needed,spinner,current
+events.holidays.christmas,3,if_stale,reuse_or_run_picture_search,Reuse latest Picture Search run if non-empty; else runHolidayPictureSearch,spinner,current
+events.holidays.christmas,4,always,score_candidate_events,Score candidate events from picture matches (event type check / score card),spinner,current
+events.holidays.christmas,5,always,reload_events_list,reloadEventsAsync for Christmas-filtered events; enrich slideshow/game after paint,spinner,current
+events.holidays.christmas,6,on_year_expand,holiday_year_object_recognition,handleHolidayYearExpanded → enqueueHolidayYearObjectRecognitionJobs for landing Vision,background,current
+events.holidays.christmas,7,on_disappear,cancel_holiday_landing_vision,cancelHolidayLandingVisionScans if active,none,current
+photos.holidays.{holiday}.photos,1,always,same_as_christmas_photos_pattern,Copy Christmas Photos EntryTasks; substitute holiday name. Mark status=change if a holiday differs.,spinner,current
+events.holidays.{holiday},1,always,same_as_christmas_events_pattern,Copy Christmas Events EntryTasks; substitute holiday name.,spinner,current
+events.all,1,always,begin_event_list_load,beginEventListLoad(.allEvents) — no 450ms push delay,spinner,current
+events.all,2,always,reload_events_async,reloadEventsAsync(loadSlideshowIds: true); chunked slideshow enrichment after paint,spinner,current
+events.all,3,always,schedule_event_date_repair,scheduleEventDateRepairIfNeeded() (All Events only),background,current
+photos.milestones.{topic}.photos,1,always,run_milestone_photos_pipeline,Vision prep if needed → Picture Search; focusEventsTabOnMilestone,spinner,current
+events.milestones.{topic},1,always,run_milestone_events_pipeline,Reuse/search → score → beginEventListLoad + reloadEventsAsync,spinner,current
+photos.outings.{topic}.photos,1,always,run_outing_photos_pipeline,Vision prep if needed → Picture Search; focusEventsTabOnOuting,spinner,current
+events.outings.{topic},1,always,run_outing_events_pipeline,Reuse/search → score → beginEventListLoad + reloadEventsAsync,spinner,current
+photos.people,1,always,face_progress_and_clusters,Repair face progress if needed; refresh people + unnamed clusters; optional auto-rebuild,spinner,current
+photos.people.person-photos,1,always,fetch_person_photo_ids,fetchPhotoIdsForPerson → PictureBrowserView,spinner,current
+photos.locations,1,always,locations_on_appear,LocationsViewModel.onAppear(),background,current
+photos.locations.detail,1,always,load_location_and_events,Load location; EventsLibraryListContent.task reload for location filter,spinner,current
+photos.milestones,1,always,refresh_milestone_landing_items,refreshMilestoneLandingItems(); clearEventsTabFocus on appear,background,current
+photos.outings,1,always,refresh_outing_landing_items,refreshOutingLandingItems(); clearEventsTabFocus on appear,background,current
+photos.activities,1,always,refresh_activity_landing_items,refreshActivityLandingItems(),background,current

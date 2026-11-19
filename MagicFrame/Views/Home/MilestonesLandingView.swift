@@ -47,6 +47,7 @@ struct MilestonesLandingView: View {
         }
         .onAppear {
             vm.clearEventsTabFocus()
+            vm.setMainTabChromeMode(.landing)
         }
     }
 

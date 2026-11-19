@@ -6,6 +6,10 @@ final class EventTagRepository {
 
     static let holidayCategory = "holiday"
 
+    /// TEMP troubleshooting: ignore / don't write AI-rejection tombstones so scoring can re-apply tags.
+    /// Set back to `false` when re-enabling user reject-AI-tag behavior.
+    static let temporarilyIgnoreAITagRejections = true
+
     private let database: DatabaseManager
 
     init(database: DatabaseManager) {
@@ -507,6 +511,7 @@ final class EventTagRepository {
     }
 
     func isAIAttributeTagRejectedUnsafe(eventId: Int, field: EventAttributeField) -> Bool {
+        if Self.temporarilyIgnoreAITagRejections { return false }
         let sql = """
         SELECT 1
         FROM event_tags
@@ -542,6 +547,7 @@ final class EventTagRepository {
         category: String,
         tagValue: String
     ) -> Bool {
+        if Self.temporarilyIgnoreAITagRejections { return false }
         let sql = """
         SELECT 1
         FROM event_tags
@@ -612,11 +618,29 @@ final class EventTagRepository {
             eventId: eventId,
             category: EventAttributeField.mainPerson.tagCategory
         )
-        // Weddings store both people under eventMainPerson; clear legacy second-person category.
         deleteAttributeTagCategoryUnsafe(
             eventId: eventId,
             category: EventAttributeField.secondaryMainPerson.tagCategory
         )
+
+        // Wedding-style couple: bride → mainPerson, groom → mainPerson2.
+        if trimmedNames.count >= 2 {
+            upsertAttributeTagUnsafe(
+                eventId: eventId,
+                category: EventAttributeField.mainPerson.tagCategory,
+                tagValue: trimmedNames[0],
+                source: .user,
+                totalScore: nil
+            )
+            upsertAttributeTagUnsafe(
+                eventId: eventId,
+                category: EventAttributeField.secondaryMainPerson.tagCategory,
+                tagValue: trimmedNames[1],
+                source: .user,
+                totalScore: nil
+            )
+            return
+        }
 
         for name in trimmedNames {
             upsertAttributeTagUnsafe(
@@ -637,33 +661,118 @@ final class EventTagRepository {
         secondaryName: String?,
         totalScore: Double?
     ) -> (primaryWritten: Bool, secondaryWritten: Bool) {
-        let primary = primaryName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let secondary = secondaryName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // Legacy callers passed primary=groom, secondary=bride.
+        let result = applyAIWeddingCouplePeopleUnsafe(
+            eventId: eventId,
+            brideName: secondaryName,
+            groomName: primaryName
+        )
+        return (primaryWritten: result.groomWritten, secondaryWritten: result.brideWritten)
+    }
 
-        var primaryWritten = false
-        var secondaryWritten = false
+    /// Birthday: AI `eventMainPerson` when no user main-person tag exists.
+    @discardableResult
+    func applyAIBirthdayMainPersonUnsafe(
+        eventId: Int,
+        personName: String,
+        totalScore: Double?
+    ) -> Bool {
+        let trimmed = personName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        guard !hasUserSourcedAttributeTagUnsafe(eventId: eventId, field: .mainPerson) else {
+            return false
+        }
+        deleteAttributeTagUnsafe(
+            eventId: eventId,
+            category: EventAttributeField.mainPerson.tagCategory,
+            source: .ai
+        )
+        upsertAIAttributeTagUnsafe(
+            eventId: eventId,
+            field: .mainPerson,
+            tagValue: trimmed,
+            totalScore: totalScore
+        )
+        return true
+    }
 
-        if !primary.isEmpty {
+    /// Bride → `eventMainPerson`, Groom → `eventMainPerson2`. Skips categories that already have user tags.
+    @discardableResult
+    func applyAIWeddingCouplePeopleUnsafe(
+        eventId: Int,
+        brideName: String?,
+        groomName: String?
+    ) -> (brideWritten: Bool, groomWritten: Bool) {
+        let bride = brideName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let groom = groomName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        var brideWritten = false
+        var groomWritten = false
+
+        if !bride.isEmpty,
+           !hasUserSourcedAttributeTagUnsafe(eventId: eventId, field: .mainPerson) {
+            deleteAttributeTagUnsafe(
+                eventId: eventId,
+                category: EventAttributeField.mainPerson.tagCategory,
+                source: .ai
+            )
             upsertAIAttributeTagUnsafe(
                 eventId: eventId,
                 field: .mainPerson,
-                tagValue: primary,
-                totalScore: totalScore
+                tagValue: bride,
+                totalScore: nil
             )
-            primaryWritten = true
+            brideWritten = true
         }
 
-        if !secondary.isEmpty {
+        if !groom.isEmpty,
+           !hasUserSourcedAttributeTagUnsafe(eventId: eventId, field: .secondaryMainPerson) {
+            deleteAttributeTagUnsafe(
+                eventId: eventId,
+                category: EventAttributeField.secondaryMainPerson.tagCategory,
+                source: .ai
+            )
             upsertAIAttributeTagUnsafe(
                 eventId: eventId,
-                field: .mainPerson,
-                tagValue: secondary,
-                totalScore: totalScore
+                field: .secondaryMainPerson,
+                tagValue: groom,
+                totalScore: nil
             )
-            secondaryWritten = true
+            groomWritten = true
         }
 
-        return (primaryWritten, secondaryWritten)
+        return (brideWritten, groomWritten)
+    }
+
+    private func hasUserSourcedAttributeTagUnsafe(
+        eventId: Int,
+        field: EventAttributeField
+    ) -> Bool {
+        let sql = """
+        SELECT 1
+        FROM event_tags
+        WHERE eventId = ?
+          AND tagCategory = ?
+          AND source = 'user'
+          AND COALESCE(isRejected, 0) = 0
+          AND TRIM(tagValue) != ''
+        LIMIT 1;
+        """
+        var statement: OpaquePointer?
+        var found = false
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            sqlite3_bind_int(statement, 1, Int32(eventId))
+            sqlite3_bind_text(
+                statement,
+                2,
+                (field.tagCategory as NSString).utf8String,
+                -1,
+                nil
+            )
+            found = sqlite3_step(statement) == SQLITE_ROW
+        }
+        sqlite3_finalize(statement)
+        return found
     }
 
     func confirmAIAttributeTag(eventId: Int, field: EventAttributeField) {
@@ -685,6 +794,38 @@ final class EventTagRepository {
     /// Removes an AI or user tag row. AI removals are marked rejected so they are not re-applied.
     func removeEventAttributeTag(eventId: Int, tag: EventAttributeTag) {
         sync { removeEventAttributeTagUnsafe(eventId: eventId, tag: tag) }
+    }
+
+    /// Testing hard-clear: deletes user + AI + rejected tombstone for one category/value.
+    @discardableResult
+    func purgeEventAttributeTag(
+        eventId: Int,
+        category: String,
+        tagValue: String
+    ) -> Int {
+        sync {
+            purgeEventAttributeTagUnsafe(
+                eventId: eventId,
+                category: category,
+                tagValue: tagValue
+            )
+        }
+    }
+
+    /// Testing: remove all rejected tombstones on an event so AI can re-apply tags.
+    @discardableResult
+    func purgeRejectedAttributeTags(eventId: Int) -> Int {
+        sync { purgeRejectedAttributeTagsUnsafe(eventId: eventId) }
+    }
+
+    /// All tag rows for an event including rejected (for developer tools).
+    func fetchAllAttributeTagRowsForEvent(eventId: Int) -> [(
+        category: String,
+        tagValue: String,
+        source: String,
+        isRejected: Bool
+    )] {
+        sync { fetchAllAttributeTagRowsForEventUnsafe(eventId: eventId) }
     }
 
     func removeEventAttributeTagUnsafe(eventId: Int, tag: EventAttributeTag) {
@@ -945,7 +1086,7 @@ final class EventTagRepository {
         let metadataKey = "eventAttributeTagsBackfilledV1"
         let alreadyMarked = getAppMetadataUnsafe(key: metadataKey) == "1"
 
-        // Legacy: "Trip" is not an eventType tag (trips use isTripEvent / tripType).
+        // Legacy: "Trip" is not an eventType tag (trips use isTripEvent + Trips tag).
         sqlite3_exec(
             db,
             """
@@ -1750,6 +1891,9 @@ final class EventTagRepository {
         field: EventAttributeField,
         tagValue: String
     ) {
+        // TEMP: do not write rejection tombstones while troubleshooting AI tagging.
+        if Self.temporarilyIgnoreAITagRejections { return }
+
         let now = ISO8601DateFormatter().string(from: Date())
         let sql = """
         INSERT INTO event_tags (
@@ -1836,6 +1980,85 @@ final class EventTagRepository {
         }
 
         sqlite3_finalize(statement)
+    }
+
+    @discardableResult
+    func purgeEventAttributeTagUnsafe(
+        eventId: Int,
+        category: String,
+        tagValue: String
+    ) -> Int {
+        let trimmedCategory = category.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedValue = tagValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard eventId > 0, !trimmedCategory.isEmpty, !trimmedValue.isEmpty else { return 0 }
+
+        let sql = """
+        DELETE FROM event_tags
+        WHERE eventId = ?
+          AND tagCategory = ? COLLATE NOCASE
+          AND tagValue = ? COLLATE NOCASE;
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return 0 }
+        sqlite3_bind_int(statement, 1, Int32(eventId))
+        sqlite3_bind_text(statement, 2, (trimmedCategory as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 3, (trimmedValue as NSString).utf8String, -1, nil)
+        sqlite3_step(statement)
+        let deleted = Int(sqlite3_changes(db))
+        sqlite3_finalize(statement)
+        return deleted
+    }
+
+    @discardableResult
+    func purgeRejectedAttributeTagsUnsafe(eventId: Int) -> Int {
+        guard eventId > 0 else { return 0 }
+        let sql = """
+        DELETE FROM event_tags
+        WHERE eventId = ?
+          AND COALESCE(isRejected, 0) = 1;
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return 0 }
+        sqlite3_bind_int(statement, 1, Int32(eventId))
+        sqlite3_step(statement)
+        let deleted = Int(sqlite3_changes(db))
+        sqlite3_finalize(statement)
+        return deleted
+    }
+
+    func fetchAllAttributeTagRowsForEventUnsafe(eventId: Int) -> [(
+        category: String,
+        tagValue: String,
+        source: String,
+        isRejected: Bool
+    )] {
+        let sql = """
+        SELECT tagCategory, tagValue, source, COALESCE(isRejected, 0)
+        FROM event_tags
+        WHERE eventId = ?
+        ORDER BY tagCategory COLLATE NOCASE, tagValue COLLATE NOCASE, source COLLATE NOCASE;
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_int(statement, 1, Int32(eventId))
+        var rows: [(category: String, tagValue: String, source: String, isRejected: Bool)] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let categoryC = sqlite3_column_text(statement, 0),
+                  let valueC = sqlite3_column_text(statement, 1),
+                  let sourceC = sqlite3_column_text(statement, 2) else {
+                continue
+            }
+            rows.append(
+                (
+                    category: String(cString: categoryC),
+                    tagValue: String(cString: valueC),
+                    source: String(cString: sourceC),
+                    isRejected: sqlite3_column_int(statement, 3) == 1
+                )
+            )
+        }
+        return rows
     }
 
     private func deleteAttributeTagValueUnsafe(

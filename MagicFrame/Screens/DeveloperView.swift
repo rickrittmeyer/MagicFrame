@@ -141,7 +141,7 @@ struct DeveloperView: View {
                 }
 
                 NavigationLink("Picture Search (face-detect flag)") {
-                    IdentifyEventTypesView()
+                    MediaSavedSearchesView()
                 }
 
                 Text(
@@ -178,11 +178,19 @@ struct DeveloperView: View {
                 }
 
                 NavigationLink("Picture Search") {
-                    IdentifyEventTypesView()
+                    MediaSavedSearchesView()
                 }
 
                 NavigationLink("Event Tag Rules") {
                     EventTagRulesDeveloperView()
+                }
+
+                NavigationLink("Event Score Cards") {
+                    EventScoreCardBrowserView()
+                }
+
+                NavigationLink("Event Tag Tools") {
+                    EventTagToolsDeveloperView()
                 }
 
                 Text(
@@ -198,13 +206,25 @@ struct DeveloperView: View {
                 .foregroundStyle(.secondary)
 
                 Text(
-                    "Picture Search saves a named search (tags, date, location, people) and runs it against indexed photos. Matching pictures show in a grid; candidate event IDs are collected for later likely-event scoring."
+                    "Picture Search opens Media Saved Searches: edit name / enabled / face-detect, refine the query, and Run to show matching pictures. Candidate event IDs feed score cards."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
                 Text(
                     "Event Tag Rules edits similar_event_tags (remove-AI alternatives) and event_name_templates (suggested names)."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                Text(
+                    "Event Score Cards picks a tag category/value (like Event Detail), then shows or creates the date / vision / people / location scorecard AI Assist uses."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                Text(
+                    "Event Tag Tools hard-clears a tagCategory + tagValue on an event (user, AI, and rejected tombstones) for retesting AI Assist."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)

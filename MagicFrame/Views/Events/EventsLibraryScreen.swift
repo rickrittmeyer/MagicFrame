@@ -19,8 +19,25 @@ struct EventsLibraryListContent: View {
     @State private var selectedEventIds: Set<Int> = []
     @State private var focusedYear: Int?
     @State private var pendingScrollSectionId: Int?
+    /// Blocks preference-driven month memory until the shared Photos↔Events anchor is applied.
+    /// Otherwise the list paints at the newest month and overwrites Media’s saved position.
+    @State private var hasAppliedBrowseMonthRestore = false
+    /// Filter for which the initial list load + month restore already finished.
+    /// `.task` restarts when popping back from Event Detail — skip reload so scroll offset stays exact.
+    @State private var loadedFilter: EventListFilter?
+    /// Avoid rebuilding month sections on every `focusedYear` tap — that blocked chip highlight for 1–2s.
+    @State private var cachedDisplayedSections: [EventYearSection] = []
+    @State private var cachedAvailableYears: [Int] = []
 
     private var usesAllMediaChrome: Bool { showsPictureStyleHeader }
+
+    /// Shared with paired Photos browsers (All Media ↔ All Events, topic ↔ topic).
+    private var browseMonthScope: BrowseMonthScope {
+        if filter == .allEvents {
+            return .allLibrary
+        }
+        return .eventsFilter(filter)
+    }
 
     private var baseTitle: String {
         landingTitle ?? filter.navigationTitle
@@ -36,29 +53,139 @@ struct EventsLibraryListContent: View {
         vm.eventSections.flatMap(\.items).filter(matchesActiveFilter)
     }
 
-    private var displayedSections: [EventYearSection] {
-        let items = filteredItems
-        guard usesAllMediaChrome else {
-            return legacySections(from: items)
+    /// Rebuild month layout only when event membership / filters change — not on slideshow enrichment.
+    private var layoutCacheToken: Int {
+        var hasher = Hasher()
+        hasher.combine(sectionCacheFilterKey)
+        hasher.combine(sort.rawValue)
+        hasher.combine(eventBrowserFilter.rawValue)
+        hasher.combine(vm.showHiddenEvents)
+        hasher.combine(usesAllMediaChrome)
+        hasher.combine(vm.eventSections.count)
+        for section in vm.eventSections {
+            hasher.combine(section.year)
+            hasher.combine(section.items.count)
+            for item in section.items {
+                hasher.combine(item.id)
+            }
         }
+        return hasher.finalize()
+    }
 
-        switch sort {
-        case .sport, .team:
-            return groupedSections(from: items, sort: sort)
-        case .date, .confidence:
-            return Self.monthSections(from: sortedItems(items))
+    /// Slideshow / game fields update after first paint; patch cache without rebuilding months.
+    private var enrichmentCacheToken: Int {
+        var hasher = Hasher()
+        for section in vm.eventSections {
+            for item in section.items {
+                hasher.combine(item.id)
+                hasher.combine(item.slideshowPhotoIds)
+                hasher.combine(item.onFrameVideoId)
+                hasher.combine(item.gameSuggestedName)
+                hasher.combine(item.hasOnFramePhotos)
+                hasher.combine(item.gameCoverScoreBoard != nil)
+            }
+        }
+        return hasher.finalize()
+    }
+
+    private var sectionCacheFilterKey: String {
+        switch filter {
+        case .allEvents: return "allEvents"
+        case .anyHoliday: return "anyHoliday"
+        case .holidayTag(let value): return "holidayTag:\(value)"
+        case .anyMilestone: return "anyMilestone"
+        case .milestoneTag(let value): return "milestoneTag:\(value)"
+        case .milestoneTags(let values): return "milestoneTags:\(values.joined(separator: ","))"
+        case .anyBirthdayMilestone: return "anyBirthdayMilestone"
+        case .trips: return "trips"
+        case .anyActivity: return "anyActivity"
+        case .activityTag(let value): return "activityTag:\(value)"
+        case .eventTypeTag(let value): return "eventTypeTag:\(value)"
+        case .eventTypeTags(let values): return "eventTypeTags:\(values.joined(separator: ","))"
+        case .birthdayPerson(let personId, _): return "birthdayPerson:\(personId)"
+        case .location(let locationId, _): return "location:\(locationId)"
         }
     }
 
-    private var availableYears: [Int] {
-        guard usesAllMediaChrome else { return [] }
+    private func rebuildSectionCache() {
+        let items = filteredItems
+        let sections: [EventYearSection]
+        if usesAllMediaChrome {
+            switch sort {
+            case .sport, .team:
+                sections = groupedSections(from: items, sort: sort)
+            case .date, .confidence:
+                sections = Self.monthSections(from: sortedItems(items))
+            }
+        } else {
+            sections = legacySections(from: items)
+        }
+        cachedDisplayedSections = sections
+
+        guard usesAllMediaChrome else {
+            cachedAvailableYears = []
+            return
+        }
         var years: [Int] = []
         var seen = Set<Int>()
-        for item in filteredItems {
+        for item in items {
             guard let year = item.event.eventYear, seen.insert(year).inserted else { continue }
             years.append(year)
         }
-        return years.sorted(by: >)
+        cachedAvailableYears = years.sorted(by: >)
+        patchCachedEnrichmentFromViewModel()
+    }
+
+    /// Copy slideshow / game enrichment into the month cache without regrouping events.
+    private func patchCachedEnrichmentFromViewModel() {
+        guard !cachedDisplayedSections.isEmpty else { return }
+
+        var byId: [Int: EventListDisplayItem] = [:]
+        byId.reserveCapacity(vm.eventSections.reduce(0) { $0 + $1.items.count })
+        for section in vm.eventSections {
+            for item in section.items {
+                byId[item.id] = item
+            }
+        }
+
+        var anyChange = false
+        let updated = cachedDisplayedSections.map { section in
+            var sectionChanged = false
+            let items = section.items.map { item -> EventListDisplayItem in
+                guard let source = byId[item.id] else { return item }
+                if item.slideshowPhotoIds == source.slideshowPhotoIds,
+                   item.onFrameVideoId == source.onFrameVideoId,
+                   item.gameSuggestedName == source.gameSuggestedName,
+                   item.gameCoverScoreBoard == source.gameCoverScoreBoard,
+                   item.hasOnFramePhotos == source.hasOnFramePhotos,
+                   item.gameLeague == source.gameLeague,
+                   item.gameTeamSortKey == source.gameTeamSortKey {
+                    return item
+                }
+                sectionChanged = true
+                return EventListDisplayItem(
+                    event: item.event,
+                    slideshowPhotoIds: source.slideshowPhotoIds,
+                    hasOnFramePhotos: source.hasOnFramePhotos,
+                    onFrameVideoId: source.onFrameVideoId,
+                    gameCoverScoreBoard: source.gameCoverScoreBoard,
+                    gameSuggestedName: source.gameSuggestedName,
+                    gameLeague: source.gameLeague,
+                    gameTeamSortKey: source.gameTeamSortKey
+                )
+            }
+            guard sectionChanged else { return section }
+            anyChange = true
+            return EventYearSection(
+                year: section.year,
+                items: items,
+                presentation: section.presentation,
+                headerTitle: section.headerTitle
+            )
+        }
+        if anyChange {
+            cachedDisplayedSections = updated
+        }
     }
 
     private func legacySections(from items: [EventListDisplayItem]) -> [EventYearSection] {
@@ -78,7 +205,7 @@ struct EventsLibraryListContent: View {
     }
 
     private var visibleEventCount: Int {
-        displayedSections.reduce(0) { $0 + $1.eventCount }
+        cachedDisplayedSections.reduce(0) { $0 + $1.eventCount }
     }
 
     private var emptyHint: String {
@@ -103,7 +230,7 @@ struct EventsLibraryListContent: View {
             }
 
             EventsLibraryView(
-                eventSections: displayedSections,
+                eventSections: cachedDisplayedSections,
                 listFilter: filter,
                 emptyHint: emptyHint,
                 isBusy: vm.showsEventsLoadingPlaceholder,
@@ -136,6 +263,15 @@ struct EventsLibraryListContent: View {
                 onPendingScrollHandled: {
                     pendingScrollSectionId = nil
                 },
+                onVisibleYearChanged: { year in
+                    guard showsYearJumpBar, hasAppliedBrowseMonthRestore else { return }
+                    guard focusedYear != year else { return }
+                    focusedYear = year
+                },
+                onVisibleMonthChanged: { yyyymm in
+                    guard showsYearJumpBar, hasAppliedBrowseMonthRestore else { return }
+                    vm.rememberBrowseMonth(yyyymm: yyyymm, scope: browseMonthScope)
+                },
                 usesStickyMonthHeaders: usesAllMediaChrome && (sort == .date || sort == .confidence),
                 expandedYear: $vm.expandedListYear
             )
@@ -145,6 +281,9 @@ struct EventsLibraryListContent: View {
             if isSelecting {
                 selectionBar
             }
+        }
+        .onAppear {
+            vm.setMainTabChromeMode(.full)
         }
         .modifier(EventsLibraryNavigationTitle(
             isEnabled: usesAllMediaChrome,
@@ -162,15 +301,43 @@ struct EventsLibraryListContent: View {
                 sort = .date
             }
         }
-        .onChange(of: availableYears) { _, years in
+        .onChange(of: layoutCacheToken) { _, _ in
+            rebuildSectionCache()
+        }
+        .onChange(of: enrichmentCacheToken) { _, _ in
+            patchCachedEnrichmentFromViewModel()
+        }
+        .onChange(of: cachedAvailableYears) { _, years in
             if let focusedYear, years.contains(focusedYear) { return }
+            if let anchor = vm.browseMonthAnchor(for: browseMonthScope),
+               years.contains(anchor.year) {
+                focusedYear = anchor.year
+                return
+            }
             focusedYear = years.first
         }
+        .onAppear {
+            if cachedDisplayedSections.isEmpty {
+                rebuildSectionCache()
+            }
+        }
         .task(id: filter) {
+            // Yield so tab selection / first chrome can paint before list load work.
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+
+            // NavigationLink push cancels this task; pop restarts it. Don't reload or
+            // re-apply month restore — that snaps to the month header and loses the row offset.
+            if loadedFilter == filter {
+                return
+            }
+
             cancelSelection()
             eventBrowserFilter = .allEvents
             sort = .date
             focusedYear = nil
+            pendingScrollSectionId = nil
+            hasAppliedBrowseMonthRestore = false
             if usesAllMediaChrome, vm.showHiddenEvents {
                 vm.showHiddenEvents = false
             }
@@ -189,7 +356,9 @@ struct EventsLibraryListContent: View {
                 loadSlideshowIds: usesAllMediaChrome
             )
             guard !Task.isCancelled else { return }
-            focusedYear = availableYears.first
+            rebuildSectionCache()
+            applyRestoredMonthAnchor()
+            loadedFilter = filter
 
             if runsDateRepairOnLoad {
                 vm.scheduleEventDateRepairIfNeeded()
@@ -272,7 +441,7 @@ struct EventsLibraryListContent: View {
     private var showsYearJumpBar: Bool {
         usesAllMediaChrome
             && (sort == .date || sort == .confidence)
-            && !availableYears.isEmpty
+            && !cachedAvailableYears.isEmpty
     }
 
     private var allMediaIconBar: some View {
@@ -300,40 +469,72 @@ struct EventsLibraryListContent: View {
     }
 
     private var yearJumpBar: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(availableYears, id: \.self) { year in
-                    let isFocused = focusedYear == year
-                    Button {
-                        jumpToYear(year)
-                    } label: {
-                        Text(String(year))
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(isFocused ? Color(.systemBackground) : .primary)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .background(
-                                isFocused ? Color.accentColor : Color(.secondarySystemFill),
-                                in: RoundedRectangle(cornerRadius: 8)
-                            )
+        ScrollViewReader { yearProxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(cachedAvailableYears, id: \.self) { year in
+                        let isFocused = focusedYear == year
+                        Button {
+                            jumpToYear(year)
+                        } label: {
+                            Text(String(year))
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(isFocused ? Color(.systemBackground) : .primary)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(
+                                    isFocused ? Color.accentColor : Color(.secondarySystemFill),
+                                    in: RoundedRectangle(cornerRadius: 8)
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .id(year)
+                        .accessibilityLabel("Jump to \(year)")
+                        .accessibilityAddTraits(isFocused ? .isSelected : [])
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Jump to \(year)")
-                    .accessibilityAddTraits(isFocused ? .isSelected : [])
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+            }
+            .background(.bar)
+            .onChange(of: focusedYear) { _, year in
+                guard let year else { return }
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    yearProxy.scrollTo(year, anchor: .center)
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
         }
-        .background(.bar)
     }
 
     private func jumpToYear(_ year: Int) {
+        // Only mutate highlight state here — any section rebuild in this handler
+        // delayed the chip by 1–2s on large libraries.
         focusedYear = year
-        // Month section ids are YYYYMM; pick the first (newest) month for that year.
-        if let sectionId = displayedSections.first(where: { $0.year / 100 == year })?.year {
+        Task { @MainActor in
+            // Month section ids are YYYYMM; pick the first (newest) month for that year.
+            guard let sectionId = cachedDisplayedSections.first(where: { $0.year / 100 == year })?.year else {
+                return
+            }
             pendingScrollSectionId = sectionId
+            vm.rememberBrowseMonth(yyyymm: sectionId, scope: browseMonthScope)
         }
+    }
+
+    /// Restore remembered month (or fall back to newest year) after sections load.
+    private func applyRestoredMonthAnchor() {
+        defer { hasAppliedBrowseMonthRestore = true }
+        if let anchor = vm.browseMonthAnchor(for: browseMonthScope) {
+            focusedYear = anchor.year
+            if cachedDisplayedSections.contains(where: { $0.year == anchor.yyyymm }) {
+                pendingScrollSectionId = anchor.yyyymm
+                return
+            }
+            if let fallback = cachedDisplayedSections.first(where: { $0.year / 100 == anchor.year })?.year {
+                pendingScrollSectionId = fallback
+                return
+            }
+        }
+        focusedYear = cachedAvailableYears.first
     }
 
     private var selectionStatus: some View {
@@ -514,16 +715,22 @@ struct EventsLibraryListContent: View {
         cancelSelection()
         let wantsHidden = option == .hiddenEvents
         Task {
+            // Load on-frame flags BEFORE applying the filter. Otherwise the layout
+            // cache rebuilds with all hasOnFramePhotos=false (On Frame → empty),
+            // and later flag merges have nothing to patch.
+            if option == .eventsOnFrame || option == .eventsOffFrame {
+                await vm.ensureOnFrameEventFlagsLoaded()
+            }
+
             if vm.showHiddenEvents != wantsHidden {
                 vm.showHiddenEvents = wantsHidden
                 eventBrowserFilter = option
                 await vm.reloadEventsAsync(filter: filter, loadSlideshowIds: true)
+                if option == .eventsOnFrame || option == .eventsOffFrame {
+                    await vm.ensureOnFrameEventFlagsLoaded()
+                }
             } else {
                 eventBrowserFilter = option
-            }
-            // On/Off Frame flags are scanned only when those filters are selected.
-            if option == .eventsOnFrame || option == .eventsOffFrame {
-                await vm.ensureOnFrameEventFlagsLoaded()
             }
         }
     }

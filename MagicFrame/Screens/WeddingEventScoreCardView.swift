@@ -30,13 +30,17 @@ struct WeddingEventScoreCardView: View {
     var body: some View {
         Form {
             Section {
-                Text(
-                    "\(report.candidateEventIds.count) candidate "
-                        + (report.candidateEventIds.count == 1 ? "event" : "events")
-                        + " from “\(definition.name)”."
-                )
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+                Text("\(settings.targetTagCategory) · \(settings.targetEventType)")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Text("Score Card")
+                    .font(.headline)
+                Text("Rules that score events and write AI tags. Independent from the Picture Search photo query.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             visionSection
@@ -45,17 +49,6 @@ struct WeddingEventScoreCardView: View {
             locationSection
             aiThresholdSection
 
-            if let statusMessage {
-                Section {
-                    HStack(spacing: 8) {
-                        if isScoring { ProgressView() }
-                        Text(statusMessage)
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-
             Section {
                 Button {
                     saveSettings()
@@ -63,6 +56,18 @@ struct WeddingEventScoreCardView: View {
                     Text("Save Score Card")
                 }
                 .disabled(isScoring)
+            }
+
+            Section {
+                Text("Picture Search run")
+                    .font(.headline)
+                Text(
+                    "\(report.candidateEventIds.count) candidate "
+                        + (report.candidateEventIds.count == 1 ? "event" : "events")
+                        + " from photo query “\(definition.name)”."
+                )
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
 
                 Button {
                     Task { await runScoring() }
@@ -77,6 +82,17 @@ struct WeddingEventScoreCardView: View {
                     }
                 }
                 .disabled(isScoring || report.candidateEventIds.isEmpty)
+            }
+
+            if let statusMessage {
+                Section {
+                    HStack(spacing: 8) {
+                        if isScoring { ProgressView() }
+                        Text(statusMessage)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
 
             if let checkReport, !checkReport.eventScores.isEmpty {
@@ -157,7 +173,7 @@ struct WeddingEventScoreCardView: View {
     private var visionSection: some View {
         Section("Apple Vision Tags") {
             if settings.visionTags.isEmpty {
-                Text("Add at least two vision tags (defaults come from the picture search).")
+                Text("Add vision tags to score object evidence on the event.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -211,9 +227,13 @@ struct WeddingEventScoreCardView: View {
 
     private var dateSection: some View {
         Section("Date") {
+            Text("Score Card calendar gate / date points (not the Picture Search photo window).")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
             Picker("Date type", selection: $settings.dateSearch.dateSearchType) {
                 ForEach(PictureDateSearchType.allCases) { type in
-                    Text(type.displayName).tag(type)
+                    Text(type.scoreCardDisplayName).tag(type)
                 }
             }
 
@@ -263,7 +283,7 @@ struct WeddingEventScoreCardView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             case .allDates:
-                Text("No date scoring while “Search All Dates” is selected.")
+                Text("No date scoring while all dates is selected.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -306,12 +326,9 @@ struct WeddingEventScoreCardView: View {
 
     private var dateWindowExpanders: some View {
         Group {
-            Toggle("Search Friday and Saturday Before", isOn: $settings.dateSearch.includeWeekendsBefore)
-            Toggle(
-                "Search Friday and Saturday After Event Date",
-                isOn: $settings.dateSearch.includeWeekendsAfter
-            )
-            Toggle("Include All Days X Before", isOn: $settings.dateSearch.includeDaysBefore)
+            Toggle("Include Fri/Sat before", isOn: $settings.dateSearch.includeWeekendsBefore)
+            Toggle("Include Fri/Sat after", isOn: $settings.dateSearch.includeWeekendsAfter)
+            Toggle("Include days before", isOn: $settings.dateSearch.includeDaysBefore)
             if settings.dateSearch.includeDaysBefore {
                 Stepper(
                     "Days before: \(settings.dateSearch.includeXDaysBefore ?? 1)",
@@ -322,7 +339,7 @@ struct WeddingEventScoreCardView: View {
                     in: 1...60
                 )
             }
-            Toggle("Include All Days Y After", isOn: $settings.dateSearch.includeDaysAfter)
+            Toggle("Include days after", isOn: $settings.dateSearch.includeDaysAfter)
             if settings.dateSearch.includeDaysAfter {
                 Stepper(
                     "Days after: \(settings.dateSearch.includeYDaysAfter ?? 1)",

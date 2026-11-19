@@ -44,6 +44,7 @@ struct HolidaysLandingView: View {
         }
         .onAppear {
             vm.clearEventsTabFocus()
+            vm.setMainTabChromeMode(.landing)
         }
         .onDisappear {
             vm.cancelHolidayLandingRefresh()

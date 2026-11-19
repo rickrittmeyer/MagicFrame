@@ -197,22 +197,24 @@ struct InlineVideoPlayer: View {
     }
 }
 
-private struct InlinePlayerLayer: UIViewRepresentable {
+struct InlinePlayerLayer: UIViewRepresentable {
     let player: AVPlayer
+    var videoGravity: AVLayerVideoGravity = .resizeAspect
 
     func makeUIView(context: Context) -> InlinePlayerHostView {
         let view = InlinePlayerHostView()
         view.playerLayer.player = player
-        view.playerLayer.videoGravity = .resizeAspect
+        view.playerLayer.videoGravity = videoGravity
         return view
     }
 
     func updateUIView(_ uiView: InlinePlayerHostView, context: Context) {
         uiView.playerLayer.player = player
+        uiView.playerLayer.videoGravity = videoGravity
     }
 }
 
-private final class InlinePlayerHostView: UIView {
+final class InlinePlayerHostView: UIView {
     override class var layerClass: AnyClass { AVPlayerLayer.self }
     var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
 }

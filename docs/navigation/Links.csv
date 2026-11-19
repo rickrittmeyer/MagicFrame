@@ -1,0 +1,76 @@
+from_id,to_id,control,effect,status
+photos.home,photos.all-media,All Media tile,push,current
+photos.home,photos.holidays,Holidays tile,push,current
+photos.home,photos.milestones,Milestones tile,push,current
+photos.home,photos.outings,Outings tile,push,current
+photos.home,photos.trips,Trips tile,push,current
+photos.home,photos.activities,Activities tile,push,current
+photos.home,photos.people,People tile,push,current
+photos.home,photos.locations,Locations tile,push,current
+photos.home,photos.archive,Archive link,push,current
+tab.photos,photos.home,Media tab,tab_switch,current
+tab.search,search.home,Search tab,tab_switch,current
+landing.help,shared.help,Help (landing chrome),sheet,current
+landing.developer,developer.home,Developer (landing chrome),tab_switch,current
+tab.events,events.all,Events tab (default filter),tab_switch,current
+tab.events,events.holidays.*,Events tab when eventsTabFilter set,tab_switch + mirror root,current
+tab.developer,developer.home,Developer tab,tab_switch,current
+photos.holidays,photos.holidays.christmas.photos,Christmas card,push,current
+photos.holidays.christmas.photos,events.holidays.christmas,onAppear sets eventsTabFilter,set eventsTabFilter (user must tap Events tab),current
+events.holidays.christmas,photos.holidays,EventsTabBackButton,root_to_media_holidays,current
+photos.holidays,photos.holidays.halloween.photos,Halloween card,push,current
+photos.holidays.halloween.photos,events.holidays.halloween,onAppear sets eventsTabFilter,set eventsTabFilter (user must tap Events tab),current
+events.holidays.halloween,photos.holidays,EventsTabBackButton,root_to_media_holidays,current
+photos.holidays,photos.holidays.thanksgiving.photos,Thanksgiving card,push,current
+photos.holidays.thanksgiving.photos,events.holidays.thanksgiving,onAppear sets eventsTabFilter,set eventsTabFilter (user must tap Events tab),current
+events.holidays.thanksgiving,photos.holidays,EventsTabBackButton,root_to_media_holidays,current
+photos.holidays,photos.holidays.easter.photos,Easter card,push,current
+photos.holidays.easter.photos,events.holidays.easter,onAppear sets eventsTabFilter,set eventsTabFilter (user must tap Events tab),current
+events.holidays.easter,photos.holidays,EventsTabBackButton,root_to_media_holidays,current
+photos.holidays,photos.holidays.july-4th.photos,July 4th card,push,current
+photos.holidays.july-4th.photos,events.holidays.july-4th,onAppear sets eventsTabFilter,set eventsTabFilter (user must tap Events tab),current
+events.holidays.july-4th,photos.holidays,EventsTabBackButton,root_to_media_holidays,current
+photos.holidays,photos.holidays.new-years.photos,New Years card,push,current
+photos.holidays.new-years.photos,events.holidays.new-years,onAppear sets eventsTabFilter,set eventsTabFilter (user must tap Events tab),current
+events.holidays.new-years,photos.holidays,EventsTabBackButton,root_to_media_holidays,current
+photos.holidays,photos.holidays.valentines-day.photos,Valentine's Day card,push,current
+photos.holidays.valentines-day.photos,events.holidays.valentines-day,onAppear sets eventsTabFilter,set eventsTabFilter (user must tap Events tab),current
+events.holidays.valentines-day,photos.holidays,EventsTabBackButton,root_to_media_holidays,current
+photos.holidays,photos.holidays.st-pattys-day.photos,St. Patty's Day card,push,current
+photos.holidays.st-pattys-day.photos,events.holidays.st-pattys-day,onAppear sets eventsTabFilter,set eventsTabFilter (user must tap Events tab),current
+events.holidays.st-pattys-day,photos.holidays,EventsTabBackButton,root_to_media_holidays,current
+photos.holidays,photos.holidays.mothers-day.photos,Mother's Day card,push,current
+photos.holidays.mothers-day.photos,events.holidays.mothers-day,onAppear sets eventsTabFilter,set eventsTabFilter (user must tap Events tab),current
+events.holidays.mothers-day,photos.holidays,EventsTabBackButton,root_to_media_holidays,current
+photos.holidays,photos.holidays.fathers-day.photos,Father's Day card,push,current
+photos.holidays.fathers-day.photos,events.holidays.fathers-day,onAppear sets eventsTabFilter,set eventsTabFilter (user must tap Events tab),current
+events.holidays.fathers-day,photos.holidays,EventsTabBackButton,root_to_media_holidays,current
+photos.milestones,photos.milestones.birthdays,Birthdays tile,push,current
+photos.milestones.birthdays,photos.milestones.birthdays.person-photos,Person tile,push,current
+photos.milestones.birthdays.person-photos,events.milestones.birthdays.person,onAppear focusEventsTabOnMilestone(birthdayPerson),set eventsTabFilter,current
+photos.milestones,photos.milestones.weddings.photos,Weddings tile,push,current
+photos.milestones.weddings.photos,events.milestones.weddings,onAppear focusEventsTabOnMilestone,set eventsTabFilter,current
+photos.milestones,photos.milestones.graduations.photos,Graduations tile,push,current
+photos.milestones.graduations.photos,events.milestones.graduations,onAppear focusEventsTabOnMilestone,set eventsTabFilter,current
+photos.milestones,photos.milestones.proms.photos,Proms tile,push,current
+photos.milestones.proms.photos,events.milestones.proms,onAppear focusEventsTabOnMilestone,set eventsTabFilter,current
+photos.milestones,photos.milestones.christening.photos,Christening tile,push,current
+photos.milestones.christening.photos,events.milestones.christening,onAppear focusEventsTabOnMilestone,set eventsTabFilter,current
+photos.milestones,photos.milestones.baptism.photos,Baptism tile,push,current
+photos.milestones.baptism.photos,events.milestones.baptism,onAppear focusEventsTabOnMilestone,set eventsTabFilter,current
+photos.milestones,photos.milestones.celebration-of-life.photos,Celebration of Life tile,push,current
+photos.milestones.celebration-of-life.photos,events.milestones.celebration-of-life,onAppear focusEventsTabOnMilestone,set eventsTabFilter,current
+photos.outings,photos.outings.sporting-events.photos,Sporting Events tile,push,current
+photos.outings.sporting-events.photos,events.outings.sporting-events,onAppear focusEventsTabOnOuting,set eventsTabFilter,current
+photos.outings,photos.outings.plays.photos,Plays tile,push,current
+photos.outings.plays.photos,events.outings.plays,onAppear focusEventsTabOnOuting,set eventsTabFilter,current
+photos.outings,photos.outings.concerts.photos,Concerts tile,push,current
+photos.outings.concerts.photos,events.outings.concerts,onAppear focusEventsTabOnOuting,set eventsTabFilter,current
+photos.activities,photos.activities.dance,Dance tile,push,current
+photos.activities,photos.activities.hiking,Hiking tile,push,current
+photos.activities,photos.activities.cornhole,Cornhole tile,push,current
+photos.people,photos.people.person-photos,Named person row,push,current
+photos.locations,photos.locations.detail,Location row,push,current
+(any event list),shared.event-detail,Event row,push,current
+(any picture browser),shared.photo-preview,Photo cell,fullScreenCover,current
+photos.home,events.all,Home onAppear,clearEventsTabFocus (does not switch tab),current

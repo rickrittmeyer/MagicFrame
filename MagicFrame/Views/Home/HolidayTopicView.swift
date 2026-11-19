@@ -25,7 +25,7 @@ struct HolidayTopicView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let report {
                 PictureBrowserView(
-                    title: "\(tagValue) Photos",
+                    title: tagValue,
                     photoIds: report.photoMatches.map(\.photoId),
                     confidenceByPhotoId: Dictionary(
                         report.photoMatches.compactMap { match in
@@ -36,7 +36,8 @@ struct HolidayTopicView: View {
                     ),
                     sortOptions: [.dateTaken, .confidence],
                     usesNavigationTitle: true,
-                    enablesVideoFilter: true
+                    enablesVideoFilter: true,
+                    browseMonthScope: .eventsFilter(.holidayTag(value: tagValue))
                 )
             } else {
                 ContentUnavailableView(
@@ -51,6 +52,7 @@ struct HolidayTopicView: View {
             await runPhotosPipelineIfNeeded()
         }
         .onAppear {
+            vm.setMainTabChromeMode(.full)
             vm.focusEventsTabOnHoliday(tagValue: tagValue)
         }
     }

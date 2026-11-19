@@ -60,6 +60,7 @@ struct BirthdaysLandingView: View {
         .onAppear {
             // Stay on Birthdays hub until a person topic focuses Events.
             vm.clearEventsTabFocus()
+            vm.setMainTabChromeMode(.landing)
         }
     }
 

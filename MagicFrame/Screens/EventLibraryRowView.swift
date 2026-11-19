@@ -6,11 +6,24 @@ struct EventLibraryRowView: View {
     var slideshowPhotoIds: [String] = []
     var gameCoverScoreBoard: GameCoverScoreBoard? = nil
     var gameSuggestedName: String? = nil
-    var slideshowQuality: PhotoThumbnailView.Quality = .high
+    var slideshowQuality: PhotoThumbnailView.Quality = .fast
+    var isSelecting: Bool = false
+    var isSelected: Bool = false
+    /// On-frame video asset for safe muted inline playback.
+    var onFrameVideoId: String? = nil
+    var allowsInlineVideoPlayback: Bool = false
+
+    @EnvironmentObject private var videoPlayback: EventListVideoPlaybackController
 
     private let cornerRadius: CGFloat = 5
     /// Full-width banner uses 4:3 so height scales with row width.
     private let photoAspectRatio: CGFloat = 4.0 / 3.0
+
+    private var isPlayingInlineVideo: Bool {
+        allowsInlineVideoPlayback
+            && onFrameVideoId != nil
+            && videoPlayback.playingEventId == event.eventId
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -21,12 +34,14 @@ struct EventLibraryRowView: View {
                 aspectRatio: photoAspectRatio,
                 cornerRadius: cornerRadius,
                 thumbnailQuality: slideshowQuality,
-                coverScoreBoard: gameCoverScoreBoard
+                coverScoreBoard: gameCoverScoreBoard,
+                onFrameVideoId: onFrameVideoId,
+                isPlayingInlineVideo: isPlayingInlineVideo
             )
 
             locationLine
 
-            HStack(alignment: .top, spacing: 12) {
+            HStack(alignment: .center, spacing: 12) {
                 if event.photoCount > 0 {
                     Label("\(event.photoCount)", systemImage: "camera")
                         .font(.caption)
@@ -47,6 +62,15 @@ struct EventLibraryRowView: View {
                         .foregroundStyle(.blue)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .lineLimit(2)
+                } else {
+                    Spacer(minLength: 0)
+                }
+
+                if isSelecting {
+                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                        .font(.title2)
+                        .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                        .accessibilityLabel(isSelected ? "Selected" : "Not selected")
                 }
             }
         }
@@ -54,6 +78,13 @@ struct EventLibraryRowView: View {
         .overlay {
             RoundedRectangle(cornerRadius: cornerRadius)
                 .strokeBorder(Color(white: 0.35), lineWidth: 2)
+        }
+        .onScrollVisibilityChange(threshold: 0.9) { visible in
+            guard onFrameVideoId != nil else { return }
+            videoPlayback.setCandidate(eventId: event.eventId, visible: visible)
+        }
+        .onDisappear {
+            videoPlayback.setCandidate(eventId: event.eventId, visible: false)
         }
     }
 
@@ -63,6 +94,9 @@ struct EventLibraryRowView: View {
         }
         if let coverPhotoId = event.coverPhotoId, !coverPhotoId.isEmpty {
             return [coverPhotoId]
+        }
+        if let onFrameVideoId, !onFrameVideoId.isEmpty {
+            return [onFrameVideoId]
         }
         return []
     }
@@ -135,6 +169,8 @@ private struct EventSlideshowRotatorView: View {
     let cornerRadius: CGFloat
     var thumbnailQuality: PhotoThumbnailView.Quality = .high
     var coverScoreBoard: GameCoverScoreBoard? = nil
+    var onFrameVideoId: String? = nil
+    var isPlayingInlineVideo: Bool = false
 
     private let photoHold: Duration = .seconds(2)
     private let crossfadeDuration: TimeInterval = 0.5
@@ -145,7 +181,12 @@ private struct EventSlideshowRotatorView: View {
     var body: some View {
         ZStack(alignment: .bottom) {
             Group {
-                if photoIds.isEmpty {
+                if isPlayingInlineVideo, let onFrameVideoId {
+                    EventListMutedLoopPlayer(
+                        assetIdentifier: onFrameVideoId,
+                        isActive: true
+                    )
+                } else if photoIds.isEmpty {
                     placeholder
                 } else if photoIds.count == 1 || thumbnailQuality == .fast {
                     slideshowPhoto(photoIds[0])

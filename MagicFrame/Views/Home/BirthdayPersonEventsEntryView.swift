@@ -17,8 +17,24 @@ struct BirthdayPersonEventsEntryView: View {
         case failed
     }
 
+    /// Prefer apostrophe form even if an older caller passed "Rachel Birthday".
+    private var canonicalTitle: String {
+        let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if MilestonePictureSearchDefaults.isPersonBirthdayTagValue(trimmed),
+           trimmed.lowercased().hasSuffix("'s birthday") {
+            return trimmed
+        }
+        let stripped = trimmed
+            .replacingOccurrences(of: "'s Birthday", with: "", options: .caseInsensitive)
+            .replacingOccurrences(of: " Birthday", with: "", options: .caseInsensitive)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return MilestonePictureSearchDefaults.personBirthdayTagValue(
+            displayName: stripped.isEmpty ? trimmed : stripped
+        )
+    }
+
     private var listFilter: EventListFilter {
-        .birthdayPerson(personId: personId, displayName: displayName)
+        .birthdayPerson(personId: personId, displayName: canonicalTitle)
     }
 
     var body: some View {
@@ -36,10 +52,10 @@ struct BirthdayPersonEventsEntryView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .failed:
                 ContentUnavailableView(
-                    "\(displayName) Events Failed",
+                    "\(canonicalTitle) Events Failed",
                     systemImage: "exclamationmark.triangle",
                     description: Text(
-                        errorMessage ?? "Could not score \(displayName) events."
+                        errorMessage ?? "Could not score \(canonicalTitle) events."
                     )
                 )
             case .ready:
@@ -48,11 +64,11 @@ struct BirthdayPersonEventsEntryView: View {
                     vm: vm,
                     runsDateRepairOnLoad: false,
                     onBack: { vm.clearEventsTabFocus() },
-                    landingTitle: "\(displayName) Events"
+                    landingTitle: "\(canonicalTitle) Events"
                 )
             }
         }
-        .navigationTitle(phase == .ready ? "" : displayName)
+        .navigationTitle(phase == .ready ? "" : canonicalTitle)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             if phase != .ready {
@@ -71,7 +87,7 @@ struct BirthdayPersonEventsEntryView: View {
         guard phase != .ready else { return }
         phase = .running
         errorMessage = nil
-        statusLine = "Finding \(displayName) pictures…"
+        statusLine = "Finding \(canonicalTitle) pictures…"
 
         let pipeline = await Task.detached(priority: .utility) { [personId] in
             await AppDependencies.database.runPersonBirthdayEventsPipeline(personId: personId) {
@@ -83,13 +99,15 @@ struct BirthdayPersonEventsEntryView: View {
         }.value
 
         guard let pipeline else {
-            errorMessage = "No birth date anchor for \(displayName)."
+            errorMessage = "No birth date anchor for \(canonicalTitle)."
             phase = .failed
             return
         }
 
-        print("\(displayName) events: \(pipeline.summaryLine)")
+        print("\(canonicalTitle) events: \(pipeline.summaryLine)")
         statusLine = pipeline.summaryLine
+        // Brief beat so scoring summary is readable before the list appears.
+        try? await Task.sleep(nanoseconds: 400_000_000)
         phase = .ready
 
         vm.beginEventListLoad(for: listFilter)

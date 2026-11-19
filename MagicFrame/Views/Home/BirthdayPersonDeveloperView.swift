@@ -17,8 +17,14 @@ struct BirthdayPersonDeveloperView: View {
         if let person {
             return MilestonePictureSearchDefaults.pictureSearchName(forPersonBirthday: person)
         }
+        let stripped = displayName
+            .replacingOccurrences(of: "'s Birthday", with: "", options: .caseInsensitive)
+            .replacingOccurrences(of: " Birthday", with: "", options: .caseInsensitive)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         return ensuredPictureSearchName
-            ?? "\(displayName.replacingOccurrences(of: " Birthday", with: "")) Birthday"
+            ?? MilestonePictureSearchDefaults.personBirthdayTagValue(
+                displayName: stripped.isEmpty ? displayName : stripped
+            )
     }
 
     private var anchorMonthDayLabel: String {
@@ -56,11 +62,11 @@ struct BirthdayPersonDeveloperView: View {
 
             Section("Picture search") {
                 NavigationLink {
-                    IdentifyEventTypesView(preferredSearchName: pictureSearchName)
+                    MediaSavedSearchesView(preferredSearchName: pictureSearchName)
                 } label: {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Picture Search")
-                        Text("Opens with \(pictureSearchName) as the default.")
+                        Text("Opens Media Saved Searches with \(pictureSearchName) preferred.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }

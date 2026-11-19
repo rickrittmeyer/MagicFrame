@@ -60,8 +60,11 @@ enum MilestonePersonPickerKind: String, Identifiable, Sendable {
 
     static func from(milestoneType: String?) -> MilestonePersonPickerKind? {
         guard let milestoneType else { return nil }
-        switch milestoneType.lowercased() {
-        case "birthday": return .birthday
+        let trimmed = milestoneType.trimmingCharacters(in: .whitespacesAndNewlines)
+        if MilestonePictureSearchDefaults.isPersonBirthdayTagValue(trimmed) {
+            return .birthday
+        }
+        switch trimmed.lowercased() {
         case "graduation": return .graduation
         case "baptism": return .baptism
         case "wedding": return .wedding

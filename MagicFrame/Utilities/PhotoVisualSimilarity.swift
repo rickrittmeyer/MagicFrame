@@ -10,24 +10,44 @@ enum PhotoVisualSimilarity {
     /// True bursts are typically well under this; unrelated imports with matching timestamps are above it.
     static let maxDistance: Float = 0.72
 
+    /// Stricter threshold for near-identical copies (re-imports / screenshots of the same image).
+    static let maxNearIdenticalDistance: Float = 0.35
+
     private static let analysisPixelSize = CGSize(width: 360, height: 360)
 
     private static let printCache = NSCache<NSString, VNFeaturePrintObservation>()
 
     static func areVisuallySimilar(photoIdA: String, photoIdB: String) async -> Bool {
         if photoIdA == photoIdB { return true }
-        guard let printA = await featurePrint(forAssetIdentifier: photoIdA),
-              let printB = await featurePrint(forAssetIdentifier: photoIdB) else {
+        guard let distance = await distance(between: photoIdA, and: photoIdB) else {
             // If either print fails, keep the metadata grouping (don't drop true bursts).
             return true
+        }
+        return distance <= maxDistance
+    }
+
+    /// Near-identical copies only. Failed prints return `false` (do not invent duplicates).
+    static func areNearIdentical(photoIdA: String, photoIdB: String) async -> Bool {
+        if photoIdA == photoIdB { return true }
+        guard let distance = await distance(between: photoIdA, and: photoIdB) else {
+            return false
+        }
+        return distance <= maxNearIdenticalDistance
+    }
+
+    static func distance(between photoIdA: String, and photoIdB: String) async -> Float? {
+        if photoIdA == photoIdB { return 0 }
+        guard let printA = await featurePrint(forAssetIdentifier: photoIdA),
+              let printB = await featurePrint(forAssetIdentifier: photoIdB) else {
+            return nil
         }
         var distance: Float = .greatestFiniteMagnitude
         do {
             try printA.computeDistance(&distance, to: printB)
         } catch {
-            return true
+            return nil
         }
-        return distance <= maxDistance
+        return distance
     }
 
     static func featurePrint(forAssetIdentifier assetIdentifier: String) async -> VNFeaturePrintObservation? {

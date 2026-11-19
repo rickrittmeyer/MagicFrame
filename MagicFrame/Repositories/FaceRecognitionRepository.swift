@@ -34,6 +34,12 @@ struct PhotoFaceAnnotation: Sendable, Identifiable, Hashable {
     let clusterId: Int?
     let personId: Int?
     let personDisplayName: String?
+    /// High-confidence named-person suggestion for confirm UI (`Rick?`). Nil when unnamed with no clear match.
+    let suggestedPersonId: Int?
+    let suggestedDisplayName: String?
+    let suggestedFirstName: String?
+    let suggestedLastName: String?
+    let suggestedMaidenName: String?
 
     var id: Int { faceInstanceId }
 
@@ -44,6 +50,24 @@ struct PhotoFaceAnnotation: Sendable, Identifiable, Hashable {
 
     var isNamed: Bool {
         !(personDisplayName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+    }
+
+    var hasConfidentNameSuggestion: Bool {
+        guard !isNamed, suggestedPersonId != nil else { return false }
+        let name = suggestedDisplayName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return !name.isEmpty
+    }
+
+    /// Idle chrome title: confirmed name, `Name?` suggestion, or plain `Name`.
+    var idleNameChipTitle: String {
+        if isNamed {
+            return personDisplayName ?? "Named"
+        }
+        if let suggested = suggestedDisplayName?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !suggested.isEmpty {
+            return "\(suggested)?"
+        }
+        return "Name"
     }
 }
 
@@ -95,6 +119,36 @@ final class FaceRecognitionRepository {
         sqlite3_bind_text(statement, 1, (photoId as NSString).utf8String, -1, nil)
         guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
         return Int(sqlite3_column_int(statement, 0))
+    }
+
+    /// Confirmed people on this event and its child days. Suggestions do not count.
+    func fetchConfirmedPersonIdsForEventUnsafe(eventId: Int) -> Set<Int> {
+        let sql = """
+        SELECT DISTINCT pp.personId
+        FROM photo_events pev
+        JOIN photo_people pp ON pp.photoId = pev.photoId
+        JOIN people p ON p.personId = pp.personId
+        WHERE (
+            pev.eventId = ?
+            OR pev.eventId IN (
+                SELECT child.eventId
+                FROM events child
+                WHERE child.parentEventId = ?
+                  AND child.isDeleted = 0
+            )
+        )
+          AND TRIM(COALESCE(p.displayName, '')) != '';
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_int(statement, 1, Int32(eventId))
+        sqlite3_bind_int(statement, 2, Int32(eventId))
+        var ids: Set<Int> = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            ids.insert(Int(sqlite3_column_int(statement, 0)))
+        }
+        return ids
     }
 
     func markPhotoFaceRecognitionVersionUnsafe(photoId: String, version: Int) {
@@ -343,7 +397,12 @@ final class FaceRecognitionRepository {
                     bboxHeight: sqlite3_column_double(statement, 5),
                     clusterId: clusterId,
                     personId: personId,
-                    personDisplayName: personName
+                    personDisplayName: personName,
+                    suggestedPersonId: nil,
+                    suggestedDisplayName: nil,
+                    suggestedFirstName: nil,
+                    suggestedLastName: nil,
+                    suggestedMaidenName: nil
                 )
             )
         }
@@ -643,6 +702,7 @@ final class FaceRecognitionRepository {
         FROM face_instances
         WHERE personId IS NOT NULL
           AND embeddingBlob IS NOT NULL
+          AND length(embeddingBlob) > 0
         ORDER BY personId ASC, COALESCE(quality, 0) DESC, faceInstanceId DESC;
         """
         var statement: OpaquePointer?

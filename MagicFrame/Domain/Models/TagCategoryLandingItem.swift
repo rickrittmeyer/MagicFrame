@@ -75,7 +75,9 @@ enum TagCategoryLandingCatalog {
             ) else {
                 return nil
             }
-            let displayName = "\(person.name) Birthday"
+            let displayName = MilestonePictureSearchDefaults.personBirthdayTagValue(
+                displayName: person.name
+            )
             return TagCategoryLandingItem(
                 id: "birthday:\(person.personId)",
                 title: displayName,

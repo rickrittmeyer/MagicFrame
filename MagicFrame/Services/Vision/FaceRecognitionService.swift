@@ -77,6 +77,11 @@ final class FaceRecognitionService {
         algorithmVersion: Int,
         createdAt: String
     ) {
+        let currentVersion = faces.faceRecognitionVersionUnsafe(photoId: photoId)
+        if currentVersion >= FaceRecognitionAnalyzer.previewScanVersion {
+            return
+        }
+
         // Detect + embed only. Clustering / naming happen later (Rebuild + Show Faces).
         faces.deleteFaceInstancesForPhotoUnsafe(photoId: photoId)
 
@@ -203,10 +208,147 @@ final class FaceRecognitionService {
 
     // MARK: - Naming / merge
 
-    func fetchFaceAnnotations(forPhotoId photoId: String) -> [PhotoFaceAnnotation] {
+    func fetchFaceAnnotations(
+        forPhotoId photoId: String,
+        suggestionEventId: Int? = nil
+    ) -> [PhotoFaceAnnotation] {
         database.sync {
-            faces.fetchFaceAnnotationsForPhotoUnsafe(photoId: photoId)
+            enrichAnnotationsWithNamedSuggestionsUnsafe(
+                faces.fetchFaceAnnotationsForPhotoUnsafe(photoId: photoId),
+                suggestionEventId: suggestionEventId
+            )
         }
+    }
+
+    /// Attach a confirmable named-person suggestion (`Rick?`) when distance is clearly best.
+    private func enrichAnnotationsWithNamedSuggestionsUnsafe(
+        _ annotations: [PhotoFaceAnnotation],
+        suggestionEventId: Int? = nil
+    ) -> [PhotoFaceAnnotation] {
+        let eventCastPersonIds: Set<Int>
+        if let suggestionEventId {
+            eventCastPersonIds = faces.fetchConfirmedPersonIdsForEventUnsafe(eventId: suggestionEventId)
+        } else {
+            eventCastPersonIds = []
+        }
+        guard annotations.contains(where: { !$0.isNamed }) else { return annotations }
+        let namedExemplars = faces.fetchNamedPersonExemplarsUnsafe(
+            limitPerPerson: 8,
+            maxPeople: 200
+        )
+        guard !namedExemplars.isEmpty, let photoId = annotations.first?.photoId else {
+            #if DEBUG
+            if annotations.contains(where: { !$0.isNamed }) {
+                print("FaceSuggest: no named exemplars — name someone first, then reopen a photo")
+            }
+            #endif
+            return annotations
+        }
+
+        #if DEBUG
+        let namedPersonCount = Set(namedExemplars.map(\.personId)).count
+        print(
+            "FaceSuggest: photo=\(photoId) unnamed=\(annotations.filter { !$0.isNamed }.count) "
+                + "namedPeople=\(namedPersonCount) exemplars=\(namedExemplars.count)"
+        )
+        #endif
+
+        let instancesById = Dictionary(
+            uniqueKeysWithValues: faces.fetchFaceInstancesForPhotoUnsafe(photoId: photoId)
+                .map { ($0.faceInstanceId, $0) }
+        )
+        var personCache: [Int: PeopleRepository.PersonRecord] = [:]
+
+        return annotations.map { annotation in
+            guard !annotation.isNamed else { return annotation }
+            guard let instance = instancesById[annotation.faceInstanceId],
+                  !instance.embeddingBlob.isEmpty else {
+                #if DEBUG
+                print("FaceSuggest: face \(annotation.faceInstanceId) missing embedding — cannot suggest")
+                #endif
+                return annotation
+            }
+            guard let personId = bestNamedSuggestionPersonId(
+                embedding: instance.embeddingBlob,
+                namedExemplars: namedExemplars,
+                eventCastPersonIds: eventCastPersonIds
+            ) else {
+                return annotation
+            }
+
+            let person: PeopleRepository.PersonRecord?
+            if let cached = personCache[personId] {
+                person = cached
+            } else if let fetched = people.fetchPersonUnsafe(personId: personId) {
+                personCache[personId] = fetched
+                person = fetched
+            } else {
+                person = nil
+            }
+            guard let person else { return annotation }
+
+            return PhotoFaceAnnotation(
+                faceInstanceId: annotation.faceInstanceId,
+                photoId: annotation.photoId,
+                bboxX: annotation.bboxX,
+                bboxY: annotation.bboxY,
+                bboxWidth: annotation.bboxWidth,
+                bboxHeight: annotation.bboxHeight,
+                clusterId: annotation.clusterId,
+                personId: annotation.personId,
+                personDisplayName: annotation.personDisplayName,
+                suggestedPersonId: person.personId,
+                suggestedDisplayName: person.displayName,
+                suggestedFirstName: person.firstName,
+                suggestedLastName: person.lastName,
+                suggestedMaidenName: person.maidenName
+            )
+        }
+    }
+
+    private func bestNamedSuggestionPersonId(
+        embedding: Data,
+        namedExemplars: [(personId: Int, embedding: Data)],
+        eventCastPersonIds: Set<Int>
+    ) -> Int? {
+        let credit = FaceRecognitionAnalyzer.namedSuggestionEventCastDistanceCredit
+        var bestByPerson: [Int: Float] = [:]
+        for exemplar in namedExemplars {
+            guard let distance = FaceRecognitionAnalyzer.distance(
+                between: embedding,
+                and: exemplar.embedding
+            ) else { continue }
+            let adjusted = eventCastPersonIds.contains(exemplar.personId)
+                ? distance - credit
+                : distance
+            let previous = bestByPerson[exemplar.personId] ?? .greatestFiniteMagnitude
+            if adjusted < previous {
+                bestByPerson[exemplar.personId] = adjusted
+            }
+        }
+
+        let ranked = bestByPerson.sorted { $0.value < $1.value }
+        guard let best = ranked.first else { return nil }
+        let second = ranked.dropFirst().first?.value
+        let withinDistance =
+            best.value <= FaceRecognitionAnalyzer.namedSuggestionConfirmDistanceThreshold
+        let clearWinner: Bool = {
+            guard let second else { return true }
+            return (second - best.value) >= FaceRecognitionAnalyzer.namedSuggestionConfirmMargin
+        }()
+        let within = withinDistance && clearWinner
+        #if DEBUG
+        let secondLabel = ranked.dropFirst().first.map { "\($0.key):\($0.value)" } ?? "none"
+        print(
+            "FaceSuggest bestPerson=\(best.key) d=\(best.value) second=\(secondLabel) "
+                + "threshold=\(FaceRecognitionAnalyzer.namedSuggestionConfirmDistanceThreshold) "
+                + "margin=\(FaceRecognitionAnalyzer.namedSuggestionConfirmMargin) "
+                + "cast=\(eventCastPersonIds.count) credit=\(credit) "
+                + "suggest=\(within)"
+        )
+        #endif
+        guard within else { return nil }
+        return best.key
     }
 
     /// Names a face from photo preview. Creates a singleton cluster when the face is still unclustered.
@@ -399,27 +541,109 @@ final class FaceRecognitionService {
     }
 
     /// Scans a single photo if it is below the current face algorithm version. Returns annotations.
-    /// Preview path uses high-quality decode so rectangles are more reliable than bulk fast scans.
-    func ensurePhotoFaceScanned(photoId: String) async -> [PhotoFaceAnnotation] {
+    /// The full browser passes `upgradeToPreviewScan` so a 1024px library pass is detected once more at 2048px.
+    func ensurePhotoFaceScanned(
+        photoId: String,
+        suggestionEventId: Int? = nil,
+        upgradeToPreviewScan: Bool = false
+    ) async -> [PhotoFaceAnnotation] {
         let algorithmVersion = FaceRecognitionAnalyzer.algorithmVersion
-        let needsScan = database.sync {
-            faces.faceRecognitionVersionUnsafe(photoId: photoId) < algorithmVersion
+        let previewVersion = FaceRecognitionAnalyzer.previewScanVersion
+        let version = database.sync {
+            faces.faceRecognitionVersionUnsafe(photoId: photoId)
         }
-        if needsScan {
-        let detections = await FaceRecognitionAnalyzer.analyze(
-            assetIdentifier: photoId,
-            preferFastDecode: false,
-            targetPixelSize: FaceRecognitionAnalyzer.previewScanTargetPixelSize
-        )
-            autoreleasepool {
-                applyScanResult(
-                    photoId: photoId,
-                    detections: detections,
-                    algorithmVersion: algorithmVersion
-                )
+        let needsLibraryScan = version < algorithmVersion
+        let needsPreviewUpgrade = upgradeToPreviewScan && version < previewVersion
+        if needsLibraryScan || needsPreviewUpgrade {
+            let detections = await FaceRecognitionAnalyzer.analyze(
+                assetIdentifier: photoId,
+                preferFastDecode: false,
+                targetPixelSize: FaceRecognitionAnalyzer.previewScanTargetPixelSize
+            )
+            if !Task.isCancelled {
+                autoreleasepool {
+                    if needsLibraryScan {
+                        applyScanResult(
+                            photoId: photoId,
+                            detections: detections,
+                            algorithmVersion: algorithmVersion
+                        )
+                    }
+                    if needsPreviewUpgrade {
+                        mergePreviewDetections(
+                            photoId: photoId,
+                            detections: detections,
+                            previewVersion: previewVersion
+                        )
+                    }
+                }
             }
         }
-        return fetchFaceAnnotations(forPhotoId: photoId)
+        return fetchFaceAnnotations(
+            forPhotoId: photoId,
+            suggestionEventId: suggestionEventId
+        )
+    }
+
+    /// Adds boxes the library scan missed. An existing box, named or not, is left in place.
+    private func mergePreviewDetections(
+        photoId: String,
+        detections: [DetectedFaceCandidate],
+        previewVersion: Int
+    ) {
+        let createdAt = ISO8601DateFormatter().string(from: Date())
+        database.sync {
+            var kept = faces.fetchFaceInstancesForPhotoUnsafe(photoId: photoId)
+            var added = 0
+            for detection in detections {
+                if kept.count >= Self.maxFacesAppliedPerPhoto { break }
+                let box = detection.boundingBox
+                if kept.contains(where: { Self.sameFace($0.faceBoundingBox, box) }) {
+                    continue
+                }
+                let faceId = faces.insertFaceInstanceUnsafe(
+                    photoId: photoId,
+                    bboxX: box.origin.x,
+                    bboxY: box.origin.y,
+                    bboxWidth: box.size.width,
+                    bboxHeight: box.size.height,
+                    quality: detection.quality,
+                    embeddingBlob: detection.embeddingData,
+                    embeddingVersion: FaceRecognitionAnalyzer.embeddingVersion,
+                    clusterId: nil,
+                    personId: nil,
+                    createdAt: createdAt
+                )
+                guard faceId > 0 else { continue }
+                kept.append(
+                    FaceInstanceRecord(
+                        faceInstanceId: faceId,
+                        photoId: photoId,
+                        bboxX: box.origin.x,
+                        bboxY: box.origin.y,
+                        bboxWidth: box.size.width,
+                        bboxHeight: box.size.height,
+                        quality: detection.quality,
+                        embeddingBlob: detection.embeddingData,
+                        embeddingVersion: FaceRecognitionAnalyzer.embeddingVersion,
+                        clusterId: nil,
+                        personId: nil
+                    )
+                )
+                added += 1
+            }
+            faces.markPhotoFaceRecognitionVersionUnsafe(photoId: photoId, version: previewVersion)
+            #if DEBUG
+            print("FacePreview: photo=\(photoId) added=\(added) kept=\(kept.count)")
+            #endif
+        }
+    }
+
+    private static func sameFace(_ existing: CGRect, _ candidate: CGRect) -> Bool {
+        if intersectionOverUnion(existing, candidate) >= 0.25 { return true }
+        let candidateCenter = CGPoint(x: candidate.midX, y: candidate.midY)
+        let existingCenter = CGPoint(x: existing.midX, y: existing.midY)
+        return existing.contains(candidateCenter) || candidate.contains(existingCenter)
     }
 
     func nameCluster(

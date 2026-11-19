@@ -27,6 +27,23 @@ enum FaceRecognitionAnalyzer: Sendable {
     /// Auto-link to an already-named person.
     nonisolated static let namedMatchDistanceThreshold: Float = 0.40
 
+    /// UI “Rick?” confirm chip. On-device crop feature-prints for the *same* person commonly
+    /// land ~0.50–0.65 in real libraries (see FaceSuggest logs) — looser than cluster rebuild
+    /// thresholds. User must tap to confirm; pair with `namedSuggestionConfirmMargin`.
+    nonisolated static let namedSuggestionConfirmDistanceThreshold: Float = 0.62
+
+    /// Clear-winner gap for the confirm chip (slightly stricter than scan `matchMargin`).
+    nonisolated static let namedSuggestionConfirmMargin: Float = 0.05
+
+    /// Subtracted from distances for people already confirmed on the open event.
+    /// Small enough that a clearly closer outsider still wins the margin test.
+    nonisolated static let namedSuggestionEventCastDistanceCredit: Float = 0.08
+
+    /// Library scans stamp `algorithmVersion`. A full-browser pass stamps this higher
+    /// value so opening a photo does not detect it again, without requeueing the library.
+    nonisolated static let previewScanVersionOffset = 1000
+    nonisolated static var previewScanVersion: Int { algorithmVersion + previewScanVersionOffset }
+
     /// Join a new detection to an existing unnamed cluster while scanning.
     /// Feature-prints are noisy across age/angle — too-tight thresholds create dozens
     /// of tiny same-person clusters (and “photo counts” look falsely low).

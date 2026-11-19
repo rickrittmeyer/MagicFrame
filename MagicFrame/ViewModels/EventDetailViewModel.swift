@@ -1,5 +1,7 @@
-import Foundation
 import Combine
+import CoreLocation
+import Foundation
+import Photos
 import SwiftUI
 
 @MainActor
@@ -43,23 +45,38 @@ final class EventDetailViewModel: ObservableObject {
 
     @Published var isSelectingPhotos = false
     @Published private(set) var selectedPhotoIds: Set<String> = []
+    /// Selection order so “first selected” is stable for Adjust Date.
+    @Published private(set) var selectedPhotoIdOrder: [String] = []
+    @Published private(set) var isAdjustingDates = false
+    @Published private(set) var isAdjustingLocations = false
     @Published var showHiddenPhotos = false
+    @Published var photoSort: EventDetailPhotoSort = .dateCaptured
+    @Published var photoFilter: PictureBrowserFilter = .allItems
+    private var sortMetadataByPhotoId: [String: EventPhotoSortMetadata] = [:]
+    private var locationLabelByLocationId: [Int: String] = [:]
     @Published private(set) var analyzingFaceMetricsPhotoIds: Set<String> = []
     @Published private(set) var objectRecognitionStatus: String?
-    @Published private(set) var visionLabelDebugStatus: String?
     @Published private(set) var gameResult: EventGameResult?
     @Published private(set) var gameLookupStatus: String?
     @Published private(set) var isLookingUpGameScore = false
+    @Published private(set) var isRunningAIAssist = false
+    @Published private(set) var isFindingDuplicates = false
+    @Published private(set) var duplicateScanStatus: String?
+    @Published private(set) var duplicateMatches: [EventPhotoDuplicateMatch] = []
     @Published var gameLookupCandidates: [SportsGameCandidate] = []
     @Published var showGameLookupCandidates = false
     @Published private(set) var locationGeocodeStatus: String?
     @Published var pendingSimilarEventAlternatives: SimilarEventAlternativesRequest?
     @Published var pendingSimilarEventPeoplePick: SimilarEventPeoplePickRequest?
+    @Published var showWeddingCoupleNaming = false
+    @Published private(set) var weddingCoupleNamingPhotoId: String?
+    @Published private(set) var weddingCoupleNamingFaces: [PhotoFaceAnnotation] = []
     private var faceAnalysisTask: Task<Void, Never>?
     private var similarGroupRefineTask: Task<Void, Never>?
     private var objectRecognitionTask: Task<Void, Never>?
-    private var visionLabelDebugTask: Task<Void, Never>?
     private var locationGeocodeTask: Task<Void, Never>?
+    private var aiAssistTask: Task<Void, Never>?
+    private var findDuplicatesTask: Task<Void, Never>?
     private var birthDateISOByPersonName: [String: String] = [:]
     private let database: any MagicFrameDatabase
 
@@ -96,10 +113,8 @@ final class EventDetailViewModel: ObservableObject {
     }
 
     var visiblePhotoCount: Int {
-        if event.isTripContainer {
-            tripPhotoDisplaySections.reduce(0) { $0 + $1.displayItems.count }
-        } else {
-            photoDisplayItems.count
+        gridBlocks.reduce(0) { partial, block in
+            partial + block.groups.reduce(0) { $0 + $1.items.count }
         }
     }
 
@@ -108,19 +123,37 @@ final class EventDetailViewModel: ObservableObject {
     }
 
     var displayRepresentatives: [IndexedPhoto] {
-        if event.isTripContainer {
-            tripPhotoDisplaySections.flatMap { $0.displayItems.map(\.representative) }
-        } else {
-            photoDisplayItems.map(\.representative)
-        }
+        fullscreenDisplayItems.map(\.representative)
     }
 
     var fullscreenDisplayItems: [EventPhotoDisplayItem] {
-        if event.isTripContainer {
-            tripPhotoDisplaySections.flatMap(\.displayItems)
-        } else {
-            photoDisplayItems
+        gridBlocks.flatMap { block in
+            block.groups.flatMap(\.items)
         }
+    }
+
+    /// Trip day blocks (optional) with sort-grouped photo sections for the sticky grid.
+    var gridBlocks: [EventDetailPhotoBlock] {
+        if event.isTripContainer, !tripPhotoDisplaySections.isEmpty {
+            return tripPhotoDisplaySections.map { trip in
+                EventDetailPhotoBlock(
+                    id: "trip-\(trip.id)",
+                    tripSection: trip,
+                    groups: sortGroups(from: filteredItems(trip.displayItems), idPrefix: "trip-\(trip.id)")
+                )
+            }
+            .filter { !$0.groups.isEmpty }
+        }
+
+        let groups = sortGroups(from: filteredItems(photoDisplayItems), idPrefix: "photos")
+        guard !groups.isEmpty else { return [] }
+        return [
+            EventDetailPhotoBlock(
+                id: "photos",
+                tripSection: nil,
+                groups: groups
+            )
+        ]
     }
 
     func displayItem(containingPhotoId photoId: String) -> EventPhotoDisplayItem? {
@@ -254,17 +287,139 @@ final class EventDetailViewModel: ObservableObject {
         loadPhotos()
     }
 
-    func loadPhotos() {
+    func loadPhotos(skipHeavyWork: Bool = false) {
         reloadPhotoCollections()
         rebuildDisplayItems()
+        reloadSortMetadata()
         selectedPhotoIds = selectedPhotoIds.intersection(Set(photos.map(\.id)))
+        selectedPhotoIdOrder = selectedPhotoIdOrder.filter { selectedPhotoIds.contains($0) }
         syncTripChildEventNameDrafts()
+        guard !skipHeavyWork else { return }
         // Face metrics wait until visual refine finishes — otherwise mega metadata
         // stacks (shared import timestamps) thrash: refine ↔ face reload ↔ regroup.
         refineSimilarGroupsWithVisualSimilarityIfNeeded()
         runObjectRecognitionIfNeeded()
         enqueueFaceRecognitionIfNeeded()
         ensureLocationGeocodedIfNeeded()
+    }
+
+    private func reloadSortMetadata() {
+        let ids = photos.map(\.id)
+        let payload = database.fetchEventPhotoSortMetadata(photoIds: ids)
+        sortMetadataByPhotoId = payload.metadata
+        locationLabelByLocationId = payload.locationLabels
+        objectWillChange.send()
+    }
+
+    private func filteredItems(_ items: [EventPhotoDisplayItem]) -> [EventPhotoDisplayItem] {
+        items.filter { passesFilter($0.representative) }
+    }
+
+    private func passesFilter(_ photo: IndexedPhoto) -> Bool {
+        switch photoFilter {
+        case .allItems:
+            return true
+        case .onFrame:
+            return photo.showOnFrame
+        case .offFrame:
+            return !photo.showOnFrame
+        case .favorites:
+            return photo.isFavorite
+        case .photos:
+            return !photo.isVideo
+        case .video:
+            return photo.isVideo
+        }
+    }
+
+    private func sortGroups(
+        from items: [EventPhotoDisplayItem],
+        idPrefix: String
+    ) -> [EventDetailPhotoSortGroup] {
+        guard !items.isEmpty else { return [] }
+
+        var buckets: [String: (title: String, items: [EventPhotoDisplayItem])] = [:]
+        for item in items {
+            let group = sortGroup(for: item)
+            var bucket = buckets[group.key] ?? (group.title, [])
+            bucket.items.append(item)
+            buckets[group.key] = bucket
+        }
+
+        let orderedKeys = buckets.keys.sorted { lhs, rhs in
+            sortGroupSortOrder(lhs) < sortGroupSortOrder(rhs)
+        }
+
+        return orderedKeys.map { key in
+            let bucket = buckets[key]!
+            let sortedItems = bucket.items.sorted { lhs, rhs in
+                let leftDate = lhs.representative.creationDate
+                let rightDate = rhs.representative.creationDate
+                if leftDate != rightDate {
+                    return leftDate < rightDate
+                }
+                return lhs.representative.id < rhs.representative.id
+            }
+            return EventDetailPhotoSortGroup(
+                id: "\(idPrefix)-\(key)",
+                title: bucket.title,
+                items: sortedItems
+            )
+        }
+    }
+
+    private func sortGroup(for item: EventPhotoDisplayItem) -> (key: String, title: String) {
+        let photo = item.representative
+        let metadata = sortMetadataByPhotoId[photo.id]
+
+        switch photoSort {
+        case .dateCaptured:
+            let day = dayKey(from: photo.creationDate)
+            return (day, formatDayTitle(dayKey: day, fallbackISO: photo.creationDate))
+
+        case .dateImported:
+            let source = metadata?.indexedAt ?? photo.creationDate
+            let day = dayKey(from: source)
+            return (day, formatDayTitle(dayKey: day, fallbackISO: source))
+
+        case .cameraType:
+            let label = metadata?.cameraLabel ?? "Unknown Camera"
+            return (label.lowercased(), label)
+
+        case .location:
+            if let locationId = metadata?.locationId,
+               let label = locationLabelByLocationId[locationId],
+               !label.isEmpty,
+               label != PhotoPreviewLocationFormatting.noGPSData {
+                return ("loc-\(locationId)", label)
+            }
+            return ("no-location", "No Location")
+        }
+    }
+
+    private func sortGroupSortOrder(_ key: String) -> String {
+        if key == "no-location" || key == "unknown camera" {
+            return "\u{FFFF}\(key)"
+        }
+        return key
+    }
+
+    private func dayKey(from iso: String) -> String {
+        if let date = EventDateParser.parseDate(iso) {
+            return EventDateParser.dateOnlyISO(from: date)
+        }
+        return String(iso.prefix(10))
+    }
+
+    private func formatDayTitle(dayKey: String, fallbackISO: String) -> String {
+        if let date = EventDateParser.parseDate(dayKey)
+            ?? EventDateParser.parseDate(fallbackISO) {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "MMMM d, yyyy"
+            return formatter.string(from: date)
+        }
+        return dayKey
     }
 
     func cancelLocationGeocode() {
@@ -290,6 +445,7 @@ final class EventDetailViewModel: ObservableObject {
             let didUpdate = await database.ensureEventLocationGeocoded(eventId: eventId)
             guard !Task.isCancelled else { return }
 
+            self.reloadSortMetadata()
             if didUpdate {
                 self.refreshEvent(notifyList: true)
             }
@@ -337,8 +493,404 @@ final class EventDetailViewModel: ObservableObject {
     func cancelObjectRecognition() {
         objectRecognitionTask?.cancel()
         objectRecognitionTask = nil
+        aiAssistTask?.cancel()
+        aiAssistTask = nil
+        isRunningAIAssist = false
         objectRecognitionStatus = nil
+        cancelFindDuplicates()
         cancelLocationGeocode()
+    }
+
+    func cancelFindDuplicates() {
+        findDuplicatesTask?.cancel()
+        findDuplicatesTask = nil
+        isFindingDuplicates = false
+        duplicateScanStatus = nil
+    }
+
+    /// AI Assist: locations → vision → faces → OCR text → score cards → suggested name → sports confirm.
+    func runAIAssist() {
+        guard !isRunningAIAssist else { return }
+        aiAssistTask?.cancel()
+        objectRecognitionTask?.cancel()
+
+        let eventId = event.eventId
+        let includeHidden = showHiddenPhotos
+        let database = database
+
+        aiAssistTask = Task { [weak self] in
+            guard let self else { return }
+            await MainActor.run {
+                self.isRunningAIAssist = true
+                self.objectRecognitionStatus = "AI Assist: assigning locations…"
+            }
+
+            let locationUpdated = await database.ensureEventLocationGeocoded(eventId: eventId)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                self.reloadSortMetadata()
+                if locationUpdated {
+                    self.refreshEvent(notifyList: true)
+                }
+                self.objectRecognitionStatus = "AI Assist: tagging photos…"
+            }
+
+            let visionReport = await database.scanEventPhotosWithVisionTags(
+                eventId: eventId,
+                includeHiddenPhotos: includeHidden
+            ) { current, total in
+                Task { @MainActor [weak self] in
+                    guard let self, !Task.isCancelled else { return }
+                    self.objectRecognitionStatus =
+                        "AI Assist: tagging photos… \(current.formatted())/\(total.formatted())"
+                }
+            }
+            guard !Task.isCancelled else { return }
+
+            await MainActor.run {
+                self.objectRecognitionStatus = "AI Assist: detecting faces…"
+            }
+            _ = await Task.detached(priority: .utility) {
+                database.enqueueFaceRecognitionForEvent(
+                    eventId: eventId,
+                    includeHidden: includeHidden
+                )
+            }.value
+            guard !Task.isCancelled else { return }
+
+            await MainActor.run {
+                self.objectRecognitionStatus = "AI Assist: reading text in photos…"
+            }
+            let textReport = await database.scanEventPhotosForText(
+                eventId: eventId,
+                includeHiddenPhotos: includeHidden
+            ) { current, total in
+                Task { @MainActor [weak self] in
+                    guard let self, !Task.isCancelled else { return }
+                    self.objectRecognitionStatus =
+                        "AI Assist: reading text… \(current.formatted())/\(total.formatted())"
+                }
+            }
+            guard !Task.isCancelled else { return }
+
+            let cards = await Task.detached(priority: .utility) {
+                database.fetchAllEventScoreCardSettings()
+            }.value
+            guard !Task.isCancelled else { return }
+
+            var tagsApplied = 0
+            for (index, card) in cards.enumerated() {
+                await MainActor.run {
+                    self.objectRecognitionStatus =
+                        "AI Assist: scoring \(card.targetEventType)…"
+                        + " \(index + 1)/\(cards.count)"
+                }
+                let score = await Task.detached(priority: .utility) {
+                    database.scoreEventAgainstScoreCard(eventId: eventId, scoreCard: card)
+                }.value
+                if card.meetsAIThreshold(totalScore: score.totalScore) {
+                    tagsApplied += 1
+                }
+                guard !Task.isCancelled else { return }
+            }
+
+            await MainActor.run {
+                self.refreshEvent()
+                var status =
+                    "AI Assist: scored \(cards.count) cards"
+                    + (tagsApplied > 0 ? " · \(tagsApplied) above threshold" : "")
+                    + (visionReport.photosScanned > 0
+                        ? " · \(visionReport.photosScanned) photos tagged"
+                        : "")
+                if textReport.photosScanned > 0 || textReport.photosWithText > 0 {
+                    status += " · \(textReport.photosWithText) with text"
+                }
+                self.objectRecognitionStatus = status
+            }
+
+            // Step 3.5 — tagValue-specific tasks (Wedding couple first).
+            let weddingCoupleSummary = await runAIAssistTagValueTasks(eventId: eventId)
+
+            await MainActor.run {
+                self.refreshEvent()
+                // AI Assist explicitly owns the title for this run (grey / non-user name).
+                self.userEditedName = false
+                self.applySuggestedName()
+                if let weddingCoupleSummary, !weddingCoupleSummary.isEmpty {
+                    let base = self.objectRecognitionStatus ?? "AI Assist"
+                    self.objectRecognitionStatus = "\(base) · \(weddingCoupleSummary)"
+                }
+            }
+
+            if shouldOfferSportsScoreConfirm {
+                objectRecognitionStatus = "AI Assist: looking up game score…"
+                await findGameScoreForConfirm()
+            }
+
+            guard !Task.isCancelled else {
+                await MainActor.run { self.isRunningAIAssist = false }
+                return
+            }
+            await MainActor.run {
+                self.isRunningAIAssist = false
+                if self.showGameLookupCandidates {
+                    self.objectRecognitionStatus = "AI Assist: confirm game score"
+                } else {
+                    let base = self.objectRecognitionStatus ?? "AI Assist done."
+                    self.objectRecognitionStatus = base.hasPrefix("AI Assist:")
+                        ? base.replacingOccurrences(of: "AI Assist:", with: "AI Assist done:")
+                        : "AI Assist done."
+                }
+            }
+
+            try? await Task.sleep(for: .seconds(5))
+            await MainActor.run {
+                if self.objectRecognitionStatus?.hasPrefix("AI Assist") == true,
+                   !self.showGameLookupCandidates {
+                    self.objectRecognitionStatus = nil
+                }
+            }
+        }
+    }
+
+    /// Scans this event’s photos against the library for near-identical copies.
+    func findDuplicates() {
+        guard !isFindingDuplicates else { return }
+        findDuplicatesTask?.cancel()
+
+        let eventId = event.eventId
+        let includeHidden = showHiddenPhotos
+
+        findDuplicatesTask = Task { [weak self] in
+            guard let self else { return }
+            await MainActor.run {
+                self.isFindingDuplicates = true
+                self.duplicateMatches = []
+                self.duplicateScanStatus = "Finding duplicates…"
+            }
+
+            let count = await self.runDuplicateScan(
+                eventId: eventId,
+                includeHidden: includeHidden
+            )
+            guard !Task.isCancelled else {
+                await MainActor.run {
+                    self.isFindingDuplicates = false
+                    self.duplicateScanStatus = nil
+                }
+                return
+            }
+
+            await MainActor.run {
+                self.isFindingDuplicates = false
+                if count == 0 {
+                    self.duplicateScanStatus = "No duplicates found"
+                } else {
+                    self.duplicateScanStatus =
+                        "\(count) duplicate\(count == 1 ? "" : "s") found"
+                }
+            }
+
+            try? await Task.sleep(for: .seconds(4))
+            await MainActor.run {
+                if self.duplicateScanStatus?.hasPrefix("No duplicates") == true
+                    || self.duplicateScanStatus?.hasSuffix("found") == true {
+                    self.duplicateScanStatus = nil
+                }
+            }
+        }
+    }
+
+    /// Scans event photos against the library for near-identical copies. Returns match count.
+    private func runDuplicateScan(eventId: Int, includeHidden: Bool) async -> Int {
+        let database = database
+        let eventPhotos = await Task.detached(priority: .utility) {
+            database.getPhotosForEvent(eventId: eventId, includeHidden: includeHidden)
+        }.value
+        guard !Task.isCancelled, !eventPhotos.isEmpty else { return 0 }
+
+        let libraryRows = await Task.detached(priority: .utility) {
+            database.fetchAllPhotosForBrowser()
+        }.value
+        guard !Task.isCancelled else { return 0 }
+
+        let libraryPhotos = libraryRows.map(\.photo)
+        let rawMatches = await EventLibraryDuplicateDetector.findDuplicates(
+            eventPhotos: eventPhotos,
+            libraryPhotos: libraryPhotos
+        ) { progress in
+            Task { @MainActor [weak self] in
+                guard let self, !Task.isCancelled else { return }
+                self.duplicateScanStatus =
+                    "Finding duplicates… \(progress.current.formatted())/\(progress.total.formatted())"
+            }
+        }
+        guard !Task.isCancelled else { return 0 }
+
+        let libraryById = Dictionary(uniqueKeysWithValues: libraryPhotos.map { ($0.id, $0) })
+        let eventById = Dictionary(uniqueKeysWithValues: eventPhotos.map { ($0.id, $0) })
+        let currentEventTitle = await MainActor.run {
+            self.event.listTitleText ?? self.event.name
+        }
+        var enriched: [EventPhotoDuplicateMatch] = []
+        enriched.reserveCapacity(rawMatches.count)
+
+        for raw in rawMatches {
+            if Task.isCancelled { break }
+            guard let libraryPhoto = libraryById[raw.libraryPhotoId],
+                  let eventPhoto = eventById[raw.eventPhotoId] else {
+                continue
+            }
+
+            let eventLocationLine = await Task.detached(priority: .utility) {
+                database.photoPreviewLocationLine(photoId: raw.eventPhotoId)
+            }.value
+            let libraryLocationLine = await Task.detached(priority: .utility) {
+                database.photoPreviewLocationLine(photoId: raw.libraryPhotoId)
+            }.value
+
+            let libraryEventId = database.getEventIdForPhoto(photoId: raw.libraryPhotoId)
+            let libraryEventTitle: String? = {
+                guard let libraryEventId,
+                      let indexed = database.getEvent(eventId: libraryEventId) else {
+                    return nil
+                }
+                return indexed.listTitleText ?? indexed.name
+            }()
+
+            enriched.append(
+                EventPhotoDuplicateMatch(
+                    eventSide: EventPhotoDuplicateSideInfo(
+                        photoId: raw.eventPhotoId,
+                        creationDate: eventPhoto.creationDate,
+                        locationLine: eventLocationLine,
+                        eventId: eventId,
+                        eventTitle: currentEventTitle
+                    ),
+                    librarySide: EventPhotoDuplicateSideInfo(
+                        photoId: raw.libraryPhotoId,
+                        creationDate: libraryPhoto.creationDate,
+                        locationLine: libraryLocationLine,
+                        eventId: libraryEventId,
+                        eventTitle: libraryEventTitle
+                    ),
+                    distance: raw.distance
+                )
+            )
+        }
+
+        await MainActor.run {
+            self.duplicateMatches = enriched
+        }
+        return enriched.count
+    }
+
+    /// Hides selected photos in their linked events (this event and/or the duplicate's event).
+    func hideDuplicatePhotos(photoIds: [String]) {
+        let ids = Array(Set(photoIds))
+        guard !ids.isEmpty else { return }
+        _ = database.setPhotosHiddenInEvent(photoIds: ids, hidden: true)
+        removeDuplicateMatches(involving: ids)
+        loadPhotos(skipHeavyWork: true)
+        refreshEvent()
+    }
+
+    /// Soft-deletes in MagicFrame and removes assets from Apple Photos.
+    func deleteDuplicatePhotos(photoIds: [String]) async -> String? {
+        let ids = Array(Set(photoIds))
+        guard !ids.isEmpty else { return nil }
+
+        let photosError = await deleteAssetsFromPhotoLibrary(photoIds: ids)
+        database.softDeletePhotos(photoIds: ids)
+        removeDuplicateMatches(involving: ids)
+        loadPhotos(skipHeavyWork: true)
+        refreshEvent()
+        onEventUpdated?(event.eventId)
+        return photosError
+    }
+
+    private func removeDuplicateMatches(involving photoIds: [String]) {
+        let removed = Set(photoIds)
+        duplicateMatches.removeAll {
+            removed.contains($0.eventPhotoId) || removed.contains($0.libraryPhotoId)
+        }
+    }
+
+    private func deleteAssetsFromPhotoLibrary(photoIds: [String]) async -> String? {
+        let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+        guard status == .authorized || status == .limited else {
+            return "Photos access is required to delete from Apple Photos. MagicFrame copies were still removed."
+        }
+
+        return await withCheckedContinuation { continuation in
+            var resumed = false
+            let resumeOnce: (String?) -> Void = { message in
+                guard !resumed else { return }
+                resumed = true
+                continuation.resume(returning: message)
+            }
+
+            let result = PHAsset.fetchAssets(withLocalIdentifiers: photoIds, options: nil)
+            guard result.count > 0 else {
+                resumeOnce(nil)
+                return
+            }
+
+            PHPhotoLibrary.shared().performChanges({
+                PHAssetChangeRequest.deleteAssets(result)
+            }, completionHandler: { success, error in
+                if let error {
+                    resumeOnce(error.localizedDescription)
+                } else if !success {
+                    resumeOnce("Could not delete some photos from Apple Photos.")
+                } else {
+                    resumeOnce(nil)
+                }
+            })
+        }
+    }
+
+    /// TagValue-specific AI Assist work after score cards (Wedding couple resolve, etc.).
+    private func runAIAssistTagValueTasks(eventId: Int) async -> String? {
+        await MainActor.run {
+            refreshEvent()
+        }
+        let milestone = await MainActor.run { () -> String? in
+            (milestoneType ?? event.resolvedAttributeValue(for: .milestoneType))?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard let milestone,
+              milestone.compare("Wedding", options: .caseInsensitive) == .orderedSame else {
+            return nil
+        }
+
+        await MainActor.run {
+            objectRecognitionStatus = "AI Assist: finding bride & groom…"
+        }
+
+        let resolution = await Task.detached(priority: .utility) { [database] in
+            database.resolveAndApplyWeddingCouple(eventId: eventId)
+        }.value
+
+        return resolution.statusSummary
+    }
+
+    private var shouldOfferSportsScoreConfirm: Bool {
+        if gameResult != nil { return false }
+        let type = (eventType ?? event.resolvedAttributeValue(for: .eventType))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if type?.compare("Sporting event", options: .caseInsensitive) == .orderedSame {
+            return true
+        }
+        // Stadium location — place name often includes "Stadium" / venue from library.
+        let haystack = [
+            event.placeName,
+            event.locationTitleLine,
+            event.city,
+        ]
+        .compactMap { $0?.lowercased() }
+        .joined(separator: " ")
+        return haystack.contains("stadium") || haystack.contains("arena")
     }
 
     private func runObjectRecognitionIfNeeded() {
@@ -484,6 +1036,7 @@ final class EventDetailViewModel: ObservableObject {
             reloadPhotoCollections()
             refreshDisplayItemsPreservingGroups()
             selectedPhotoIds = selectedPhotoIds.intersection(Set(photos.map(\.id)))
+            selectedPhotoIdOrder = selectedPhotoIdOrder.filter { selectedPhotoIds.contains($0) }
         }.value
     }
 
@@ -754,7 +1307,7 @@ final class EventDetailViewModel: ObservableObject {
             .caseInsensitiveCompare("Wedding") == .orderedSame
 
         if isWedding {
-            // Bride then Groom — both under eventMainPerson.
+            // Bride → eventMainPerson, Groom → eventMainPerson2.
             database.replaceUserEventMainPeople(
                 eventId: event.eventId,
                 names: [person1.name, person2.name]
@@ -771,6 +1324,12 @@ final class EventDetailViewModel: ObservableObject {
         weddingDate = weddingDateISO
 
         if isWedding {
+            _ = database.upsertMarriedCoupleRelationship(
+                bridePersonId: person1.personId,
+                groomPersonId: person2.personId,
+                weddingDateISO: weddingDateISO,
+                sourceEventId: event.eventId
+            )
             _ = database.propagateAnniversaryTagsFromWedding(
                 sourceEventId: event.eventId,
                 person1: person1.name,
@@ -785,7 +1344,7 @@ final class EventDetailViewModel: ObservableObject {
         notifyEventUpdated()
     }
 
-    /// Confirm AI Wedding milestone (source → user), then caller presents Bride/Groom picker.
+    /// Confirm AI Wedding milestone (source → user), then caller presents couple naming UI.
     func confirmAIWeddingMilestoneTag(_ tag: EventAttributeTag) {
         guard tag.isAIDerived,
               tag.category == .milestoneType,
@@ -798,6 +1357,72 @@ final class EventDetailViewModel: ObservableObject {
         }
         refreshEvent()
         notifyEventUpdated()
+        _ = prepareWeddingCoupleNamingSheet()
+    }
+
+    /// Loads couple-only photo + faces for naming. Returns false when caller should use people list.
+    @discardableResult
+    func prepareWeddingCoupleNamingSheet() -> Bool {
+        let photoId = database.weddingCouplePhotoId(eventId: event.eventId)
+            ?? database.resolveAndApplyWeddingCouple(eventId: event.eventId).couplePhotoId
+        guard let photoId, !photoId.isEmpty else {
+            showWeddingCoupleNaming = false
+            weddingCoupleNamingPhotoId = nil
+            weddingCoupleNamingFaces = []
+            return false
+        }
+        let faces = database.fetchFaceAnnotations(forPhotoId: photoId)
+        guard faces.count >= 2 else {
+            weddingCoupleNamingPhotoId = nil
+            weddingCoupleNamingFaces = []
+            showWeddingCoupleNaming = false
+            return false
+        }
+        weddingCoupleNamingPhotoId = photoId
+        weddingCoupleNamingFaces = Array(faces.prefix(2))
+        showWeddingCoupleNaming = true
+        return true
+    }
+
+    func completeWeddingCoupleNaming(
+        brideFaceId: Int,
+        brideName: String,
+        groomFaceId: Int,
+        groomName: String,
+        weddingDate selectedDate: Date
+    ) {
+        let bridePersonId = database.nameFaceInstance(
+            faceInstanceId: brideFaceId,
+            displayName: brideName,
+            firstName: nil,
+            lastName: nil,
+            maidenName: nil
+        )
+        let groomPersonId = database.nameFaceInstance(
+            faceInstanceId: groomFaceId,
+            displayName: groomName,
+            firstName: nil,
+            lastName: nil,
+            maidenName: nil
+        )
+        guard bridePersonId > 0, groomPersonId > 0 else { return }
+
+        assignCoupleMilestone(
+            person1: MilestonePersonPickerItem(
+                personId: bridePersonId,
+                name: brideName,
+                birthDateISO: nil
+            ),
+            person2: MilestonePersonPickerItem(
+                personId: groomPersonId,
+                name: groomName,
+                birthDateISO: nil
+            ),
+            weddingDate: selectedDate
+        )
+        showWeddingCoupleNaming = false
+        weddingCoupleNamingPhotoId = nil
+        weddingCoupleNamingFaces = []
     }
 
     private func applyWeddingSuggestedNameIfAllowed(bride: String, groom: String) {
@@ -1059,19 +1684,343 @@ final class EventDetailViewModel: ObservableObject {
     func beginPhotoSelection() {
         isSelectingPhotos = true
         selectedPhotoIds.removeAll()
+        selectedPhotoIdOrder.removeAll()
     }
 
     func cancelPhotoSelection() {
         isSelectingPhotos = false
         selectedPhotoIds.removeAll()
+        selectedPhotoIdOrder.removeAll()
     }
 
     func togglePhotoSelection(photoId: String) {
         if selectedPhotoIds.contains(photoId) {
             selectedPhotoIds.remove(photoId)
+            selectedPhotoIdOrder.removeAll { $0 == photoId }
         } else {
             selectedPhotoIds.insert(photoId)
+            selectedPhotoIdOrder.append(photoId)
         }
+    }
+
+    private var selectedRepresentativePhotos: [IndexedPhoto] {
+        photos.filter { selectedPhotoIds.contains($0.id) }
+    }
+
+    var adjustDateAnchorDate: Date? {
+        guard let anchorId = selectedPhotoIdOrder.first,
+              let photo = photos.first(where: { $0.id == anchorId })
+                ?? selectedRepresentativePhotos.first,
+              let date = EventDateParser.parseDate(photo.creationDate) else {
+            return nil
+        }
+        return date
+    }
+
+    func makeDateAdjustPreview(adjustedAnchor: Date) -> PhotoDateAdjustPreview? {
+        guard let originalAnchor = adjustDateAnchorDate else { return nil }
+        let delta = adjustedAnchor.timeIntervalSince(originalAnchor)
+        let orderedIds = selectedPhotoIdOrder.isEmpty
+            ? Array(selectedPhotoIds)
+            : selectedPhotoIdOrder
+        guard !orderedIds.isEmpty else { return nil }
+
+        var updates: [(photoId: String, originalDate: Date, newDate: Date)] = []
+        for photoId in orderedIds {
+            guard let photo = photos.first(where: { $0.id == photoId }),
+                  let original = EventDateParser.parseDate(photo.creationDate) else {
+                continue
+            }
+            updates.append(
+                (
+                    photoId: photoId,
+                    originalDate: original,
+                    newDate: original.addingTimeInterval(delta)
+                )
+            )
+        }
+        guard !updates.isEmpty else { return nil }
+
+        let rangeStart = updates.map(\.newDate).min() ?? adjustedAnchor
+        let rangeEnd = updates.map(\.newDate).max() ?? adjustedAnchor
+        let leaves = datesLeaveCurrentEvent(updates.map(\.newDate))
+        return PhotoDateAdjustPreview(
+            updates: updates,
+            rangeStart: rangeStart,
+            rangeEnd: rangeEnd,
+            leavesCurrentEvent: leaves
+        )
+    }
+
+    private func datesLeaveCurrentEvent(_ dates: [Date]) -> Bool {
+        guard let eventStart = EventDateParser.parseDate(event.startDate),
+              let eventEnd = EventDateParser.parseDate(event.endDate) else {
+            return false
+        }
+        let start = min(eventStart, eventEnd)
+        let end = max(eventStart, eventEnd)
+        return dates.contains { $0 < start || $0 > end }
+    }
+
+    func candidateEventsForDateAdjust(preview: PhotoDateAdjustPreview) -> [IndexedEvent] {
+        database.findEventsContainingDateRange(
+            rangeStart: preview.rangeStart,
+            rangeEnd: preview.rangeEnd,
+            excludingEventId: event.eventId
+        )
+    }
+
+    @discardableResult
+    func commitDateAdjust(
+        preview: PhotoDateAdjustPreview,
+        destination: PhotoDateAdjustDestination?
+    ) async -> PhotoDateAdjustResult {
+        isAdjustingDates = true
+        defer { isAdjustingDates = false }
+        // Let the progress overlay paint before heavy work.
+        await Task.yield()
+
+        let photoIds = preview.photoIds
+        // MagicFrame DB + event membership first so UI unblocks; Photos library can lag on iCloud.
+        database.shiftPhotoCaptureDates(
+            updates: preview.updates.map { ($0.photoId, $0.newDate) }
+        )
+
+        let iso8601 = ISO8601DateFormatter()
+        photos = photos.map { photo in
+            guard let update = preview.updates.first(where: { $0.photoId == photo.id }) else {
+                return photo
+            }
+            return photo.withCreationDate(iso8601.string(from: update.newDate))
+        }
+
+        guard preview.leavesCurrentEvent else {
+            refreshDisplayItemsPreservingGroups()
+            cancelPhotoSelection()
+            return PhotoDateAdjustResult(
+                kind: .datesOnly,
+                updatedCount: photoIds.count,
+                errorMessage: nil
+            )
+        }
+
+        guard let destination else {
+            refreshDisplayItemsPreservingGroups()
+            cancelPhotoSelection()
+            return PhotoDateAdjustResult(
+                kind: .datesOnly,
+                updatedCount: photoIds.count,
+                errorMessage: "Choose where to move these photos."
+            )
+        }
+
+        let locationId = selectedRepresentativePhotos.compactMap(\.locationId).first
+            ?? event.locationId
+        let latitude = selectedRepresentativePhotos.compactMap(\.latitude).first
+            ?? event.latitude
+        let longitude = selectedRepresentativePhotos.compactMap(\.longitude).first
+            ?? event.longitude
+
+        let destinationEvent: IndexedEvent?
+        switch destination {
+        case .createNew:
+            destinationEvent = database.createEventForShiftedPhotos(
+                photoIds: photoIds,
+                fromEventId: event.eventId,
+                rangeStart: preview.rangeStart,
+                rangeEnd: preview.rangeEnd,
+                locationId: locationId,
+                latitude: latitude,
+                longitude: longitude
+            )
+        case let .existing(eventId):
+            database.movePhotosToEvent(
+                photoIds: photoIds,
+                fromEventId: event.eventId,
+                toEventId: eventId,
+                photoDates: preview.photoDates
+            )
+            destinationEvent = database.getEvent(eventId: eventId)
+        }
+
+        cancelPhotoSelection()
+        // Skip vision/face/geocode — those were the multi-minute hang after a successful move.
+        loadPhotos(skipHeavyWork: true)
+        refreshEvent()
+
+        let sourceGone = database.getEvent(eventId: event.eventId) == nil
+            || (!showHiddenPhotos && photos.isEmpty)
+
+        guard let destinationEvent else {
+            return PhotoDateAdjustResult(
+                kind: .datesOnly,
+                updatedCount: photoIds.count,
+                errorMessage: "Could not move photos to another event."
+            )
+        }
+
+        onEventUpdated?(event.eventId)
+        onEventUpdated?(destinationEvent.eventId)
+
+        return PhotoDateAdjustResult(
+            kind: .movedToEvent(destinationEvent, sourceEmptied: sourceGone),
+            updatedCount: photoIds.count,
+            errorMessage: nil
+        )
+    }
+
+    /// Writes adjusted dates to Apple Photos, then promotes overrides into library `creationDate`.
+    func syncAdjustedDatesToApplePhotos(
+        _ updates: [(photoId: String, newDate: Date)]
+    ) async -> String? {
+        let error = await PhotosAssetMetadataWriter.updateCreationDates(
+            updates.map { ($0.photoId, $0.newDate) }
+        )
+        guard error == nil else { return error }
+        database.promoteCaptureDatesAfterPhotosSync(
+            updates: updates.map { ($0.photoId, $0.newDate) }
+        )
+        return nil
+    }
+
+    private var locationAdjustAnchorPhoto: IndexedPhoto? {
+        guard let anchorId = selectedPhotoIdOrder.first else {
+            return selectedRepresentativePhotos.first
+        }
+        return photos.first(where: { $0.id == anchorId })
+            ?? selectedRepresentativePhotos.first
+    }
+
+    var adjustLocationAnchorCoordinate: (latitude: Double, longitude: Double)? {
+        guard let photo = locationAdjustAnchorPhoto,
+              let latitude = photo.latitude,
+              let longitude = photo.longitude else {
+            return nil
+        }
+        return (latitude, longitude)
+    }
+
+    var adjustLocationAnchorLabel: String {
+        guard let photo = locationAdjustAnchorPhoto else {
+            return PhotoPreviewLocationFormatting.noGPSData
+        }
+        if let locationId = photo.locationId,
+           let location = database.getLocation(locationId: locationId) {
+            return location.displayTitle
+        }
+        return PhotoPreviewLocationFormatting.line(
+            nickname: nil,
+            placeName: nil,
+            city: nil,
+            state: nil,
+            latitude: photo.latitude,
+            longitude: photo.longitude
+        )
+    }
+
+    func locationsForAdjust() -> [ManagedLocation] {
+        database.getLocationsRankedByEventCount()
+            .filter { $0.latitude != nil && $0.longitude != nil }
+    }
+
+    func makeLocationAdjustPreview(location: ManagedLocation) -> PhotoLocationAdjustPreview? {
+        guard let latitude = location.latitude,
+              let longitude = location.longitude else {
+            return nil
+        }
+        let orderedIds = selectedPhotoIdOrder.isEmpty
+            ? Array(selectedPhotoIds)
+            : selectedPhotoIdOrder
+        guard !orderedIds.isEmpty else { return nil }
+        return PhotoLocationAdjustPreview(
+            photoIds: orderedIds,
+            latitude: latitude,
+            longitude: longitude,
+            locationId: location.locationId,
+            locationLabel: location.displayTitle
+        )
+    }
+
+    @discardableResult
+    func commitLocationAdjust(
+        preview: PhotoLocationAdjustPreview
+    ) async -> PhotoLocationAdjustResult {
+        isAdjustingLocations = true
+        defer { isAdjustingLocations = false }
+        await Task.yield()
+
+        let photoIds = preview.photoIds
+        database.shiftPhotoLocations(
+            updates: photoIds.map {
+                (
+                    photoId: $0,
+                    latitude: preview.latitude,
+                    longitude: preview.longitude,
+                    locationId: preview.locationId
+                )
+            }
+        )
+
+        photos = photos.map { photo in
+            guard photoIds.contains(photo.id) else { return photo }
+            return photo.withLocation(
+                latitude: preview.latitude,
+                longitude: preview.longitude,
+                locationId: preview.locationId
+            )
+        }
+        refreshDisplayItemsPreservingGroups()
+        cancelPhotoSelection()
+
+        return PhotoLocationAdjustResult(
+            updatedCount: photoIds.count,
+            errorMessage: nil
+        )
+    }
+
+    /// Writes adjusted locations to Apple Photos, then promotes overrides into library GPS.
+    func syncAdjustedLocationsToApplePhotos(
+        _ updates: [(photoId: String, latitude: Double, longitude: Double)]
+    ) async -> String? {
+        let error = await PhotosAssetMetadataWriter.updateLocations(
+            updates.map {
+                (
+                    photoId: $0.photoId,
+                    location: CLLocation(latitude: $0.latitude, longitude: $0.longitude)
+                )
+            }
+        )
+        guard error == nil else { return error }
+        database.promoteLocationsAfterPhotosSync(updates: updates)
+        return nil
+    }
+
+    var selectedAllOnFrame: Bool {
+        let selected = selectedRepresentativePhotos
+        return !selected.isEmpty && selected.allSatisfy(\.showOnFrame)
+    }
+
+    var selectedAllFavorite: Bool {
+        let selected = selectedRepresentativePhotos
+        return !selected.isEmpty && selected.allSatisfy(\.isFavorite)
+    }
+
+    var selectedAllHidden: Bool {
+        let selected = selectedRepresentativePhotos
+        return !selected.isEmpty && selected.allSatisfy(\.isHiddenInEvent)
+    }
+
+    func toggleSelectedPhotosOnFrame() {
+        setSelectedPhotosOnFrame(!selectedAllOnFrame)
+    }
+
+    func toggleSelectedPhotosFavorite() {
+        setSelectedPhotosFavorite(!selectedAllFavorite)
+    }
+
+    @discardableResult
+    func toggleSelectedPhotosHidden() -> Bool {
+        setSelectedPhotosHidden(!selectedAllHidden)
     }
 
     func setSelectedPhotosOnFrame(_ show: Bool) {
@@ -1119,6 +2068,58 @@ final class EventDetailViewModel: ObservableObject {
         cancelPhotoSelection()
     }
 
+    func setSelectedPhotosFavorite(_ favorite: Bool) {
+        guard !selectedPhotoIds.isEmpty else { return }
+        let photoIds = Array(selectedPhotoIds)
+        photos = photos.map { photo in
+            selectedPhotoIds.contains(photo.id) ? photo.withFavorite(favorite) : photo
+        }
+        refreshDisplayItemsPreservingGroups()
+        cancelPhotoSelection()
+
+        Task {
+            await setFavoriteInPhotoLibrary(photoIds: photoIds, isFavorite: favorite)
+            database.setPhotosFavorite(photoIds: photoIds, isFavorite: favorite)
+        }
+    }
+
+    private func setFavoriteInPhotoLibrary(photoIds: [String], isFavorite: Bool) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            PHPhotoLibrary.shared().performChanges({
+                let result = PHAsset.fetchAssets(withLocalIdentifiers: photoIds, options: nil)
+                result.enumerateObjects { asset, _, _ in
+                    let request = PHAssetChangeRequest(for: asset)
+                    request.isFavorite = isFavorite
+                }
+            }, completionHandler: { _, error in
+                if let error {
+                    print("EventDetail favorite update failed: \(error.localizedDescription)")
+                }
+                continuation.resume()
+            })
+        }
+    }
+
+    @discardableResult
+    func setSelectedPhotosHidden(_ hidden: Bool) -> Bool {
+        guard !selectedPhotoIds.isEmpty else { return false }
+
+        database.setPhotosHiddenInEvent(
+            photoIds: Array(selectedPhotoIds),
+            hidden: hidden
+        )
+
+        cancelPhotoSelection()
+        loadPhotos()
+        refreshEvent()
+
+        if showHiddenPhotos {
+            return false
+        }
+
+        return photos.isEmpty
+    }
+
     @discardableResult
     func hidePhoto(photoId: String) -> Bool {
         if let item = displayItem(forRepresentativeId: photoId) {
@@ -1145,22 +2146,7 @@ final class EventDetailViewModel: ObservableObject {
 
     @discardableResult
     func hideSelectedPhotos() -> Bool {
-        guard !selectedPhotoIds.isEmpty else { return false }
-
-        database.setPhotosHiddenInEvent(
-            photoIds: Array(selectedPhotoIds),
-            hidden: true
-        )
-
-        cancelPhotoSelection()
-        loadPhotos()
-        refreshEvent()
-
-        if showHiddenPhotos {
-            return false
-        }
-
-        return photos.isEmpty
+        setSelectedPhotosHidden(true)
     }
 
     func hideEvent() {
@@ -1185,6 +2171,14 @@ final class EventDetailViewModel: ObservableObject {
 
         event = updated
         syncClassification(from: updated)
+        userEditedName = updated.userEditedName
+        // Keep the name field in sync with DB when the user hasn't taken ownership.
+        if !userEditedName {
+            let trimmed = updated.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                eventName = trimmed
+            }
+        }
         gameResult = database.fetchEventGameResult(eventId: event.eventId)
         if notifyList {
             notifyEventUpdated()
@@ -1193,6 +2187,24 @@ final class EventDetailViewModel: ObservableObject {
 
     @MainActor
     func findGameScore() async {
+        await lookupGameCandidates(autoSaveSingleMatch: true)
+    }
+
+    /// AI Assist path — always ask the user to confirm, even for a single match.
+    @MainActor
+    func findGameScoreForConfirm() async {
+        await lookupGameCandidates(autoSaveSingleMatch: false)
+    }
+
+    func dismissGameLookupCandidates() {
+        showGameLookupCandidates = false
+        if objectRecognitionStatus?.hasPrefix("AI Assist") == true {
+            objectRecognitionStatus = nil
+        }
+    }
+
+    @MainActor
+    private func lookupGameCandidates(autoSaveSingleMatch: Bool) async {
         guard !isLookingUpGameScore else { return }
         isLookingUpGameScore = true
         gameLookupStatus = "Looking up games…"
@@ -1225,13 +2237,22 @@ final class EventDetailViewModel: ObservableObject {
                 latitude: latitude,
                 longitude: longitude
             )
+            // Stadium match without sporting tag still warrants confirm when AI Assist ran.
+            if result.candidates.isEmpty, result.stadiums.isEmpty {
+                gameLookupStatus = "No matching games"
+                return
+            }
             gameLookupCandidates = result.candidates
-            if result.candidates.count == 1, let only = result.candidates.first {
+            if autoSaveSingleMatch,
+               result.candidates.count == 1,
+               let only = result.candidates.first {
                 saveGameCandidate(only)
                 gameLookupStatus = "Saved \(only.coverScoreLine)"
+            } else if result.candidates.isEmpty {
+                gameLookupStatus = "Stadium matched · no games found"
             } else {
                 showGameLookupCandidates = true
-                gameLookupStatus = "\(result.candidates.count) matching games"
+                gameLookupStatus = "\(result.candidates.count) matching games — confirm"
             }
         } catch {
             gameLookupStatus = error.localizedDescription
@@ -1278,11 +2299,17 @@ final class EventDetailViewModel: ObservableObject {
     }
 
     func applySuggestedName() {
-        guard let name = suggestedName else { return }
+        guard let name = suggestedName?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !name.isEmpty else {
+            return
+        }
+        guard !userEditedName else { return }
 
         eventName = name
         userEditedName = false
-        saveEventName()
+        guard saveEventName() else { return }
+        // Reload so list/detail share the saved AI name + tags.
+        refreshEvent(notifyList: true)
     }
 
     @discardableResult
@@ -1433,21 +2460,5 @@ final class EventDetailViewModel: ObservableObject {
 
         // Preserve visually refined stacks — do not metadata-regroup.
         refreshDisplayItemsPreservingGroups()
-    }
-
-    func logVisionLabelsForPhoto(_ photo: IndexedPhoto) {
-        visionLabelDebugTask?.cancel()
-        visionLabelDebugTask = Task {
-            visionLabelDebugStatus = "Analyzing Vision labels…"
-
-            let objectKeys = database.christmasObjectKeysForVisionDebug()
-            let result = await VisionLabelDebugService.analyze(
-                assetIdentifier: photo.id,
-                objectKeys: objectKeys
-            )
-
-            guard !Task.isCancelled else { return }
-            visionLabelDebugStatus = result.statusMessage
-        }
     }
 }

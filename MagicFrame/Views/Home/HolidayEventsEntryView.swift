@@ -44,7 +44,7 @@ struct HolidayEventsEntryView: View {
                     filter: listFilter,
                     vm: vm,
                     runsDateRepairOnLoad: false,
-                    onBack: { vm.clearEventsTabFocus() },
+                    onBack: { vm.requestReturnToHolidaysHub() },
                     landingTitle: "\(tagValue) Events"
                 )
             }
@@ -54,9 +54,12 @@ struct HolidayEventsEntryView: View {
         .toolbar {
             if phase != .ready {
                 ToolbarItem(placement: .topBarLeading) {
-                    EventsTabBackButton(action: { vm.clearEventsTabFocus() })
+                    EventsTabBackButton(action: { vm.requestReturnToHolidaysHub() })
                 }
             }
+        }
+        .onAppear {
+            vm.setMainTabChromeMode(.full)
         }
         .task {
             await runEventsPipelineIfNeeded()

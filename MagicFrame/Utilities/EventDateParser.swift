@@ -47,6 +47,38 @@ enum EventDateParser {
         return "\(displayFormatter.string(from: start)) – \(displayFormatter.string(from: end))"
     }
 
+    /// Event detail: "MMMM d, yyyy" or multi-day "MMMM d - MMMM d, yyyy".
+    static func detailDisplayDateRange(startDate: String, endDate: String) -> String? {
+        guard let start = parseDate(startDate) else { return nil }
+
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "MMMM d, yyyy"
+
+        guard let end = parseDate(endDate) else {
+            return formatter.string(from: start)
+        }
+
+        let calendar = Calendar.current
+        if calendar.isDate(start, inSameDayAs: end) {
+            return formatter.string(from: start)
+        }
+
+        let startYear = calendar.component(.year, from: start)
+        let endYear = calendar.component(.year, from: end)
+
+        if startYear == endYear {
+            formatter.dateFormat = "MMMM d"
+            let startText = formatter.string(from: start)
+            let endText = formatter.string(from: end)
+            formatter.dateFormat = "yyyy"
+            return "\(startText) - \(endText), \(formatter.string(from: start))"
+        }
+
+        formatter.dateFormat = "MMMM d, yyyy"
+        return "\(formatter.string(from: start)) - \(formatter.string(from: end))"
+    }
+
     static func nameIsDateOnly(_ name: String, startDate: String, endDate: String) -> Bool {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }

@@ -16,6 +16,16 @@ final class PhotoRepository {
     static let faceMetricsAlgorithmVersionKey = "faceMetricsAlgorithmVersion"
     static let cropAlgorithmVersionKey = "cropAlgorithmVersion"
 
+    /// Capture date used for UI / sorting when the user has adjusted dates in MagicFrame only.
+    private static let effectiveCreationDateSQL = """
+    COALESCE(NULLIF(TRIM(p.captureDateOverride), ''), p.creationDate)
+    """
+    private static let effectiveCreationDateUnqualifiedSQL = """
+    COALESCE(NULLIF(TRIM(captureDateOverride), ''), creationDate)
+    """
+    private static let effectiveLatitudeSQL = "COALESCE(p.userLatitude, p.latitude)"
+    private static let effectiveLongitudeSQL = "COALESCE(p.userLongitude, p.longitude)"
+
     private let database: DatabaseManager
     private let metadata: AppMetadataStore
     private var locations: LocationRepository?
@@ -161,6 +171,52 @@ final class PhotoRepository {
             }
         } else if let db {
             print("markPhotoVisionAnalyzed prepare failed: \(String(cString: sqlite3_errmsg(db)))")
+        }
+        sqlite3_finalize(statement)
+    }
+
+    func textRecognitionVersionUnsafe(photoId: String) -> Int {
+        let sql = """
+        SELECT COALESCE(textRecognitionVersion, 0)
+        FROM photos
+        WHERE id = ?
+        LIMIT 1;
+        """
+
+        var statement: OpaquePointer?
+        var version = 0
+
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            let photoIdNS = photoId as NSString
+            sqlite3_bind_text(statement, 1, photoIdNS.utf8String, -1, nil)
+            if sqlite3_step(statement) == SQLITE_ROW {
+                version = Int(sqlite3_column_int(statement, 0))
+            }
+        } else if let db {
+            print("textRecognitionVersion prepare failed: \(String(cString: sqlite3_errmsg(db)))")
+        }
+
+        sqlite3_finalize(statement)
+        return version
+    }
+
+    func markPhotoTextRecognizedUnsafe(photoId: String, version: Int) {
+        let sql = """
+        UPDATE photos
+        SET textRecognitionVersion = ?
+        WHERE id = ?;
+        """
+
+        var statement: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            let photoIdNS = photoId as NSString
+            sqlite3_bind_int(statement, 1, Int32(version))
+            sqlite3_bind_text(statement, 2, photoIdNS.utf8String, -1, nil)
+            if sqlite3_step(statement) != SQLITE_DONE {
+                print("Failed to mark photo text recognized: \(String(cString: sqlite3_errmsg(db)))")
+            }
+        } else if let db {
+            print("markPhotoTextRecognized prepare failed: \(String(cString: sqlite3_errmsg(db)))")
         }
         sqlite3_finalize(statement)
     }
@@ -536,11 +592,14 @@ final class PhotoRepository {
 
     func getRecentPhotos(limit: Int = 100) -> [IndexedPhoto] {
         let sql = """
-        SELECT id, creationDate, isFavorite, width, height, mediaSubtype,
-               latitude, longitude, isScreenshot, aspectRatio, orientation, qualityScore
+        SELECT id, \(Self.effectiveCreationDateUnqualifiedSQL) AS creationDate,
+               isFavorite, width, height, mediaSubtype,
+               COALESCE(userLatitude, latitude) AS latitude,
+               COALESCE(userLongitude, longitude) AS longitude,
+               isScreenshot, aspectRatio, orientation, qualityScore
         FROM photos
         WHERE isDeleted = 0
-        ORDER BY creationDate DESC
+        ORDER BY \(Self.effectiveCreationDateUnqualifiedSQL) DESC
         LIMIT ?;
         """
 
@@ -571,9 +630,12 @@ final class PhotoRepository {
         let uniqueIds = Array(Set(photoIds))
         let placeholders = Array(repeating: "?", count: uniqueIds.count).joined(separator: ", ")
         let sql = """
-        SELECT p.id, p.creationDate, p.isFavorite, p.width, p.height, p.mediaSubtype,
-               p.latitude, p.longitude, p.isScreenshot, p.aspectRatio, p.orientation, p.qualityScore,
-               p.faceEyesOpenScore, p.faceSmileScore,
+        SELECT p.id, \(Self.effectiveCreationDateSQL) AS creationDate,
+               p.isFavorite, p.width, p.height, p.mediaSubtype,
+               \(Self.effectiveLatitudeSQL) AS latitude,
+               \(Self.effectiveLongitudeSQL) AS longitude,
+               p.isScreenshot, p.aspectRatio, p.orientation, p.qualityScore,
+               p.faceEyesOpenScore, p.faceSmileScore, p.locationId,
                COALESCE((
                    SELECT pe.includeInSlideshow
                    FROM photo_events pe
@@ -603,7 +665,7 @@ final class PhotoRepository {
             }
             while sqlite3_step(statement) == SQLITE_ROW {
                 let photo = readBrowserPhotoRow(from: statement)
-                let mediaType = Int(sqlite3_column_int(statement, 16))
+                let mediaType = Int(sqlite3_column_int(statement, 17))
                 byId[photo.id] = (photo, mediaType)
             }
         } else if let db {
@@ -613,6 +675,115 @@ final class PhotoRepository {
         sqlite3_finalize(statement)
 
         return photoIds.compactMap { byId[$0] }
+    }
+
+    /// Loads browser rows for `photoIds` whose capture year, or import year, is `year`.
+    /// Ids are queried in chunks so a large match set stays under SQLite's bind limit.
+    func fetchPhotosForBrowser(
+        photoIds: [String],
+        year: Int,
+        useImportDate: Bool
+    ) -> [(photo: IndexedPhoto, mediaType: Int, indexedAt: String)] {
+        sync {
+            fetchPhotosForBrowserMatchingYearUnsafe(
+                photoIds: photoIds,
+                year: year,
+                useImportDate: useImportDate
+            )
+        }
+    }
+
+    private func fetchPhotosForBrowserMatchingYearUnsafe(
+        photoIds: [String],
+        year: Int,
+        useImportDate: Bool
+    ) -> [(photo: IndexedPhoto, mediaType: Int, indexedAt: String)] {
+        let uniqueIds = Array(Set(photoIds))
+        guard !uniqueIds.isEmpty, year >= 1000, year <= 9999 else { return [] }
+
+        let dateExpr = useImportDate
+            ? "COALESCE(p.indexedAt, '')"
+            : Self.effectiveCreationDateSQL
+        let yearText = String(year)
+        let chunkSize = 400
+        var rows: [(photo: IndexedPhoto, mediaType: Int, indexedAt: String)] = []
+        var start = uniqueIds.startIndex
+        while start < uniqueIds.endIndex {
+            let end = uniqueIds.index(start, offsetBy: chunkSize, limitedBy: uniqueIds.endIndex)
+                ?? uniqueIds.endIndex
+            let chunk = Array(uniqueIds[start..<end])
+            rows.append(contentsOf: fetchBrowserYearChunkUnsafe(
+                photoIds: chunk,
+                yearText: yearText,
+                dateExpr: dateExpr
+            ))
+            start = end
+        }
+        return rows
+    }
+
+    private func fetchBrowserYearChunkUnsafe(
+        photoIds: [String],
+        yearText: String,
+        dateExpr: String
+    ) -> [(photo: IndexedPhoto, mediaType: Int, indexedAt: String)] {
+        let placeholders = Array(repeating: "?", count: photoIds.count).joined(separator: ", ")
+        let sql = """
+        SELECT p.id, \(Self.effectiveCreationDateSQL) AS creationDate,
+               p.isFavorite, p.width, p.height, p.mediaSubtype,
+               \(Self.effectiveLatitudeSQL) AS latitude,
+               \(Self.effectiveLongitudeSQL) AS longitude,
+               p.isScreenshot, p.aspectRatio, p.orientation, p.qualityScore,
+               p.faceEyesOpenScore, p.faceSmileScore, p.locationId,
+               COALESCE((
+                   SELECT pe.includeInSlideshow
+                   FROM photo_events pe
+                   WHERE pe.photoId = p.id
+                   ORDER BY pe.includeInSlideshow DESC, pe.eventId ASC
+                   LIMIT 1
+               ), 0) AS showOnFrame,
+               COALESCE((
+                   SELECT pe.manuallyExcluded
+                   FROM photo_events pe
+                   WHERE pe.photoId = p.id
+                   ORDER BY pe.manuallyExcluded DESC, pe.eventId ASC
+                   LIMIT 1
+               ), 0) AS isHiddenInEvent,
+               COALESCE(p.mediaType, 0) AS mediaType,
+               COALESCE(p.indexedAt, '') AS indexedAt
+        FROM photos p
+        WHERE p.isDeleted = 0
+          AND substr(\(dateExpr), 1, 4) = ?
+          AND p.id IN (\(placeholders));
+        """
+
+        var statement: OpaquePointer?
+        var rows: [(photo: IndexedPhoto, mediaType: Int, indexedAt: String)] = []
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            if let db {
+                print("fetchPhotosForBrowser year chunk failed: \(String(cString: sqlite3_errmsg(db)))")
+            }
+            return []
+        }
+        defer { sqlite3_finalize(statement) }
+
+        sqlite3_bind_text(statement, 1, (yearText as NSString).utf8String, -1, nil)
+        for (index, photoId) in photoIds.enumerated() {
+            sqlite3_bind_text(
+                statement,
+                Int32(index + 2),
+                (photoId as NSString).utf8String,
+                -1,
+                nil
+            )
+        }
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let photo = readBrowserPhotoRow(from: statement)
+            let mediaType = Int(sqlite3_column_int(statement, 17))
+            let indexedAt = sqlite3_column_text(statement, 18).map { String(cString: $0) } ?? ""
+            rows.append((photo, mediaType, indexedAt))
+        }
+        return rows
     }
 
     /// Every indexed photo for the All Photos grid, including the date it was imported.
@@ -643,15 +814,15 @@ final class PhotoRepository {
         let flagsYearFilter: String
         if let year, year >= 1000, year <= 9999 {
             yearFilter = """
-              AND p.creationDate >= '\(year)-01-01'
-              AND p.creationDate < '\(year + 1)-01-01'
+              AND \(Self.effectiveCreationDateSQL) >= '\(year)-01-01'
+              AND \(Self.effectiveCreationDateSQL) < '\(year + 1)-01-01'
             """
             flagsYearFilter = """
               AND pe.photoId IN (
                 SELECT id FROM photos
                 WHERE isDeleted = 0
-                  AND creationDate >= '\(year)-01-01'
-                  AND creationDate < '\(year + 1)-01-01'
+                  AND \(Self.effectiveCreationDateUnqualifiedSQL) >= '\(year)-01-01'
+                  AND \(Self.effectiveCreationDateUnqualifiedSQL) < '\(year + 1)-01-01'
               )
             """
         } else {
@@ -660,9 +831,12 @@ final class PhotoRepository {
         }
 
         let sql = """
-        SELECT p.id, p.creationDate, p.isFavorite, p.width, p.height, p.mediaSubtype,
-               p.latitude, p.longitude, p.isScreenshot, p.aspectRatio, p.orientation, p.qualityScore,
-               p.faceEyesOpenScore, p.faceSmileScore,
+        SELECT p.id, \(Self.effectiveCreationDateSQL) AS creationDate,
+               p.isFavorite, p.width, p.height, p.mediaSubtype,
+               \(Self.effectiveLatitudeSQL) AS latitude,
+               \(Self.effectiveLongitudeSQL) AS longitude,
+               p.isScreenshot, p.aspectRatio, p.orientation, p.qualityScore,
+               p.faceEyesOpenScore, p.faceSmileScore, p.locationId,
                COALESCE(flags.showOnFrame, 0) AS showOnFrame,
                COALESCE(flags.isHiddenInEvent, 0) AS isHiddenInEvent,
                COALESCE(p.mediaType, 0) AS mediaType,
@@ -680,7 +854,7 @@ final class PhotoRepository {
         ) AS flags ON flags.photoId = p.id
         WHERE p.isDeleted = 0
           \(yearFilter)
-        ORDER BY p.creationDate DESC, p.id DESC;
+        ORDER BY \(Self.effectiveCreationDateSQL) DESC, p.id DESC;
         """
 
         var statement: OpaquePointer?
@@ -689,8 +863,8 @@ final class PhotoRepository {
         if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
             while sqlite3_step(statement) == SQLITE_ROW {
                 let photo = readBrowserPhotoRow(from: statement)
-                let mediaType = Int(sqlite3_column_int(statement, 16))
-                let indexedAt = sqlite3_column_text(statement, 17).map { String(cString: $0) } ?? ""
+                let mediaType = Int(sqlite3_column_int(statement, 17))
+                let indexedAt = sqlite3_column_text(statement, 18).map { String(cString: $0) } ?? ""
                 rows.append((photo, mediaType, indexedAt))
             }
         } else if let db {
@@ -703,10 +877,10 @@ final class PhotoRepository {
 
     private func fetchDistinctPhotoYearsForBrowserUnsafe() -> [Int] {
         let sql = """
-        SELECT DISTINCT SUBSTR(creationDate, 1, 4) AS year
+        SELECT DISTINCT SUBSTR(\(Self.effectiveCreationDateUnqualifiedSQL), 1, 4) AS year
         FROM photos
         WHERE isDeleted = 0
-          AND LENGTH(creationDate) >= 4
+          AND LENGTH(\(Self.effectiveCreationDateUnqualifiedSQL)) >= 4
         ORDER BY year DESC;
         """
         var statement: OpaquePointer?
@@ -740,6 +914,175 @@ final class PhotoRepository {
         sync { setPhotosFavoriteUnsafe(photoIds: photoIds, isFavorite: isFavorite) }
     }
 
+    /// Stores MF capture dates in `captureDateOverride` so library re-import cannot wipe them.
+    func shiftPhotoCaptureDates(updates: [(photoId: String, newCreationDate: Date)]) {
+        sync { shiftPhotoCaptureDatesUnsafe(updates: updates) }
+    }
+
+    func shiftPhotoCaptureDatesUnsafe(updates: [(photoId: String, newCreationDate: Date)]) {
+        guard !updates.isEmpty else { return }
+
+        let iso8601 = ISO8601DateFormatter()
+        let now = iso8601.string(from: Date())
+        let sql = """
+        UPDATE photos
+        SET captureDateOverride = ?,
+            indexedAt = ?
+        WHERE id = ?;
+        """
+
+        var statement: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) != SQLITE_OK {
+            print("Failed to prepare shiftPhotoCaptureDates: \(String(cString: sqlite3_errmsg(db)))")
+            return
+        }
+
+        for update in updates {
+            let overrideISO = iso8601.string(from: update.newCreationDate)
+            sqlite3_reset(statement)
+            sqlite3_clear_bindings(statement)
+            sqlite3_bind_text(statement, 1, (overrideISO as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, 2, (now as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, 3, (update.photoId as NSString).utf8String, -1, nil)
+            if sqlite3_step(statement) != SQLITE_DONE {
+                print("Failed shiftPhotoCaptureDates for \(update.photoId): \(String(cString: sqlite3_errmsg(db)))")
+            }
+        }
+        sqlite3_finalize(statement)
+    }
+
+    /// After a successful Apple Photos write, mirror dates into library `creationDate` and clear overrides.
+    func promoteCaptureDatesAfterPhotosSync(updates: [(photoId: String, newCreationDate: Date)]) {
+        sync { promoteCaptureDatesAfterPhotosSyncUnsafe(updates: updates) }
+    }
+
+    func promoteCaptureDatesAfterPhotosSyncUnsafe(
+        updates: [(photoId: String, newCreationDate: Date)]
+    ) {
+        guard !updates.isEmpty else { return }
+
+        let iso8601 = ISO8601DateFormatter()
+        let now = iso8601.string(from: Date())
+        let sql = """
+        UPDATE photos
+        SET creationDate = ?,
+            captureDateOverride = NULL,
+            indexedAt = ?
+        WHERE id = ?;
+        """
+
+        var statement: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) != SQLITE_OK {
+            print("Failed to prepare promoteCaptureDatesAfterPhotosSync: \(String(cString: sqlite3_errmsg(db)))")
+            return
+        }
+
+        for update in updates {
+            let creationISO = iso8601.string(from: update.newCreationDate)
+            sqlite3_reset(statement)
+            sqlite3_clear_bindings(statement)
+            sqlite3_bind_text(statement, 1, (creationISO as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, 2, (now as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, 3, (update.photoId as NSString).utf8String, -1, nil)
+            if sqlite3_step(statement) != SQLITE_DONE {
+                print("Failed promoteCaptureDatesAfterPhotosSync for \(update.photoId): \(String(cString: sqlite3_errmsg(db)))")
+            }
+        }
+        sqlite3_finalize(statement)
+    }
+
+    /// Stores MF GPS in user overrides so library re-import cannot wipe them. Does not touch event membership.
+    func shiftPhotoLocations(
+        updates: [(photoId: String, latitude: Double, longitude: Double, locationId: Int?)]
+    ) {
+        sync { shiftPhotoLocationsUnsafe(updates: updates) }
+    }
+
+    func shiftPhotoLocationsUnsafe(
+        updates: [(photoId: String, latitude: Double, longitude: Double, locationId: Int?)]
+    ) {
+        guard !updates.isEmpty else { return }
+
+        let iso8601 = ISO8601DateFormatter()
+        let now = iso8601.string(from: Date())
+        let sql = """
+        UPDATE photos
+        SET userLatitude = ?,
+            userLongitude = ?,
+            locationId = ?,
+            indexedAt = ?
+        WHERE id = ?;
+        """
+
+        var statement: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) != SQLITE_OK {
+            print("Failed to prepare shiftPhotoLocations: \(String(cString: sqlite3_errmsg(db)))")
+            return
+        }
+
+        for update in updates {
+            sqlite3_reset(statement)
+            sqlite3_clear_bindings(statement)
+            sqlite3_bind_double(statement, 1, update.latitude)
+            sqlite3_bind_double(statement, 2, update.longitude)
+            if let locationId = update.locationId {
+                sqlite3_bind_int(statement, 3, Int32(locationId))
+            } else {
+                sqlite3_bind_null(statement, 3)
+            }
+            sqlite3_bind_text(statement, 4, (now as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, 5, (update.photoId as NSString).utf8String, -1, nil)
+            if sqlite3_step(statement) != SQLITE_DONE {
+                print("Failed shiftPhotoLocations for \(update.photoId): \(String(cString: sqlite3_errmsg(db)))")
+            }
+        }
+        sqlite3_finalize(statement)
+    }
+
+    /// After a successful Apple Photos location write, mirror into library GPS and clear user overrides.
+    func promoteLocationsAfterPhotosSync(
+        updates: [(photoId: String, latitude: Double, longitude: Double)]
+    ) {
+        sync { promoteLocationsAfterPhotosSyncUnsafe(updates: updates) }
+    }
+
+    func promoteLocationsAfterPhotosSyncUnsafe(
+        updates: [(photoId: String, latitude: Double, longitude: Double)]
+    ) {
+        guard !updates.isEmpty else { return }
+
+        let iso8601 = ISO8601DateFormatter()
+        let now = iso8601.string(from: Date())
+        let sql = """
+        UPDATE photos
+        SET latitude = ?,
+            longitude = ?,
+            userLatitude = NULL,
+            userLongitude = NULL,
+            indexedAt = ?
+        WHERE id = ?;
+        """
+
+        var statement: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) != SQLITE_OK {
+            print("Failed to prepare promoteLocationsAfterPhotosSync: \(String(cString: sqlite3_errmsg(db)))")
+            return
+        }
+
+        for update in updates {
+            sqlite3_reset(statement)
+            sqlite3_clear_bindings(statement)
+            sqlite3_bind_double(statement, 1, update.latitude)
+            sqlite3_bind_double(statement, 2, update.longitude)
+            sqlite3_bind_text(statement, 3, (now as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, 4, (update.photoId as NSString).utf8String, -1, nil)
+            if sqlite3_step(statement) != SQLITE_DONE {
+                print("Failed promoteLocationsAfterPhotosSync for \(update.photoId): \(String(cString: sqlite3_errmsg(db)))")
+            }
+        }
+        sqlite3_finalize(statement)
+    }
+
     func setPhotosFavoriteUnsafe(photoIds: [String], isFavorite: Bool) {
         guard !photoIds.isEmpty else { return }
 
@@ -764,8 +1107,12 @@ final class PhotoRepository {
 
     private func readBrowserPhotoRow(from statement: OpaquePointer?) -> IndexedPhoto {
         let base = readIndexedPhotoRow(from: statement)
-        let showOnFrame = sqlite3_column_int(statement, 14) == 1
-        let isHiddenInEvent = sqlite3_column_int(statement, 15) == 1
+        let locationId =
+            sqlite3_column_type(statement, 14) == SQLITE_NULL
+            ? nil
+            : Int(sqlite3_column_int(statement, 14))
+        let showOnFrame = sqlite3_column_int(statement, 15) == 1
+        let isHiddenInEvent = sqlite3_column_int(statement, 16) == 1
         return IndexedPhoto(
             id: base.id,
             creationDate: base.creationDate,
@@ -775,6 +1122,7 @@ final class PhotoRepository {
             mediaSubtype: base.mediaSubtype,
             latitude: base.latitude,
             longitude: base.longitude,
+            locationId: locationId,
             isScreenshot: base.isScreenshot,
             aspectRatio: base.aspectRatio,
             orientation: base.orientation,
@@ -784,8 +1132,161 @@ final class PhotoRepository {
             showOnFrame: showOnFrame,
             isHiddenInEvent: isHiddenInEvent,
             isSimilarGroupPick: false,
-            isVideo: sqlite3_column_int(statement, 16) == 2
+            isVideo: sqlite3_column_int(statement, 17) == 2
         )
+    }
+
+    func setPhotoLocationIdUnsafe(photoId: String, locationId: Int?) {
+        guard let db else { return }
+        let sql = "UPDATE photos SET locationId = ? WHERE id = ?;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(statement) }
+        if let locationId {
+            sqlite3_bind_int(statement, 1, Int32(locationId))
+        } else {
+            sqlite3_bind_null(statement, 1)
+        }
+        sqlite3_bind_text(statement, 2, (photoId as NSString).utf8String, -1, nil)
+        sqlite3_step(statement)
+    }
+
+    /// GPS + existing locationId for assign/header paths. Prefers user overrides.
+    func photoLocationAssignRowUnsafe(photoId: String) -> (
+        locationId: Int?,
+        latitude: Double?,
+        longitude: Double?,
+        captureDate: Date?
+    )? {
+        guard let db else { return nil }
+        let sql = """
+        SELECT locationId,
+               COALESCE(userLatitude, latitude),
+               COALESCE(userLongitude, longitude),
+               COALESCE(captureDateOverride, creationDate)
+        FROM photos
+        WHERE id = ? AND isDeleted = 0;
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, (photoId as NSString).utf8String, -1, nil)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+
+        let locationId =
+            sqlite3_column_type(statement, 0) == SQLITE_NULL
+            ? nil
+            : Int(sqlite3_column_int(statement, 0))
+        let latitude =
+            sqlite3_column_type(statement, 1) == SQLITE_NULL
+            ? nil
+            : sqlite3_column_double(statement, 1)
+        let longitude =
+            sqlite3_column_type(statement, 2) == SQLITE_NULL
+            ? nil
+            : sqlite3_column_double(statement, 2)
+        let captureDate: Date? = {
+            guard sqlite3_column_type(statement, 3) != SQLITE_NULL,
+                  let cString = sqlite3_column_text(statement, 3) else { return nil }
+            return EventDateParser.parseDate(String(cString: cString))
+        }()
+        return (locationId, latitude, longitude, captureDate)
+    }
+
+    /// indexedAt + locationId for event-detail sort grouping.
+    func fetchSortFieldsUnsafe(photoIds: [String]) -> [String: (indexedAt: String?, locationId: Int?)] {
+        guard !photoIds.isEmpty, let db else { return [:] }
+        let placeholders = Array(repeating: "?", count: photoIds.count).joined(separator: ", ")
+        let sql = """
+        SELECT id, indexedAt, locationId
+        FROM photos
+        WHERE isDeleted = 0
+          AND id IN (\(placeholders));
+        """
+        var statement: OpaquePointer?
+        var result: [String: (indexedAt: String?, locationId: Int?)] = [:]
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [:] }
+        defer { sqlite3_finalize(statement) }
+        for (index, photoId) in photoIds.enumerated() {
+            sqlite3_bind_text(statement, Int32(index + 1), (photoId as NSString).utf8String, -1, nil)
+        }
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let photoId = String(cString: sqlite3_column_text(statement, 0))
+            let indexedAt =
+                sqlite3_column_type(statement, 1) == SQLITE_NULL
+                ? nil
+                : String(cString: sqlite3_column_text(statement, 1))
+            let locationId =
+                sqlite3_column_type(statement, 2) == SQLITE_NULL
+                ? nil
+                : Int(sqlite3_column_int(statement, 2))
+            result[photoId] = (indexedAt, locationId)
+        }
+        return result
+    }
+
+    /// Event member photos with GPS (including ones that already have a `locationId`).
+    func photosWithGPSForEventUnsafe(eventId: Int) -> [(
+        photoId: String,
+        latitude: Double,
+        longitude: Double,
+        captureDate: Date,
+        locationId: Int?
+    )] {
+        guard let db else { return [] }
+        let sql = """
+        SELECT p.id,
+               COALESCE(p.userLatitude, p.latitude),
+               COALESCE(p.userLongitude, p.longitude),
+               COALESCE(p.captureDateOverride, p.creationDate),
+               p.locationId
+        FROM photos p
+        JOIN photo_events pe ON p.id = pe.photoId
+        WHERE p.isDeleted = 0
+          AND COALESCE(p.userLatitude, p.latitude) IS NOT NULL
+          AND COALESCE(p.userLongitude, p.longitude) IS NOT NULL
+          AND (
+            pe.eventId = ?
+            OR pe.eventId IN (
+                SELECT child.eventId
+                FROM events child
+                WHERE child.parentEventId = ?
+                  AND child.isDeleted = 0
+            )
+          );
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_int(statement, 1, Int32(eventId))
+        sqlite3_bind_int(statement, 2, Int32(eventId))
+
+        var rows: [(
+            photoId: String,
+            latitude: Double,
+            longitude: Double,
+            captureDate: Date,
+            locationId: Int?
+        )] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let photoId = String(cString: sqlite3_column_text(statement, 0))
+            let latitude = sqlite3_column_double(statement, 1)
+            let longitude = sqlite3_column_double(statement, 2)
+            let captureDate: Date = {
+                guard sqlite3_column_type(statement, 3) != SQLITE_NULL,
+                      let cString = sqlite3_column_text(statement, 3),
+                      let parsed = EventDateParser.parseDate(String(cString: cString)) else {
+                    return Date()
+                }
+                return parsed
+            }()
+            let locationId =
+                sqlite3_column_type(statement, 4) == SQLITE_NULL
+                ? nil
+                : Int(sqlite3_column_int(statement, 4))
+            rows.append((photoId, latitude, longitude, captureDate, locationId))
+        }
+        return rows
     }
 
     func updateFaceMetrics(
@@ -1359,6 +1860,19 @@ final class PhotoRepository {
 
         sqlite3_finalize(statement)
         return ids
+    }
+
+    /// Soft-deletes photos in MagicFrame (does not remove Apple Photos assets by itself).
+    func softDeletePhotos(photoIds: [String]) {
+        sync { softDeletePhotosUnsafe(photoIds: photoIds) }
+    }
+
+    func softDeletePhotosUnsafe(photoIds: [String]) {
+        guard !photoIds.isEmpty else { return }
+        let now = ISO8601DateFormatter().string(from: Date())
+        for photoId in photoIds {
+            markPhotoDeleted(photoId: photoId, deletedAt: now)
+        }
     }
 
     private func markPhotoDeleted(photoId: String, deletedAt: String) {

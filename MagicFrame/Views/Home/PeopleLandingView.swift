@@ -8,6 +8,12 @@ struct PeopleLandingView: View {
     @State private var mergingCluster: PersonClusterRecord?
     @State private var showResetFaceRecognitionConfirm = false
 
+    private let peopleColumns = [
+        GridItem(.flexible(), spacing: 16),
+        GridItem(.flexible(), spacing: 16),
+        GridItem(.flexible(), spacing: 16),
+    ]
+
     private let clusterColumns = [
         GridItem(.flexible(), spacing: 16),
         GridItem(.flexible(), spacing: 16),
@@ -29,6 +35,9 @@ struct PeopleLandingView: View {
         .background(Color(.systemGroupedBackground))
         .navigationTitle("People")
         .navigationBarTitleDisplayMode(.large)
+        .onAppear {
+            vm.setMainTabChromeMode(.landing)
+        }
         .task {
             vm.repairFaceRecognitionProgressIfNeeded()
             vm.resumeFaceRecognitionProgressMonitoringIfNeeded()
@@ -200,7 +209,7 @@ struct PeopleLandingView: View {
     @ViewBuilder
     private var namedPeopleSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Named people")
+            Text("People")
                 .font(.title3.weight(.semibold))
 
             if vm.isLoadingPeopleLanding && vm.peopleLandingItems.isEmpty {
@@ -212,41 +221,45 @@ struct PeopleLandingView: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             } else {
-                LazyVStack(spacing: 0) {
+                LazyVGrid(columns: peopleColumns, spacing: 20) {
                     ForEach(vm.peopleLandingItems) { person in
                         NavigationLink {
-                            PersonPhotosBrowserView(person: person)
+                            PersonDetailView(personId: person.personId)
                         } label: {
-                            HStack(spacing: 12) {
-                                Image(systemName: "person.crop.circle.fill")
-                                    .font(.title)
-                                    .foregroundStyle(Color(red: 0.9, green: 0.45, blue: 0.55))
-
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(person.displayName)
-                                        .font(.headline)
-                                        .foregroundStyle(.primary)
-                                    if let detail = personDetailLine(person) {
-                                        Text(detail)
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
+                            VStack(spacing: 8) {
+                                if let photoId = person.avatarPhotoId {
+                                    FaceCircleAvatar(
+                                        photoId: photoId,
+                                        faceBoundingBox: person.avatarBoundingBox,
+                                        size: 96
+                                    )
+                                } else {
+                                    Circle()
+                                        .fill(Color(.secondarySystemFill))
+                                        .frame(width: 96, height: 96)
+                                        .overlay {
+                                            Image(systemName: "person.fill")
+                                                .foregroundStyle(.secondary)
+                                        }
                                 }
 
-                                Spacer(minLength: 8)
-                                Image(systemName: "chevron.right")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.tertiary)
+                                Text(person.displayName)
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(2)
+                                    .multilineTextAlignment(.center)
+
+                                Text(
+                                    "\(person.photoCount) photo\(person.photoCount == 1 ? "" : "s")"
+                                )
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
                             }
-                            .padding(.vertical, 10)
+                            .frame(maxWidth: .infinity)
                         }
-                        if person.id != vm.peopleLandingItems.last?.id {
-                            Divider()
-                        }
+                        .buttonStyle(.plain)
                     }
                 }
-                .padding(.horizontal, 12)
-                .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12))
             }
         }
     }
@@ -334,24 +347,14 @@ struct PeopleLandingView: View {
         return "\(faces) face\(faces == 1 ? "" : "s")"
     }
 
-    private func personDetailLine(_ person: PeopleRepository.PersonRecord) -> String? {
-        var parts: [String] = []
-        if let first = person.firstName, let last = person.lastName {
-            parts.append("\(first) \(last)")
-        }
-        if let maiden = person.maidenName, !maiden.isEmpty {
-            parts.append("née \(maiden)")
-        }
-        guard !parts.isEmpty else { return nil }
-        let line = parts.joined(separator: " · ")
-        return line == person.displayName ? nil : line
-    }
 }
 
-private struct PersonPhotosBrowserView: View {
+struct PersonPhotosBrowserView: View {
     let person: PeopleRepository.PersonRecord
+    @EnvironmentObject private var libraryVM: LibraryViewModel
     @State private var photoIds: [String] = []
     @State private var isLoading = true
+    @State private var statusMessage: String?
 
     var body: some View {
         Group {
@@ -365,13 +368,26 @@ private struct PersonPhotosBrowserView: View {
                     description: Text("No photos linked to \(person.displayName) yet.")
                 )
             } else {
-                PictureBrowserView(
-                    title: "\(person.displayName) Photos",
-                    photoIds: photoIds,
-                    sortOptions: [.dateTaken],
-                    usesNavigationTitle: true,
-                    enablesVideoFilter: true
-                )
+                VStack(spacing: 0) {
+                    if let statusMessage {
+                        Text(statusMessage)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 8)
+                    }
+                    PictureBrowserView(
+                        title: person.displayName,
+                        photoIds: photoIds,
+                        sortOptions: [.dateTaken],
+                        usesNavigationTitle: true,
+                        enablesVideoFilter: true,
+                        onUseAsProfilePicture: { photoId in
+                            Task { await setProfilePicture(photoId: photoId) }
+                        }
+                    )
+                }
             }
         }
         .navigationBarTitleDisplayMode(.inline)
@@ -381,6 +397,25 @@ private struct PersonPhotosBrowserView: View {
                 PhotoDatabase.shared.fetchPhotoIdsForPerson(personId: person.personId)
             }.value
             isLoading = false
+        }
+    }
+
+    @MainActor
+    private func setProfilePicture(photoId: String) async {
+        let personId = person.personId
+        let ok = await Task.detached(priority: .userInitiated) {
+            AppDependencies.database.setPersonProfilePicture(
+                personId: personId,
+                photoId: photoId
+            )
+        }.value
+        if ok {
+            FaceCircleAvatar.clearCache()
+            await libraryVM.refreshPeopleLandingItems()
+            statusMessage = "Profile picture updated."
+        } else {
+            statusMessage =
+                "No face for \(person.displayName) on that photo. Pick a photo where their face is detected."
         }
     }
 }

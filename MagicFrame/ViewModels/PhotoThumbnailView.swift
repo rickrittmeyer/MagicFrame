@@ -36,6 +36,7 @@ struct PhotoThumbnailView: View {
 
     @State private var image: UIImage?
     @State private var loadedTargetSize: CGSize = .zero
+    @State private var loadedQuality: Quality?
     @State private var resolvedCropFocus: CGPoint?
     @State private var detectedIsVideo = false
 
@@ -76,19 +77,31 @@ struct PhotoThumbnailView: View {
         return isVideo ?? detectedIsVideo
     }
 
+    private var fastCacheKey: String {
+        PhotoThumbnailImageCache.key(assetIdentifier: assetIdentifier, quality: "fast")
+    }
+
+    private var highCacheKey: String {
+        PhotoThumbnailImageCache.key(assetIdentifier: assetIdentifier, quality: "high")
+    }
+
     private var thumbnailCacheKey: String {
-        PhotoThumbnailImageCache.key(
-            assetIdentifier: assetIdentifier,
-            quality: quality == .high ? "high" : "fast"
-        )
+        quality == .high ? highCacheKey : fastCacheKey
     }
 
     @MainActor
     private func restoreCachedImageIfNeeded() {
-        guard image == nil, let cached = PhotoThumbnailImageCache.image(for: thumbnailCacheKey) else {
+        // Prefer a sharp cached frame when available (even if the row asked for .fast).
+        if let high = PhotoThumbnailImageCache.image(for: highCacheKey) {
+            image = high
+            loadedQuality = .high
             return
         }
-        image = cached
+        guard image == nil, let fast = PhotoThumbnailImageCache.image(for: fastCacheKey) else {
+            return
+        }
+        image = fast
+        loadedQuality = .fast
     }
 
     private var usesCustomCrop: Bool {
@@ -149,18 +162,9 @@ struct PhotoThumbnailView: View {
 
     @MainActor
     private func loadThumbnail(for size: CGSize) async {
-        if image == nil, let cached = PhotoThumbnailImageCache.image(for: thumbnailCacheKey) {
-            image = cached
-            if isVideo == nil {
-                detectedIsVideo = PhotoAssetKind.isVideo(assetIdentifier: assetIdentifier)
-            }
-            if size.width > 1, size.height > 1 {
-                loadedTargetSize = CGSize(
-                    width: size.width * displayScale,
-                    height: size.height * displayScale
-                )
-            }
-            return
+        restoreCachedImageIfNeeded()
+        if isVideo == nil, image != nil {
+            detectedIsVideo = PhotoAssetKind.isVideo(assetIdentifier: assetIdentifier)
         }
 
         // Ignore collapse/layout passes during navigation transitions.
@@ -175,14 +179,25 @@ struct PhotoThumbnailView: View {
             height: size.height * displayScale
         )
 
-        if let image, loadedTargetSize.width > 10 {
+        // Keep a sharp frame while the list temporarily asks for .fast during scroll.
+        if quality == .fast, loadedQuality == .high, image != nil {
+            return
+        }
+
+        // Already have a matching-quality frame at a similar size.
+        if loadedQuality == quality, let image, loadedTargetSize.width > 10 {
             let widthRatio = targetSize.width / loadedTargetSize.width
             if image.size.width > 0, widthRatio > 0.75, widthRatio < 1.35 {
                 return
             }
         }
 
-        if targetSize == loadedTargetSize, image != nil {
+        if targetSize == loadedTargetSize, loadedQuality == quality, image != nil {
+            return
+        }
+
+        // Fast path satisfied by cache — still allow .high to upgrade below.
+        if quality == .fast, loadedQuality == .fast, image != nil {
             return
         }
 
@@ -202,8 +217,9 @@ struct PhotoThumbnailView: View {
 
         let options = PHImageRequestOptions()
         options.isNetworkAccessAllowed = true
+        let requestQuality = quality
 
-        switch quality {
+        switch requestQuality {
         case .fast:
             options.deliveryMode = .fastFormat
             options.resizeMode = .fast
@@ -211,16 +227,19 @@ struct PhotoThumbnailView: View {
                 for: asset,
                 targetSize: targetSize,
                 options: options,
-                waitForFinalQuality: false
+                waitForFinalQuality: false,
+                requestedQuality: requestQuality
             )
         case .high:
+            // Keep the current (possibly fast) image visible until high delivers.
             options.deliveryMode = .opportunistic
             options.resizeMode = .exact
             await requestImage(
                 for: asset,
                 targetSize: targetSize,
                 options: options,
-                waitForFinalQuality: true
+                waitForFinalQuality: true,
+                requestedQuality: requestQuality
             )
         }
     }
@@ -230,13 +249,15 @@ struct PhotoThumbnailView: View {
         for asset: PHAsset,
         targetSize: CGSize,
         options: PHImageRequestOptions,
-        waitForFinalQuality: Bool
+        waitForFinalQuality: Bool,
+        requestedQuality: Quality
     ) async {
         final class RequestSession: @unchecked Sendable {
             var requestID = PHImageRequestID(PHInvalidImageRequestID)
             var deliveredImage = false
         }
         let session = RequestSession()
+        let cacheKey = requestedQuality == .high ? highCacheKey : fastCacheKey
 
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
@@ -274,7 +295,11 @@ struct PhotoThumbnailView: View {
                             session.deliveredImage = true
                             // Don't cache opportunistic placeholders — they stick as blurry "high" thumbs.
                             if !isDegraded || !waitForFinalQuality {
-                                PhotoThumbnailImageCache.store(result, for: self.thumbnailCacheKey)
+                                PhotoThumbnailImageCache.store(result, for: cacheKey)
+                                self.loadedQuality = requestedQuality
+                            } else if self.loadedQuality == nil {
+                                // Show degraded high preview without demoting a sharper cached frame.
+                                self.loadedQuality = .fast
                             }
                             self.image = result
                             self.loadedTargetSize = targetSize

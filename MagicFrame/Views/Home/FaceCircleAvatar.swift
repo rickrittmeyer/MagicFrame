@@ -14,12 +14,13 @@ struct FaceCircleAvatar: View {
     private var taskKey: String {
         guard let faceBoundingBox else { return "\(photoId)|full" }
         return String(
-            format: "%@|%.4f,%.4f,%.4f,%.4f|v5",
+            format: "%@|%.4f,%.4f,%.4f,%.4f|%.0f|v6hq",
             photoId,
             faceBoundingBox.origin.x,
             faceBoundingBox.origin.y,
             faceBoundingBox.size.width,
-            faceBoundingBox.size.height
+            faceBoundingBox.size.height,
+            size
         )
     }
 
@@ -59,8 +60,8 @@ struct FaceCircleAvatar: View {
 
     private static let cropCache: NSCache<NSString, UIImage> = {
         let cache = NSCache<NSString, UIImage>()
-        cache.countLimit = 24
-        cache.totalCostLimit = 6 * 1024 * 1024
+        cache.countLimit = 48
+        cache.totalCostLimit = 24 * 1024 * 1024
         return cache
     }()
 
@@ -78,24 +79,30 @@ struct FaceCircleAvatar: View {
             return cached
         }
 
-        // Memory-first: modest decode. Representatives are already large faces.
-        let target = min(720, max(480, displaySize * UIScreen.main.scale * 2.5))
+        // High-quality decode sized for retina circle display (face crop needs headroom).
+        let scale = UIScreen.main.scale
+        let faceFraction = max(faceBoundingBox.width, faceBoundingBox.height)
+        let faceBoost = faceFraction > 0 ? min(1.0 / faceFraction, 6.0) : 3.0
+        let target = min(
+            2400,
+            max(1024, displaySize * scale * max(faceBoost, 2.5))
+        )
 
         guard let cgImage = await PhotoAssetImageLoader.loadCGImage(
             assetIdentifier: photoId,
             targetPixelSize: target,
-            preferFastDecode: true
+            preferFastDecode: false
         ) else {
             return nil
         }
 
-        let croppedImage = await Task.detached(priority: .utility) {
+        let croppedImage = await Task.detached(priority: .userInitiated) {
             autoreleasepool { () -> UIImage? in
                 guard let cropped = FaceRecognitionAnalyzer.croppedFaceImage(
                     from: cgImage,
                     normalizedBox: faceBoundingBox,
-                    padding: 0.32,
-                    verticalBias: 0.10
+                    padding: 0.28,
+                    verticalBias: 0.08
                 ) else {
                     return nil
                 }

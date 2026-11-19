@@ -7,6 +7,8 @@ struct EventListDisplayItem: Identifiable {
     let slideshowPhotoIds: [String]
     /// True when any still/video in this event (or a trip child day) has includeInSlideshow.
     let hasOnFramePhotos: Bool
+    /// Best on-frame video for muted inline cover playback (nil if none).
+    let onFrameVideoId: String?
     /// Score bar on cover photos: away over home, scores right-aligned.
     let gameCoverScoreBoard: GameCoverScoreBoard?
     /// Suggested list title when the user has not edited the name: "Home vs Away".
@@ -22,6 +24,7 @@ struct EventListDisplayItem: Identifiable {
         event: IndexedEvent,
         slideshowPhotoIds: [String] = [],
         hasOnFramePhotos: Bool = false,
+        onFrameVideoId: String? = nil,
         gameCoverScoreBoard: GameCoverScoreBoard? = nil,
         gameSuggestedName: String? = nil,
         gameLeague: SportsLeague? = nil,
@@ -30,6 +33,7 @@ struct EventListDisplayItem: Identifiable {
         self.event = event
         self.slideshowPhotoIds = slideshowPhotoIds
         self.hasOnFramePhotos = hasOnFramePhotos
+        self.onFrameVideoId = onFrameVideoId
         self.gameCoverScoreBoard = gameCoverScoreBoard
         self.gameSuggestedName = gameSuggestedName
         self.gameLeague = gameLeague
@@ -41,6 +45,20 @@ struct EventListDisplayItem: Identifiable {
             event: event,
             slideshowPhotoIds: ids,
             hasOnFramePhotos: hasOnFramePhotos,
+            onFrameVideoId: onFrameVideoId,
+            gameCoverScoreBoard: gameCoverScoreBoard,
+            gameSuggestedName: gameSuggestedName,
+            gameLeague: gameLeague,
+            gameTeamSortKey: gameTeamSortKey
+        )
+    }
+
+    func withOnFrameVideoId(_ onFrameVideoId: String?) -> EventListDisplayItem {
+        EventListDisplayItem(
+            event: event,
+            slideshowPhotoIds: slideshowPhotoIds,
+            hasOnFramePhotos: hasOnFramePhotos,
+            onFrameVideoId: onFrameVideoId,
             gameCoverScoreBoard: gameCoverScoreBoard,
             gameSuggestedName: gameSuggestedName,
             gameLeague: gameLeague,
@@ -53,6 +71,7 @@ struct EventListDisplayItem: Identifiable {
             event: event,
             slideshowPhotoIds: slideshowPhotoIds,
             hasOnFramePhotos: hasOnFramePhotos,
+            onFrameVideoId: onFrameVideoId,
             gameCoverScoreBoard: gameCoverScoreBoard,
             gameSuggestedName: gameSuggestedName,
             gameLeague: gameLeague,
@@ -65,6 +84,7 @@ struct EventListDisplayItem: Identifiable {
             event: event,
             slideshowPhotoIds: slideshowPhotoIds,
             hasOnFramePhotos: hasOnFramePhotos,
+            onFrameVideoId: onFrameVideoId,
             gameCoverScoreBoard: gameCoverScoreBoard,
             gameSuggestedName: gameSuggestedName,
             gameLeague: gameLeague,
@@ -146,13 +166,21 @@ final class LibraryViewModel: ObservableObject {
     @Published var homeLocationsCount: Int = 0
     /// When set (e.g. while browsing Christmas photos), the Events tab opens that holiday’s events.
     @Published var eventsTabFilter: EventListFilter = .allEvents
+    /// Media-stack bottom chrome: landing hubs vs full Media|Events|Developer|Search.
+    @Published var mainTabChromeMode: MainTabChromeMode = .landing
+    /// Cross-tab deep link into the Media stack (consumed by `MainTabView`).
+    @Published var mediaNavigationRequest: MediaNavigationRequest?
+    /// Bumped when the Search tab should open Pictures search on the current All Media browser.
+    @Published var mediaPhotoSearchRequestID: UUID?
+    /// Last visible month per Photos↔Events pair (in-memory; survives tab remounts).
+    private var browseMonthAnchorByScope: [BrowseMonthScope: BrowseMonthAnchor] = [:]
     @Published var holidayLandingItems: [HolidayLandingItem] = []
     @Published var isLoadingHolidayLanding = false
     @Published var hasLoadedHolidayLanding = false
     @Published var milestoneLandingItems: [TagCategoryLandingItem] = []
     @Published var outingLandingItems: [TagCategoryLandingItem] = []
     @Published var activityLandingItems: [TagCategoryLandingItem] = []
-    @Published var peopleLandingItems: [PeopleRepository.PersonRecord] = []
+    @Published var peopleLandingItems: [PeopleRepository.PeopleLandingItem] = []
     @Published var isLoadingPeopleLanding = false
     @Published var eventListScrollTarget: EventListScrollTarget?
     @Published var pendingWeddingCoupleConfirm: WeddingCoupleConfirmRequest?
@@ -359,6 +387,59 @@ final class LibraryViewModel: ObservableObject {
         eventsTabFilter = .allEvents
     }
 
+    func setMainTabChromeMode(_ mode: MainTabChromeMode) {
+        guard mainTabChromeMode != mode else { return }
+        mainTabChromeMode = mode
+    }
+
+    /// All Events back → Media Home (Figma events.all).
+    func requestReturnToHome() {
+        clearEventsTabFocus()
+        mediaNavigationRequest = .home
+    }
+
+    /// Events holiday back → Media Holidays hub (Figma).
+    func requestReturnToHolidaysHub() {
+        clearEventsTabFocus()
+        mediaNavigationRequest = .holidaysHub
+    }
+
+    /// All Events → All Media Photos (Media tab while on the All Events root).
+    func requestNavigateToAllMediaPhotos() {
+        clearEventsTabFocus()
+        mediaNavigationRequest = .allMediaPhotos
+    }
+
+    func requestOpenMediaPhotoSearch() {
+        mediaPhotoSearchRequestID = UUID()
+    }
+
+    func consumeMediaPhotoSearchRequest() {
+        mediaPhotoSearchRequestID = nil
+    }
+
+    func consumeMediaNavigationRequest() {
+        mediaNavigationRequest = nil
+    }
+
+    func rememberBrowseMonth(_ anchor: BrowseMonthAnchor, scope: BrowseMonthScope) {
+        browseMonthAnchorByScope[scope] = anchor
+    }
+
+    func browseMonthAnchor(for scope: BrowseMonthScope) -> BrowseMonthAnchor? {
+        browseMonthAnchorByScope[scope]
+    }
+
+    func rememberBrowseMonth(yyyymm: Int, scope: BrowseMonthScope) {
+        guard let anchor = BrowseMonthAnchor.from(yyyymm: yyyymm) else { return }
+        rememberBrowseMonth(anchor, scope: scope)
+    }
+
+    func rememberBrowseMonth(photoSectionId: String, scope: BrowseMonthScope) {
+        guard let anchor = BrowseMonthAnchor.from(photoSectionId: photoSectionId) else { return }
+        rememberBrowseMonth(anchor, scope: scope)
+    }
+
     func cancelHolidayLandingRefresh() {
         holidayLandingRefreshTask?.cancel()
         holidayLandingRefreshTask = nil
@@ -433,7 +514,7 @@ final class LibraryViewModel: ObservableObject {
         defer { isLoadingPeopleLanding = false }
 
         peopleLandingItems = await Task.detached(priority: .utility) { [backgroundDatabase] in
-            backgroundDatabase.fetchAllPeople()
+            backgroundDatabase.fetchPeopleLandingItems()
         }.value
     }
 
@@ -884,6 +965,7 @@ final class LibraryViewModel: ObservableObject {
                         event: item.event,
                         slideshowPhotoIds: item.slideshowPhotoIds,
                         hasOnFramePhotos: item.hasOnFramePhotos,
+                        onFrameVideoId: item.onFrameVideoId,
                         gameCoverScoreBoard: game.coverScoreBoard,
                         gameSuggestedName: game.suggestedEventName,
                         gameLeague: game.league,
@@ -940,14 +1022,23 @@ final class LibraryViewModel: ObservableObject {
                 let chunkEnd = min(chunkStart + chunkSize, events.count)
                 let chunk = Array(events[chunkStart..<chunkEnd])
 
-                let partial = await Task.detached(priority: .utility) { [backgroundDatabase] in
-                    backgroundDatabase.getSlideshowPhotoIds(for: chunk)
+                let (partial, onFrameVideos) = await Task.detached(priority: .utility) { [backgroundDatabase] in
+                    (
+                        backgroundDatabase.getSlideshowPhotoIds(for: chunk),
+                        backgroundDatabase.getOnFrameVideoIds(for: chunk)
+                    )
                 }.value
 
-                guard !Task.isCancelled, !partial.isEmpty else { continue }
+                guard !Task.isCancelled else { continue }
+                guard !partial.isEmpty || !onFrameVideos.isEmpty else { continue }
 
                 await MainActor.run {
-                    self.mergeSlideshowPhotoIds(partial)
+                    if !partial.isEmpty {
+                        self.mergeSlideshowPhotoIds(partial)
+                    }
+                    if !onFrameVideos.isEmpty {
+                        self.mergeOnFrameVideoIds(onFrameVideos)
+                    }
                 }
 
                 try? await Task.sleep(for: .milliseconds(80))
@@ -983,14 +1074,23 @@ final class LibraryViewModel: ObservableObject {
             let chunkEnd = min(chunkStart + chunkSize, snapshot.count)
             let chunk = Array(snapshot[chunkStart..<chunkEnd])
 
-            let partial = await Task.detached(priority: .utility) { [backgroundDatabase] in
-                backgroundDatabase.getSlideshowPhotoIds(for: chunk)
+            let (partial, onFrameVideos) = await Task.detached(priority: .utility) { [backgroundDatabase] in
+                (
+                    backgroundDatabase.getSlideshowPhotoIds(for: chunk),
+                    backgroundDatabase.getOnFrameVideoIds(for: chunk)
+                )
             }.value
 
-            guard !Task.isCancelled, !partial.isEmpty else { continue }
+            guard !Task.isCancelled else { continue }
+            guard !partial.isEmpty || !onFrameVideos.isEmpty else { continue }
 
             await MainActor.run {
-                mergeSlideshowPhotoIds(partial)
+                if !partial.isEmpty {
+                    mergeSlideshowPhotoIds(partial)
+                }
+                if !onFrameVideos.isEmpty {
+                    mergeOnFrameVideoIds(onFrameVideos)
+                }
             }
 
             processedChunks += 1
@@ -1008,21 +1108,59 @@ final class LibraryViewModel: ObservableObject {
         }
     }
 
-    private func mergeSlideshowPhotoIds(_ slideshowIdsByEvent: [Int: [String]]) {
-        guard !slideshowIdsByEvent.isEmpty else { return }
-
-        eventSections = eventSections.map { section in
-            EventYearSection(
+    private func mergeOnFrameVideoIds(_ videoIdsByEvent: [Int: String]) {
+        var anyChange = false
+        let updated = eventSections.map { section in
+            var sectionChanged = false
+            let items = section.items.map { item -> EventListDisplayItem in
+                guard let videoId = videoIdsByEvent[item.event.eventId] else { return item }
+                if item.onFrameVideoId == videoId {
+                    return item
+                }
+                sectionChanged = true
+                return item.withOnFrameVideoId(videoId)
+            }
+            guard sectionChanged else { return section }
+            anyChange = true
+            return EventYearSection(
                 year: section.year,
-                items: section.items.map { item in
-                    guard let ids = slideshowIdsByEvent[item.event.eventId], !ids.isEmpty else {
-                        return item
-                    }
-                    return item.withSlideshowPhotoIds(ids)
-                },
+                items: items,
                 presentation: section.presentation,
                 headerTitle: section.headerTitle
             )
+        }
+        if anyChange {
+            eventSections = updated
+        }
+    }
+
+    private func mergeSlideshowPhotoIds(_ slideshowIdsByEvent: [Int: [String]]) {
+        guard !slideshowIdsByEvent.isEmpty else { return }
+
+        var anyChange = false
+        let updated = eventSections.map { section in
+            var sectionChanged = false
+            let items = section.items.map { item -> EventListDisplayItem in
+                guard let ids = slideshowIdsByEvent[item.event.eventId], !ids.isEmpty else {
+                    return item
+                }
+                if item.slideshowPhotoIds == ids {
+                    return item
+                }
+                sectionChanged = true
+                return item.withSlideshowPhotoIds(ids)
+            }
+            guard sectionChanged else { return section }
+            anyChange = true
+            return EventYearSection(
+                year: section.year,
+                items: items,
+                presentation: section.presentation,
+                headerTitle: section.headerTitle
+            )
+        }
+        if anyChange {
+            eventSections = updated
         }
     }
 
@@ -2303,6 +2441,12 @@ final class LibraryViewModel: ObservableObject {
 
         let weddingDateISO = EventDateParser.dateOnlyISO(from: weddingDate)
         database.updateWeddingDate(eventId: displayEventId, weddingDate: weddingDateISO)
+        _ = database.upsertMarriedCoupleRelationship(
+            bridePersonId: bride.personId,
+            groomPersonId: groom.personId,
+            weddingDateISO: weddingDateISO,
+            sourceEventId: displayEventId
+        )
         _ = database.propagateAnniversaryTagsFromWedding(
             sourceEventId: displayEventId,
             person1: bride.name,

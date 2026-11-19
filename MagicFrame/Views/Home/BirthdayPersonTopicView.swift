@@ -11,7 +11,9 @@ struct BirthdayPersonTopicView: View {
     @State private var isRunning = true
     @State private var errorMessage: String?
 
-    private var title: String { "\(person.name) Birthday" }
+    private var title: String {
+        MilestonePictureSearchDefaults.personBirthdayTagValue(displayName: person.name)
+    }
 
     private var listFilter: EventListFilter {
         .birthdayPerson(personId: person.personId, displayName: title)
@@ -36,7 +38,7 @@ struct BirthdayPersonTopicView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let report, !report.photoMatches.isEmpty {
                 PictureBrowserView(
-                    title: "\(title) Photos",
+                    title: title,
                     photoIds: report.photoMatches.map(\.photoId),
                     confidenceByPhotoId: Dictionary(
                         report.photoMatches.compactMap { match in
@@ -47,7 +49,8 @@ struct BirthdayPersonTopicView: View {
                     ),
                     sortOptions: [.dateTaken, .confidence],
                     usesNavigationTitle: true,
-                    enablesVideoFilter: true
+                    enablesVideoFilter: true,
+                    browseMonthScope: .eventsFilter(listFilter)
                 )
             } else if report != nil {
                 ContentUnavailableView(
@@ -73,6 +76,7 @@ struct BirthdayPersonTopicView: View {
             await runPhotosPipelineIfNeeded()
         }
         .onAppear {
+            vm.setMainTabChromeMode(.full)
             vm.focusEventsTabOnMilestone(listFilter)
         }
     }

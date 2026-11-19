@@ -3,7 +3,7 @@ import Foundation
 
 let path = CommandLine.arguments.count > 1
     ? CommandLine.arguments[1]
-    : "/Users/rick/Dropbox/Mac/Desktop/Magic Frame/MagicFrame/MagicFrame/Assets.xcassets/AppIcon.appiconset/AppIcon.png"
+    : "/Users/rick/Dropbox/Magic Frame/MagicFrame/MagicFrame/Assets.xcassets/AppIcon.appiconset/AppIcon.png"
 
 let paddingRatio = CommandLine.arguments.count > 2
     ? Double(CommandLine.arguments[2]) ?? 0.015

@@ -16,5 +16,9 @@ struct ActivitiesLandingView: View {
         .task {
             await vm.refreshActivityLandingItems()
         }
+        .onAppear {
+            vm.clearEventsTabFocus()
+            vm.setMainTabChromeMode(.landing)
+        }
     }
 }

@@ -25,7 +25,7 @@ struct OutingTopicView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let report {
                 PictureBrowserView(
-                    title: "\(topic.title) Photos",
+                    title: topic.title,
                     photoIds: report.photoMatches.map(\.photoId),
                     confidenceByPhotoId: Dictionary(
                         report.photoMatches.compactMap { match in
@@ -36,7 +36,8 @@ struct OutingTopicView: View {
                     ),
                     sortOptions: [.dateTaken, .confidence],
                     usesNavigationTitle: true,
-                    enablesVideoFilter: true
+                    enablesVideoFilter: true,
+                    browseMonthScope: .eventsFilter(topic.filter)
                 )
             } else {
                 ContentUnavailableView(
@@ -53,6 +54,7 @@ struct OutingTopicView: View {
             await runPhotosPipelineIfNeeded()
         }
         .onAppear {
+            vm.setMainTabChromeMode(.full)
             vm.focusEventsTabOnOuting(topic.filter)
         }
     }

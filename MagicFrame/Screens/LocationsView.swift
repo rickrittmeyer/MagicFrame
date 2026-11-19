@@ -3,6 +3,7 @@ import SwiftUI
 struct LocationsView: View {
 
     @StateObject private var vm = LocationsViewModel()
+    @EnvironmentObject private var libraryVM: LibraryViewModel
 
     var body: some View {
         Group {
@@ -36,6 +37,7 @@ struct LocationsView: View {
             }
         }
         .onAppear {
+            libraryVM.setMainTabChromeMode(.landing)
             vm.onAppear()
         }
         .alert("Add Location Type", isPresented: $vm.isAddingType) {

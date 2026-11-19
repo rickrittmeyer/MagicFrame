@@ -11,28 +11,71 @@ struct PhotoPreviewContext {
     let isZoomed: Bool
 }
 
-/// Close button and counter used by the shared preview. Callers can supply a different header.
+/// Chevron close + centered location/date box used by the shared preview.
 struct PhotoPreviewStandardHeader: View {
+    let photo: IndexedPhoto?
     let index: Int
     let count: Int
     var showsCounter = true
     let onClose: () -> Void
 
+    @State private var locationLine = PhotoPreviewLocationFormatting.noGPSData
+    @State private var isShowingPhotoInfo = false
+
+    private var dateTimeLine: String {
+        guard let photo else { return "Unknown date" }
+        return PhotoPreviewLocationFormatting.dateTimeLine(from: photo.creationDate)
+    }
+
     var body: some View {
         VStack(spacing: 4) {
-            HStack {
-                Spacer()
-                Button(action: onClose) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.title2)
-                        .foregroundStyle(.white)
-                        .frame(width: 44, height: 44)
-                        .contentShape(Rectangle())
+            ZStack {
+                HStack {
+                    Button(action: onClose) {
+                        Image(systemName: "chevron.left")
+                            .font(.title2.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Close")
+
+                    Spacer(minLength: 0)
+
+                    if photo != nil {
+                        Button {
+                            isShowingPhotoInfo = true
+                        } label: {
+                            Image(systemName: "info.circle")
+                                .font(.title2.weight(.semibold))
+                                .foregroundStyle(.white)
+                                .frame(width: 44, height: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Photo info")
+                    }
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Close")
+                .padding(.horizontal, 6)
+
+                VStack(spacing: 2) {
+                    Text(locationLine)
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(1)
+                    Text(dateTimeLine)
+                        .font(.caption)
+                        .lineLimit(1)
+                }
+                .foregroundStyle(.white)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .frame(maxWidth: 280)
+                .background(.ultraThinMaterial.opacity(0.85), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .background(Color.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .padding(.horizontal, 52)
             }
-            .padding(.trailing, 10)
 
             if showsCounter {
                 Text("\(min(index, max(count, 1))) of \(count)")
@@ -42,12 +85,28 @@ struct PhotoPreviewStandardHeader: View {
                     .frame(height: 22)
             }
         }
+        .task(id: photo?.id) {
+            guard let photo else {
+                locationLine = PhotoPreviewLocationFormatting.noGPSData
+                return
+            }
+            let photoId = photo.id
+            locationLine = await Task.detached(priority: .utility) {
+                AppDependencies.database.photoPreviewLocationLine(photoId: photoId)
+            }.value
+        }
+        .sheet(isPresented: $isShowingPhotoInfo) {
+            if let photo {
+                PhotoInfoSheet(photoId: photo.id)
+            }
+        }
     }
 }
 
 private enum PhotoPreviewLayout {
     static let belowSafeAreaCloseOffset: CGFloat = 5
-    static let photoTopInset: CGFloat = 78
+    /// Title band lives above the photo; no header overlay inset on the image.
+    static let photoTopInset: CGFloat = 0
     static let actionBarHeight: CGFloat = 88
     static let belowPhotoSpacing: CGFloat = 14
     static let referencePortraitAspect = CGSize(width: 3, height: 4)
@@ -69,6 +128,8 @@ struct PhotoPreviewView<Header: View, Actions: View, Accessory: View>: View {
     var showsActionBar: Bool
     var dismissWhenEmpty: Bool
     let onDismiss: () -> Void
+    /// Event whose confirmed people get a suggestion boost. Nil keeps the library-wide test.
+    let faceSuggestionEventId: Int?
     let onPhotoVisible: (IndexedPhoto, EventPhotoDisplayItem) async -> Void
     @ViewBuilder let header: (PhotoPreviewContext) -> Header
     @ViewBuilder let actions: (PhotoPreviewContext) -> Actions
@@ -92,6 +153,7 @@ struct PhotoPreviewView<Header: View, Actions: View, Accessory: View>: View {
         showsActionBar: Bool = true,
         dismissWhenEmpty: Bool = true,
         onDismiss: @escaping () -> Void,
+        faceSuggestionEventId: Int? = nil,
         onPhotoVisible: @escaping (IndexedPhoto, EventPhotoDisplayItem) async -> Void = { _, _ in },
         @ViewBuilder header: @escaping (PhotoPreviewContext) -> Header,
         @ViewBuilder actions: @escaping (PhotoPreviewContext) -> Actions,
@@ -103,6 +165,7 @@ struct PhotoPreviewView<Header: View, Actions: View, Accessory: View>: View {
         self.showsActionBar = showsActionBar
         self.dismissWhenEmpty = dismissWhenEmpty
         self.onDismiss = onDismiss
+        self.faceSuggestionEventId = faceSuggestionEventId
         self.onPhotoVisible = onPhotoVisible
         self.header = header
         self.actions = actions
@@ -170,111 +233,122 @@ struct PhotoPreviewView<Header: View, Actions: View, Accessory: View>: View {
                 return showsActionBar ? PhotoPreviewLayout.actionBarHeight : 0
             }()
             let photoTopInset = PhotoPreviewLayout.photoTopInset
-            let photoZoneHeight = max(geometry.size.height - actionHeight, 0)
-            let photoFitBounds = CGSize(
-                width: geometry.size.width,
-                height: max(photoZoneHeight - photoTopInset, 0)
-            )
-            let referencePortraitHeight = referencePortraitDisplayHeight(in: photoFitBounds)
-            let imageLayout = currentPhoto.map {
-                photoDisplayLayout(
-                    for: $0,
-                    photoTopInset: photoTopInset,
-                    fitBounds: photoFitBounds,
-                    referencePortraitHeight: referencePortraitHeight
-                )
-            }
+            // Title band already sits below the system safe area; only add a small gap.
+            let titleTopPadding = PhotoPreviewLayout.belowSafeAreaCloseOffset
 
             ZStack {
                 Color.black.ignoresSafeArea()
 
                 VStack(spacing: 0) {
-                    ZStack(alignment: .top) {
-                        if let presentation = currentPhotoPresentation,
-                           let photo = currentPhoto,
-                           let context = previewContext {
-                            Group {
-                                if playingVideoId == photo.id {
-                                    InlineVideoPlayer(assetIdentifier: photo.id)
-                                } else {
-                                    FullscreenPhotoView(
-                                        assetIdentifier: presentation.assetIdentifier,
-                                        reloadToken: presentation.reloadToken,
-                                        groupID: presentation.groupID,
-                                        zoomState: zoomBinding(for: presentation.groupID),
-                                        preserveZoomOnAssetChange: presentation.preserveZoomOnChange,
-                                        photoTopInset: photoTopInset,
-                                        referencePortraitDisplayHeight: referencePortraitHeight,
-                                        imagePixelSize: CGSize(
-                                            width: CGFloat(photo.width),
-                                            height: CGFloat(photo.height)
-                                        ),
-                                        faceAnnotations: faceAnnotations,
-                                        unzoomRequestID: unzoomRequestID,
-                                        onAssignFace: { faceId, displayName, firstName, lastName, maidenName in
-                                            assignFaceName(
-                                                faceInstanceId: faceId,
-                                                photoId: photo.id,
-                                                displayName: displayName,
-                                                firstName: firstName,
-                                                lastName: lastName,
-                                                maidenName: maidenName
-                                            )
+                    if let context = previewContext {
+                        header(context)
+                            .padding(.top, titleTopPadding)
+                            .frame(maxWidth: .infinity, alignment: .top)
+                    } else if items.isEmpty {
+                        Color.clear
+                            .frame(height: titleTopPadding)
+                    }
+
+                    GeometryReader { photoGeometry in
+                        let photoZoneHeight = photoGeometry.size.height
+                        let photoFitBounds = CGSize(
+                            width: photoGeometry.size.width,
+                            height: max(photoZoneHeight - photoTopInset, 0)
+                        )
+                        let referencePortraitHeight = referencePortraitDisplayHeight(in: photoFitBounds)
+                        let imageLayout = currentPhoto.map {
+                            photoDisplayLayout(
+                                for: $0,
+                                photoTopInset: photoTopInset,
+                                fitBounds: photoFitBounds,
+                                referencePortraitHeight: referencePortraitHeight
+                            )
+                        }
+
+                        ZStack(alignment: .top) {
+                            if let presentation = currentPhotoPresentation,
+                               let photo = currentPhoto,
+                               let context = previewContext {
+                                Group {
+                                    if playingVideoId == photo.id {
+                                        InlineVideoPlayer(assetIdentifier: photo.id)
+                                    } else {
+                                        FullscreenPhotoView(
+                                            assetIdentifier: presentation.assetIdentifier,
+                                            reloadToken: presentation.reloadToken,
+                                            groupID: presentation.groupID,
+                                            zoomState: zoomBinding(for: presentation.groupID),
+                                            preserveZoomOnAssetChange: presentation.preserveZoomOnChange,
+                                            photoTopInset: photoTopInset,
+                                            referencePortraitDisplayHeight: referencePortraitHeight,
+                                            imagePixelSize: CGSize(
+                                                width: CGFloat(photo.width),
+                                                height: CGFloat(photo.height)
+                                            ),
+                                            faceAnnotations: faceAnnotations,
+                                            unzoomRequestID: unzoomRequestID,
+                                            onAssignFace: { faceId, displayName, firstName, lastName, maidenName in
+                                                assignFaceName(
+                                                    faceInstanceId: faceId,
+                                                    photoId: photo.id,
+                                                    displayName: displayName,
+                                                    firstName: firstName,
+                                                    lastName: lastName,
+                                                    maidenName: maidenName
+                                                )
+                                            }
+                                        )
+                                        .overlay {
+                                            VideoPlayButton(assetIdentifier: photo.id, iconSize: 72) {
+                                                playingVideoId = photo.id
+                                            }
                                         }
-                                    )
-                                    .overlay {
-                                        VideoPlayButton(assetIdentifier: photo.id, iconSize: 72) {
-                                            playingVideoId = photo.id
-                                        }
-                                    }
-                                    .overlay(alignment: .top) {
-                                        if isScanningFaces {
-                                            ProgressView("Finding faces…")
-                                                .tint(.white)
-                                                .foregroundStyle(.white)
-                                                .padding(.horizontal, 12)
-                                                .padding(.vertical, 8)
-                                                .background(.black.opacity(0.55), in: Capsule())
-                                                .padding(.top, photoTopInset + 8)
-                                        } else if faceAnnotations.isEmpty {
-                                            Text("No faces found")
-                                                .font(.caption.weight(.medium))
-                                                .foregroundStyle(.white.opacity(0.85))
-                                                .padding(.horizontal, 12)
-                                                .padding(.vertical, 8)
-                                                .background(.black.opacity(0.45), in: Capsule())
-                                                .padding(.top, photoTopInset + 8)
+                                        .overlay(alignment: .top) {
+                                            if isScanningFaces {
+                                                ProgressView("Finding faces…")
+                                                    .tint(.white)
+                                                    .foregroundStyle(.white)
+                                                    .padding(.horizontal, 12)
+                                                    .padding(.vertical, 8)
+                                                    .background(.black.opacity(0.55), in: Capsule())
+                                                    .padding(.top, 8)
+                                            } else if faceAnnotations.isEmpty {
+                                                Text("No faces found")
+                                                    .font(.caption.weight(.medium))
+                                                    .foregroundStyle(.white.opacity(0.85))
+                                                    .padding(.horizontal, 12)
+                                                    .padding(.vertical, 8)
+                                                    .background(.black.opacity(0.45), in: Capsule())
+                                                    .padding(.top, 8)
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            .id(presentation.groupID)
-                            .frame(height: photoZoneHeight)
-                            .frame(maxWidth: .infinity, alignment: .top)
-                            .clipped()
-                            .simultaneousGesture(gridPageSwipeGesture(for: presentation))
-
-                            if let item = currentItem,
-                               item.isStack,
-                               let layout = imageLayout {
-                                stackControlsOverlay(
-                                    item: item,
-                                    context: context,
-                                    layout: layout,
-                                    zoneHeight: photoZoneHeight
-                                )
-                            }
-
-                            header(context)
-                                .padding(.top, geometry.safeAreaInsets.top + PhotoPreviewLayout.belowSafeAreaCloseOffset)
+                                .id(presentation.groupID)
+                                .frame(height: photoZoneHeight)
                                 .frame(maxWidth: .infinity, alignment: .top)
-                        } else if items.isEmpty {
-                            ProgressView()
-                                .tint(.white)
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .clipped()
+                                .simultaneousGesture(gridPageSwipeGesture(for: presentation))
+
+                                if let item = currentItem,
+                                   item.isStack,
+                                   let layout = imageLayout {
+                                    stackControlsOverlay(
+                                        item: item,
+                                        context: context,
+                                        layout: layout,
+                                        zoneHeight: photoZoneHeight
+                                    )
+                                }
+                            } else if items.isEmpty {
+                                ProgressView()
+                                    .tint(.white)
+                                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            }
                         }
+                        .frame(width: photoGeometry.size.width, height: photoZoneHeight)
                     }
-                    .frame(height: photoZoneHeight)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                     if isPhotoZoomed {
                         unzoomActionBar()
@@ -284,6 +358,9 @@ struct PhotoPreviewView<Header: View, Actions: View, Accessory: View>: View {
                         actions(context)
                             .frame(maxWidth: .infinity)
                             .frame(height: PhotoPreviewLayout.actionBarHeight)
+                    } else {
+                        Color.clear
+                            .frame(height: actionHeight)
                     }
                 }
             }
@@ -309,7 +386,11 @@ struct PhotoPreviewView<Header: View, Actions: View, Accessory: View>: View {
     private func loadFaceAnnotations(for photoId: String) async {
         isScanningFaces = true
         defer { isScanningFaces = false }
-        let annotations = await AppDependencies.database.ensurePhotoFaceScanned(photoId: photoId)
+        let annotations = await AppDependencies.database.ensurePhotoFaceScanned(
+            photoId: photoId,
+            suggestionEventId: faceSuggestionEventId,
+            upgradeToPreviewScan: true
+        )
         guard !Task.isCancelled, currentPhoto?.id == photoId else { return }
         faceAnnotations = annotations
     }
@@ -329,7 +410,10 @@ struct PhotoPreviewView<Header: View, Actions: View, Accessory: View>: View {
             lastName: lastName,
             maidenName: maidenName
         )
-        faceAnnotations = AppDependencies.database.fetchFaceAnnotations(forPhotoId: photoId)
+        faceAnnotations = AppDependencies.database.fetchFaceAnnotations(
+            forPhotoId: photoId,
+            suggestionEventId: faceSuggestionEventId
+        )
 
         guard let group = currentItem?.group, group.isStack else { return }
         let siblingPhotoIds = group.photos.map(\.id).filter { $0 != photoId }
@@ -598,6 +682,7 @@ extension PhotoPreviewView where Accessory == EmptyView {
         showsActionBar: Bool = true,
         dismissWhenEmpty: Bool = true,
         onDismiss: @escaping () -> Void,
+        faceSuggestionEventId: Int? = nil,
         onPhotoVisible: @escaping (IndexedPhoto, EventPhotoDisplayItem) async -> Void = { _, _ in },
         @ViewBuilder header: @escaping (PhotoPreviewContext) -> Header,
         @ViewBuilder actions: @escaping (PhotoPreviewContext) -> Actions
@@ -610,6 +695,7 @@ extension PhotoPreviewView where Accessory == EmptyView {
             showsActionBar: showsActionBar,
             dismissWhenEmpty: dismissWhenEmpty,
             onDismiss: onDismiss,
+            faceSuggestionEventId: faceSuggestionEventId,
             onPhotoVisible: onPhotoVisible,
             header: header,
             actions: actions,
@@ -631,6 +717,7 @@ struct EventPhotoFullscreenView: View {
             resolvingPhotos: viewModel.photos,
             initialIndex: initialDisplayIndex,
             onDismiss: onDismiss,
+            faceSuggestionEventId: viewModel.event.eventId,
             onPhotoVisible: { photo, item in
                 await viewModel.analyzeFaceMetricsIfNeeded(for: photo.id)
                 if item.isStack {
@@ -639,6 +726,7 @@ struct EventPhotoFullscreenView: View {
             },
             header: { context in
                 PhotoPreviewStandardHeader(
+                    photo: context.photo,
                     index: context.displayIndex + 1,
                     count: context.displayCount,
                     showsCounter: !context.isZoomed,
@@ -661,15 +749,6 @@ struct EventPhotoFullscreenView: View {
 
         VStack(spacing: 6) {
             Spacer(minLength: 0)
-
-            if let visionStatus = viewModel.visionLabelDebugStatus {
-                Text(visionStatus)
-                    .font(.caption2)
-                    .foregroundStyle(.white.opacity(0.85))
-                    .multilineTextAlignment(.center)
-                    .lineLimit(2)
-                    .padding(.horizontal, 12)
-            }
 
             HStack(spacing: 28) {
                 Button {
@@ -700,18 +779,6 @@ struct EventPhotoFullscreenView: View {
                         Image(systemName: "eye.slash")
                             .font(.title2)
                         Text("Hide")
-                            .font(.caption2)
-                    }
-                    .foregroundStyle(.white)
-                }
-
-                Button {
-                    viewModel.logVisionLabelsForPhoto(photo)
-                } label: {
-                    VStack(spacing: 4) {
-                        Image(systemName: "viewfinder")
-                            .font(.title2)
-                        Text("Vision")
                             .font(.caption2)
                     }
                     .foregroundStyle(.white)
@@ -774,6 +841,7 @@ struct FetchedPhotoPreview: View {
                         .tint(.white)
                     VStack {
                         PhotoPreviewStandardHeader(
+                            photo: nil,
                             index: 1,
                             count: 1,
                             showsCounter: false,
@@ -793,6 +861,7 @@ struct FetchedPhotoPreview: View {
                     onDismiss: { dismiss() },
                     header: { context in
                         PhotoPreviewStandardHeader(
+                            photo: context.photo,
                             index: context.displayIndex + 1,
                             count: context.displayCount,
                             showsCounter: !context.isZoomed,

@@ -22,6 +22,9 @@ struct EventTuningSettings: Codable, Equatable {
     var frequentPlaceMinEvents: Int = 5
     var homeLocationMergeMiles: Double = 0.12
     var homeEventSnapMiles: Double = 0.2
+    /// Photo preview / assign: snap photo GPS to the event's location within this radius
+    /// (wider than `locationMatchMiles`, without changing global location merge).
+    var photoEventLocationSnapMiles: Double = 0.2
 
     /// Pass 2: attach no-GPS photos to existing GPS-backed events (album / people / time).
     var metadataAttachMaxGapHours: Double = 24.0
