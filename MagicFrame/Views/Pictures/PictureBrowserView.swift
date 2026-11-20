@@ -751,6 +751,10 @@ struct PictureBrowserView: View {
             onAdjustLocation: {
                 guard vm.selectedCount > 0 else { return }
                 isShowingAdjustLocationSheet = true
+            },
+            onMoveToEveryday: {
+                guard vm.selectedCount > 0 else { return }
+                vm.moveSelectedPhotosToEveryday()
             }
         )
     }

@@ -322,6 +322,19 @@ protocol MagicFrameDatabase: AnyObject {
         toEventId: Int,
         photoDates: [String: Date]
     )
+    func movePhotosIntoEveryday(
+        photoIds: [String],
+        fromEventId: Int?,
+        photoDates: [String: Date]
+    )
+    func movePhotosOntoEvent(
+        photoIds: [String],
+        fromEventId: Int?,
+        toEventId: Int,
+        photoDates: [String: Date],
+        expandDestinationDates: Bool
+    )
+    func refreshEventPlacesForPhotos(photoIds: [String])
     func persistPhotoOnFrameChanges(
         defaultEventId: Int,
         writes: [(photoId: String, show: Bool)],

@@ -48,6 +48,7 @@ final class EventDetailViewModel: ObservableObject {
     /// Selection order so “first selected” is stable for Adjust Date.
     @Published private(set) var selectedPhotoIdOrder: [String] = []
     @Published private(set) var isAdjustingDates = false
+    @Published private(set) var isMovingPhotos = false
     @Published private(set) var isAdjustingLocations = false
     @Published var showHiddenPhotos = false
     @Published var photoSort: EventDetailPhotoSort = .dateCaptured
@@ -1768,6 +1769,90 @@ final class EventDetailViewModel: ObservableObject {
             rangeEnd: preview.rangeEnd,
             excludingEventId: event.eventId
         )
+        .filter { !$0.isEverydayPhotos }
+    }
+
+    func selectedPhotoDateMap() -> [String: Date] {
+        var dates: [String: Date] = [:]
+        for photo in photos where selectedPhotoIds.contains(photo.id) {
+            if let date = EventDateParser.parseDate(photo.creationDate) {
+                dates[photo.id] = date
+            }
+        }
+        return dates
+    }
+
+    func eventsForPhotoMove() -> [IndexedEvent] {
+        database.getEvents(includeHidden: false)
+            .filter { candidate in
+                candidate.eventId != event.eventId
+                    && !candidate.isEverydayPhotos
+                    && candidate.parentEventId == nil
+            }
+            .sorted { $0.startDate > $1.startDate }
+    }
+
+    func moveWindow(for destination: IndexedEvent, dates: [String: Date]) -> PhotoMoveWindow? {
+        guard let start = EventDateParser.parseDate(destination.startDate),
+              let end = EventDateParser.parseDate(destination.endDate) else {
+            return nil
+        }
+        return PhotoMoveWindow.evaluate(dates: dates, windowStart: start, windowEnd: end)
+    }
+
+    func moveSelectedPhotosToEveryday() {
+        let dates = selectedPhotoDateMap()
+        guard !dates.isEmpty else { return }
+        isMovingPhotos = true
+        defer { isMovingPhotos = false }
+        database.movePhotosIntoEveryday(
+            photoIds: Array(dates.keys),
+            fromEventId: event.eventId,
+            photoDates: dates
+        )
+        finishPhotoMove()
+    }
+
+    func moveSelectedPhotos(
+        to destinationId: Int,
+        dates: [String: Date],
+        expandDestinationDates: Bool
+    ) {
+        guard !dates.isEmpty else { return }
+        isMovingPhotos = true
+        defer { isMovingPhotos = false }
+        database.movePhotosOntoEvent(
+            photoIds: Array(dates.keys),
+            fromEventId: event.eventId,
+            toEventId: destinationId,
+            photoDates: dates,
+            expandDestinationDates: expandDestinationDates
+        )
+        finishPhotoMove()
+    }
+
+    func applyInsideDatesThenMove(
+        updates: [(photoId: String, newCreationDate: Date)],
+        destinationId: Int,
+        dates: [String: Date]
+    ) {
+        database.shiftPhotoCaptureDates(updates: updates)
+        var merged = dates
+        for update in updates {
+            merged[update.photoId] = update.newCreationDate
+        }
+        moveSelectedPhotos(
+            to: destinationId,
+            dates: merged,
+            expandDestinationDates: false
+        )
+    }
+
+    private func finishPhotoMove() {
+        cancelPhotoSelection()
+        loadPhotos(skipHeavyWork: true)
+        refreshEvent()
+        onEventUpdated?(event.eventId)
     }
 
     @discardableResult
@@ -1969,6 +2054,7 @@ final class EventDetailViewModel: ObservableObject {
                 locationId: preview.locationId
             )
         }
+        database.refreshEventPlacesForPhotos(photoIds: photoIds)
         refreshDisplayItemsPreservingGroups()
         cancelPhotoSelection()
 

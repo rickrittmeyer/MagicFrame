@@ -29,17 +29,19 @@ struct EventLibraryRowView: View {
         VStack(alignment: .leading, spacing: 8) {
             titleLine
 
-            EventSlideshowRotatorView(
-                photoIds: displaySlideshowPhotoIds,
-                aspectRatio: photoAspectRatio,
-                cornerRadius: cornerRadius,
-                thumbnailQuality: slideshowQuality,
-                coverScoreBoard: gameCoverScoreBoard,
-                onFrameVideoId: onFrameVideoId,
-                isPlayingInlineVideo: isPlayingInlineVideo
-            )
+            if !event.isEverydayPhotos {
+                EventSlideshowRotatorView(
+                    photoIds: displaySlideshowPhotoIds,
+                    aspectRatio: photoAspectRatio,
+                    cornerRadius: cornerRadius,
+                    thumbnailQuality: slideshowQuality,
+                    coverScoreBoard: gameCoverScoreBoard,
+                    onFrameVideoId: onFrameVideoId,
+                    isPlayingInlineVideo: isPlayingInlineVideo
+                )
 
-            locationLine
+                locationLine
+            }
 
             HStack(alignment: .center, spacing: 12) {
                 if event.photoCount > 0 {
@@ -127,7 +129,7 @@ struct EventLibraryRowView: View {
                 Spacer(minLength: 0)
             }
 
-            if let dateText = event.displayDateText {
+            if let dateText = event.displayDateText, !event.isEverydayPhotos {
                 Text(dateText)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)

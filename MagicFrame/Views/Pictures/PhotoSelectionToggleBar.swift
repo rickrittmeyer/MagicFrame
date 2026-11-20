@@ -12,6 +12,8 @@ struct PhotoSelectionToggleBar: View {
     var onAdjustDate: () -> Void = {}
     var onAdjustLocation: () -> Void = {}
     var onAdjustDateAndLocation: () -> Void = {}
+    var onMoveToEveryday: (() -> Void)? = nil
+    var onMoveToEvent: (() -> Void)? = nil
 
     var body: some View {
         HStack(spacing: 12) {
@@ -55,6 +57,12 @@ struct PhotoSelectionToggleBar: View {
             Button("Adjust Date & Time", action: onAdjustDate)
             Button("Adjust Location", action: onAdjustLocation)
             Button("Adjust Date and Location", action: onAdjustDateAndLocation)
+            if let onMoveToEveryday {
+                Button("Move to Everyday Photos", action: onMoveToEveryday)
+            }
+            if let onMoveToEvent {
+                Button("Move to an Event", action: onMoveToEvent)
+            }
         } label: {
             VStack(spacing: 4) {
                 Image(systemName: "info.circle")

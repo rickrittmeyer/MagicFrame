@@ -1,6 +1,12 @@
 import CoreLocation
 import SwiftUI
 
+struct PendingOutsidePhotoMove {
+    let destination: IndexedEvent
+    let dates: [String: Date]
+    let window: PhotoMoveWindow
+}
+
 struct EventDetailView: View {
 
     @StateObject private var vm: EventDetailViewModel
@@ -18,6 +24,13 @@ struct EventDetailView: View {
     @State private var isShowingLeaveEventPrompt = false
     @State private var isShowingExistingEventPicker = false
     @State private var candidateEventsForDateAdjust: [IndexedEvent] = []
+    @State private var isShowingMoveEventPicker = false
+    @State private var moveTargetEvents: [IndexedEvent] = []
+    @State private var pendingOutsideMove: PendingOutsidePhotoMove?
+    @State private var isShowingOutsideMoveDialog = false
+    @State private var isShowingYearExtendDialog = false
+    @State private var isShowingInsideDatePicker = false
+    @State private var insideMoveDate = Date()
     @State private var isShowingNoMatchingEventAlert = false
     @State private var dateAdjustSuccessEvent: IndexedEvent?
     @State private var isShowingDateAdjustSuccess = false
@@ -455,8 +468,9 @@ struct EventDetailView: View {
                 }
             )
         }
+        .background { photoMovePrompts }
         .overlay {
-            if vm.isAdjustingDates || vm.isAdjustingLocations
+            if vm.isAdjustingDates || vm.isAdjustingLocations || vm.isMovingPhotos
                 || isSyncingApplePhotosDates || isSyncingApplePhotosLocations {
                 ZStack {
                     Color.black.opacity(0.25).ignoresSafeArea()
@@ -891,6 +905,15 @@ struct EventDetailView: View {
             onAdjustLocation: {
                 guard vm.selectedPhotoCount > 0 else { return }
                 isShowingAdjustLocationSheet = true
+            },
+            onMoveToEveryday: {
+                guard vm.selectedPhotoCount > 0 else { return }
+                Task { await MainActor.run { vm.moveSelectedPhotosToEveryday() } }
+            },
+            onMoveToEvent: {
+                guard vm.selectedPhotoCount > 0 else { return }
+                moveTargetEvents = vm.eventsForPhotoMove()
+                isShowingMoveEventPicker = true
             }
         )
     }
@@ -901,6 +924,9 @@ struct EventDetailView: View {
         }
         if vm.isAdjustingLocations {
             return "Updating locations…"
+        }
+        if vm.isMovingPhotos {
+            return "Moving photos…"
         }
         return "Updating dates…"
     }
@@ -918,6 +944,141 @@ struct EventDetailView: View {
             }
         } else {
             Task { await commitDateAdjust(destination: nil) }
+        }
+    }
+
+    private var photoMovePrompts: some View {
+        let outsideCount = pendingOutsideMove?.window.outside.count ?? 0
+        let insideDateTitle = outsideCount > 1 ? "Change all photo dates" : "Choose a date in the event"
+        let eventSummary = pendingOutsideMove?.destination.listTitleText ?? ""
+        let moveMessage = pendingOutsideMove?.window.message(eventSummary: eventSummary) ?? ""
+        return Color.clear
+            .sheet(isPresented: $isShowingMoveEventPicker) {
+                PhotoDateAdjustEventPickerSheet(
+                    events: moveTargetEvents,
+                    onCancel: {
+                        isShowingMoveEventPicker = false
+                    },
+                    onSelect: { event in
+                        isShowingMoveEventPicker = false
+                        beginMoveToExistingEvent(event)
+                    }
+                )
+            }
+            .confirmationDialog(
+                "Photo date is outside this event",
+                isPresented: $isShowingOutsideMoveDialog,
+                titleVisibility: .visible
+            ) {
+                Button(insideDateTitle) {
+                    if let window = pendingOutsideMove?.window {
+                        insideMoveDate = window.windowStart
+                    }
+                    isShowingInsideDatePicker = true
+                }
+                Button("Extend the event") {
+                    if pendingOutsideMove?.window.needsYearConfirmation == true {
+                        isShowingYearExtendDialog = true
+                    } else {
+                        commitPendingMove(expandDestinationDates: true)
+                    }
+                }
+                Button("Cancel", role: .cancel) {
+                    pendingOutsideMove = nil
+                }
+            } message: {
+                Text(moveMessage)
+            }
+            .confirmationDialog(
+                "This extends the event by more than a year",
+                isPresented: $isShowingYearExtendDialog,
+                titleVisibility: .visible
+            ) {
+                Button("Extend the event") {
+                    commitPendingMove(expandDestinationDates: true)
+                }
+                Button("Cancel", role: .cancel) {
+                    pendingOutsideMove = nil
+                }
+            } message: {
+                Text(moveMessage)
+            }
+            .sheet(isPresented: $isShowingInsideDatePicker) {
+                insideDatePicker
+            }
+    }
+
+    private func beginMoveToExistingEvent(_ destination: IndexedEvent) {
+        let dates = vm.selectedPhotoDateMap()
+        guard let window = vm.moveWindow(for: destination, dates: dates) else { return }
+        if window.isEmpty {
+            vm.moveSelectedPhotos(
+                to: destination.eventId,
+                dates: dates,
+                expandDestinationDates: false
+            )
+            return
+        }
+        pendingOutsideMove = PendingOutsidePhotoMove(
+            destination: destination,
+            dates: dates,
+            window: window
+        )
+        isShowingOutsideMoveDialog = true
+    }
+
+    private func commitPendingMove(expandDestinationDates: Bool) {
+        guard let pending = pendingOutsideMove else { return }
+        pendingOutsideMove = nil
+        vm.moveSelectedPhotos(
+            to: pending.destination.eventId,
+            dates: pending.dates,
+            expandDestinationDates: expandDestinationDates
+        )
+    }
+
+    private func commitInsideDateMove() {
+        guard let pending = pendingOutsideMove else { return }
+        let updates = pending.window.outside.map { (photoId: $0.photoId, newCreationDate: insideMoveDate) }
+        let destinationId = pending.destination.eventId
+        let dates = pending.dates
+        pendingOutsideMove = nil
+        vm.applyInsideDatesThenMove(
+            updates: updates,
+            destinationId: destinationId,
+            dates: dates
+        )
+    }
+
+    private var insideDatePicker: some View {
+        NavigationStack {
+            VStack(spacing: 16) {
+                DatePicker(
+                    "Date inside the event",
+                    selection: $insideMoveDate,
+                    in: (pendingOutsideMove?.window.windowStart ?? Date()) ... (pendingOutsideMove?.window.windowEnd ?? Date()),
+                    displayedComponents: .date
+                )
+                .datePickerStyle(.graphical)
+                .padding()
+                Spacer()
+            }
+            .navigationTitle("Date inside the event")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        isShowingInsideDatePicker = false
+                        pendingOutsideMove = nil
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Use this date") {
+                        isShowingInsideDatePicker = false
+                        commitInsideDateMove()
+                    }
+                }
+            }
         }
     }
 

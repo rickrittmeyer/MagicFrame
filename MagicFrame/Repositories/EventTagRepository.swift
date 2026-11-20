@@ -37,42 +37,6 @@ final class EventTagRepository {
         let eventIds = events.map(\.eventId)
         var tagsByEventId = fetchAttributeTagsUnsafe(eventIds: eventIds)
 
-        let parentIdsMissingHoliday = events
-            .filter {
-                $0.parentEventId == nil
-                    && !(tagsByEventId[$0.eventId]?.contains { $0.category == .holidayType } ?? false)
-            }
-            .map(\.eventId)
-        if !parentIdsMissingHoliday.isEmpty {
-            let fromChildren = fetchHolidayTagsFromDescendantsUnsafe(
-                parentEventIds: parentIdsMissingHoliday
-            )
-            for (parentId, holidayTag) in fromChildren {
-                var tags = tagsByEventId[parentId] ?? []
-                guard !tags.contains(where: { $0.category == .holidayType }) else { continue }
-                tags.append(EventAttributeTag(holidayTag: holidayTag))
-                tagsByEventId[parentId] = tags
-            }
-        }
-
-        let parentIdsMissingMilestone = events
-            .filter {
-                $0.parentEventId == nil
-                    && !(tagsByEventId[$0.eventId]?.contains { $0.category == .milestoneType } ?? false)
-            }
-            .map(\.eventId)
-        if !parentIdsMissingMilestone.isEmpty {
-            let fromChildren = fetchMilestoneTagsFromDescendantsUnsafe(
-                parentEventIds: parentIdsMissingMilestone
-            )
-            for (parentId, milestoneTag) in fromChildren {
-                var tags = tagsByEventId[parentId] ?? []
-                guard !tags.contains(where: { $0.category == .milestoneType }) else { continue }
-                tags.append(milestoneTag)
-                tagsByEventId[parentId] = tags
-            }
-        }
-
         return events.map { event in
             eventWithAttributeTags(event, tags: tagsByEventId[event.eventId] ?? [])
         }
@@ -186,6 +150,28 @@ final class EventTagRepository {
     ) -> EventNameTemplate? {
         sync {
             fetchEventNameTemplateUnsafe(tagCategory: tagCategory, tagValue: tagValue)
+        }
+    }
+
+    /// Removes an AI-applied tag that no longer meets its score. A user tag and a rejected tag stay.
+    func deleteAIAttributeTag(eventId: Int, category: String, tagValue: String) {
+        sync {
+            let sql = """
+            DELETE FROM event_tags
+            WHERE eventId = ?
+              AND tagCategory = ?
+              AND tagValue = ?
+              AND source = ?
+              AND isRejected = 0;
+            """
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
+            defer { sqlite3_finalize(statement) }
+            sqlite3_bind_int(statement, 1, Int32(eventId))
+            sqlite3_bind_text(statement, 2, (category as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, 3, (tagValue as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, 4, (EventTagSource.ai.rawValue as NSString).utf8String, -1, nil)
+            sqlite3_step(statement)
         }
     }
 

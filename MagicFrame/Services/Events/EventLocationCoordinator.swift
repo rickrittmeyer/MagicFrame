@@ -148,6 +148,43 @@ final class EventLocationCoordinator {
         syncDefaultChildEventNameIfSubEvent(eventId: eventId)
     }
 
+    /// Sets the event place from its photos. A place that is already geocoded keeps its city, state, and place name.
+    func assignEventLocationKeepingCompletedPlace(eventId: Int) {
+        guard let coordinates = representativeCoordinatesForEvent(eventId: eventId) else {
+            return
+        }
+
+        let eventDate = locations.getEventStartDate(eventId: eventId) ?? Date()
+        let locationId = locations.findOrCreateLocation(
+            latitude: coordinates.latitude,
+            longitude: coordinates.longitude,
+            at: eventDate
+        )
+        guard locationId > 0 else { return }
+
+        events.setEventLocationId(eventId: eventId, locationId: locationId)
+        events.setEventCentroid(
+            eventId: eventId,
+            latitude: coordinates.latitude,
+            longitude: coordinates.longitude,
+            clearTimeOnlyFlag: true
+        )
+        events.clearEventLocationFields(eventId: eventId)
+
+        guard !locations.isLocationGeocodeComplete(locationId: locationId) else { return }
+
+        locations.resetLocationForGeocoding(
+            locationId: locationId,
+            latitude: coordinates.latitude,
+            longitude: coordinates.longitude
+        )
+        geocodeQueue.requestFreshGeocode(
+            locationId: locationId,
+            latitude: coordinates.latitude,
+            longitude: coordinates.longitude
+        )
+    }
+
     // MARK: - Private
 
     private struct PhotoCoordinate {

@@ -816,6 +816,13 @@ final class EventClusteringService {
       AND latitude IS NOT NULL
       AND longitude IS NOT NULL
       AND parentEventId IS NULL
+      AND eventId NOT IN (
+          SELECT eventId
+          FROM event_tags
+          WHERE tagCategory = 'eventType'
+            AND tagValue = 'Everyday Photos'
+            AND isRejected = 0
+      )
       AND startDate <= ?
       AND endDate >= ?
       AND latitude BETWEEN ? AND ?

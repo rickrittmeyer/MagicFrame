@@ -206,6 +206,13 @@ struct IndexedEvent {
         isTripEvent && parentEventId == nil
     }
 
+    var isEverydayPhotos: Bool {
+        if eventType?.localizedCaseInsensitiveCompare(EverydayPhotos.tagValue) == .orderedSame {
+            return true
+        }
+        return EverydayPhotos.isEverydayName(name)
+    }
+
     var usesSuggestedName: Bool {
         !userEditedName
     }

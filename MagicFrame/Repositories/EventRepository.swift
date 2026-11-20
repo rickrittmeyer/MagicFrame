@@ -3691,23 +3691,97 @@ final class EventRepository {
         photoIds: [String],
         fromEventId: Int?,
         toEventId: Int,
-        photoDates: [String: Date]
+        photoDates: [String: Date],
+        expandDestinationDates: Bool = true
     ) {
         sync {
             movePhotosToEventUnsafe(
                 photoIds: photoIds,
                 fromEventId: fromEventId,
                 toEventId: toEventId,
-                photoDates: photoDates
+                photoDates: photoDates,
+                expandDestinationDates: expandDestinationDates
             )
         }
+    }
+
+    /// One Everyday Photos event per calendar month. Creates it the first time a photo needs that month.
+    func findOrCreateEverydayEvent(containing date: Date) -> Int {
+        sync {
+            if let existing = everydayEventId(containing: date) {
+                return existing
+            }
+            let bounds = EverydayPhotos.monthBounds(containing: date)
+            return insertEventRow(
+                name: EverydayPhotos.title(containing: date),
+                startDate: Self.iso8601Formatter.string(from: bounds.start),
+                endDate: Self.iso8601Formatter.string(from: bounds.end),
+                latitude: nil,
+                longitude: nil,
+                locationId: nil,
+                clusteredByTimeOnly: true
+            )
+        }
+    }
+
+    func restoreEverydayMonthShell(eventId: Int, containing date: Date) {
+        sync {
+            let bounds = EverydayPhotos.monthBounds(containing: date)
+            let sql = """
+            UPDATE events
+            SET name = ?,
+                startDate = ?,
+                endDate = ?,
+                latitude = NULL,
+                longitude = NULL,
+                city = NULL,
+                state = NULL,
+                placeName = NULL,
+                locationId = NULL,
+                coverPhotoId = NULL,
+                userEditedName = 1,
+                clusteredByTimeOnly = 1
+            WHERE eventId = ?;
+            """
+            var statement: OpaquePointer?
+            let name = EverydayPhotos.title(containing: date)
+            let startISO = Self.iso8601Formatter.string(from: bounds.start)
+            let endISO = Self.iso8601Formatter.string(from: bounds.end)
+            if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+                sqlite3_bind_text(statement, 1, (name as NSString).utf8String, -1, nil)
+                sqlite3_bind_text(statement, 2, (startISO as NSString).utf8String, -1, nil)
+                sqlite3_bind_text(statement, 3, (endISO as NSString).utf8String, -1, nil)
+                sqlite3_bind_int(statement, 4, Int32(eventId))
+                sqlite3_step(statement)
+            }
+            sqlite3_finalize(statement)
+        }
+    }
+
+    private func everydayEventId(containing date: Date) -> Int? {
+        let sql = """
+        SELECT eventId
+        FROM events
+        WHERE isDeleted = 0
+          AND parentEventId IS NULL
+          AND name = ?
+        LIMIT 1;
+        """
+        var statement: OpaquePointer?
+        let name = EverydayPhotos.title(containing: date)
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, (name as NSString).utf8String, -1, nil)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        return Int(sqlite3_column_int(statement, 0))
     }
 
     private func movePhotosToEventUnsafe(
         photoIds: [String],
         fromEventId: Int?,
         toEventId: Int,
-        photoDates: [String: Date]
+        photoDates: [String: Date],
+        expandDestinationDates: Bool = true
     ) {
         for photoId in photoIds {
             if let fromEventId {
@@ -3733,7 +3807,7 @@ final class EventRepository {
             )
             markPhotoEventAssigned(photoId: photoId)
 
-            if let photoDate = photoDates[photoId] {
+            if expandDestinationDates, let photoDate = photoDates[photoId] {
                 expandEventDatesAfterAttach(eventId: toEventId, photoDate: photoDate)
             }
         }
@@ -4034,15 +4108,7 @@ final class EventRepository {
             WHERE ht.tagCategory = '\(escapeSQLLiteral(category))'
               AND ht.isRejected = 0
               \(tagValueClause)
-              AND (
-                  ht.eventId = e.eventId
-                  OR ht.eventId IN (
-                      SELECT child.eventId
-                      FROM events child
-                      WHERE child.parentEventId = e.eventId
-                        AND child.isDeleted = 0
-                  )
-              )
+              AND ht.eventId = e.eventId
         )
         """
     }
@@ -4182,10 +4248,12 @@ final class EventRepository {
 
     private func listScopeFilterSQL(filter: EventListFilter) -> String {
         switch filter {
-        case .allEvents, .anyHoliday, .holidayTag, .anyMilestone, .milestoneTag, .milestoneTags,
-             .anyBirthdayMilestone, .trips, .anyActivity, .activityTag, .eventTypeTag, .eventTypeTags,
-             .birthdayPerson, .location:
+        case .allEvents, .trips:
             return "AND e.parentEventId IS NULL"
+        case .location(_, _):
+            return "AND e.parentEventId IS NULL"
+        default:
+            return ""
         }
     }
 

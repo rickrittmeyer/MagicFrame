@@ -646,6 +646,37 @@ final class PictureBrowserViewModel: ObservableObject {
             rangeEnd: preview.rangeEnd,
             excludingEventId: excludingEventId
         )
+        .filter { !$0.isEverydayPhotos }
+    }
+
+    func moveSelectedPhotosToEveryday() {
+        let records = selectedPhotoRecords
+        guard !records.isEmpty else { return }
+        var byEvent: [Int: [String: Date]] = [:]
+        var unassigned: [String: Date] = [:]
+        for record in records {
+            guard let date = EventDateParser.parseDate(record.photo.creationDate) else { continue }
+            if let eventId = database.getEventIdForPhoto(photoId: record.id) {
+                byEvent[eventId, default: [:]][record.id] = date
+            } else {
+                unassigned[record.id] = date
+            }
+        }
+        for (eventId, dates) in byEvent {
+            database.movePhotosIntoEveryday(
+                photoIds: Array(dates.keys),
+                fromEventId: eventId,
+                photoDates: dates
+            )
+        }
+        if !unassigned.isEmpty {
+            database.movePhotosIntoEveryday(
+                photoIds: Array(unassigned.keys),
+                fromEventId: nil,
+                photoDates: unassigned
+            )
+        }
+        cancelSelection()
     }
 
     @discardableResult
@@ -840,6 +871,7 @@ final class PictureBrowserViewModel: ObservableObject {
             )
         }
         cancelSelection()
+        database.refreshEventPlacesForPhotos(photoIds: photoIds)
         statusMessage = "Updated location for \(photoIds.count) photo\(photoIds.count == 1 ? "" : "s")"
 
         return PhotoLocationAdjustResult(

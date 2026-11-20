@@ -3089,6 +3089,128 @@ final class PhotoDatabase: @unchecked Sendable {
             toEventId: toEventId,
             photoDates: photoDates
         )
+        refreshPlacesAfterMembershipChange(eventIds: [fromEventId, toEventId].compactMap { $0 })
+        rescoreTagsAfterMembershipChange(eventIds: [fromEventId, toEventId].compactMap { $0 })
+    }
+
+    /// Sends each photo to the Everyday Photos month for its own date. Creates that month when needed.
+    func movePhotosIntoEveryday(
+        photoIds: [String],
+        fromEventId: Int?,
+        photoDates: [String: Date]
+    ) {
+        let grouped = Dictionary(grouping: photoIds) { photoId -> Date in
+            let date = photoDates[photoId] ?? Date()
+            return EverydayPhotos.monthBounds(containing: date).start
+        }
+        var destinationIds: [Int] = []
+        for (monthStart, ids) in grouped {
+            let eventId = eventRepository.findOrCreateEverydayEvent(containing: monthStart)
+            guard eventId != fromEventId else { continue }
+            updateEventAttribute(
+                eventId: eventId,
+                field: .eventType,
+                value: EverydayPhotos.tagValue
+            )
+            eventRepository.movePhotosToEvent(
+                photoIds: ids,
+                fromEventId: fromEventId,
+                toEventId: eventId,
+                photoDates: photoDates,
+                expandDestinationDates: false
+            )
+            eventRepository.restoreEverydayMonthShell(eventId: eventId, containing: monthStart)
+            destinationIds.append(eventId)
+        }
+        var touched = destinationIds
+        if let fromEventId {
+            touched.append(fromEventId)
+        }
+        refreshPlacesAfterMembershipChange(eventIds: touched)
+        rescoreTagsAfterMembershipChange(eventIds: touched)
+    }
+
+    func movePhotosOntoEvent(
+        photoIds: [String],
+        fromEventId: Int?,
+        toEventId: Int,
+        photoDates: [String: Date],
+        expandDestinationDates: Bool
+    ) {
+        eventRepository.movePhotosToEvent(
+            photoIds: photoIds,
+            fromEventId: fromEventId,
+            toEventId: toEventId,
+            photoDates: photoDates,
+            expandDestinationDates: expandDestinationDates
+        )
+        var touched = [toEventId]
+        if let fromEventId {
+            touched.append(fromEventId)
+        }
+        refreshPlacesAfterMembershipChange(eventIds: touched)
+        rescoreTagsAfterMembershipChange(eventIds: touched)
+    }
+
+    func refreshEventPlacesForPhotos(photoIds: [String]) {
+        let eventIds = Array(Set(photoIds.compactMap { getEventIdForPhoto(photoId: $0) }))
+        refreshPlacesAfterMembershipChange(eventIds: eventIds)
+    }
+
+    private func refreshPlacesAfterMembershipChange(eventIds: [Int]) {
+        for eventId in Set(eventIds) {
+            guard let event = eventRepository.getEvent(eventId: eventId) else { continue }
+            if EverydayPhotos.isEverydayName(event.name) { continue }
+            eventLocationCoordinator.assignEventLocationKeepingCompletedPlace(eventId: eventId)
+            if let parentId = event.parentEventId {
+                eventRepository.updateTripParentSummary(parentEventId: parentId)
+            }
+        }
+    }
+
+    private func rescoreTagsAfterMembershipChange(eventIds: [Int]) {
+        let cards = fetchAllEventScoreCardSettings()
+        guard !cards.isEmpty else { return }
+        for eventId in Set(eventIds) {
+            guard let event = getEvent(eventId: eventId) else { continue }
+            if event.isEverydayPhotos { continue }
+            if event.isTripContainer {
+                rescore(eventId: event.eventId, cards: cards, tripsOnly: true)
+                for child in getSubEvents(parentEventId: event.eventId) {
+                    rescore(eventId: child.eventId, cards: cards, tripsOnly: false)
+                }
+            } else if event.isTripSubEvent {
+                rescore(eventId: event.eventId, cards: cards, tripsOnly: false)
+                if let parentId = event.parentEventId {
+                    rescore(eventId: parentId, cards: cards, tripsOnly: true)
+                }
+            } else {
+                rescore(eventId: event.eventId, cards: cards, tripsOnly: nil)
+            }
+        }
+    }
+
+    private func rescore(
+        eventId: Int,
+        cards: [PictureSearchEventScoreCardSettings],
+        tripsOnly: Bool?
+    ) {
+        for card in cards {
+            let isTrips = card.targetTagCategory.localizedCaseInsensitiveCompare("Trips") == .orderedSame
+            if let tripsOnly {
+                if tripsOnly != isTrips { continue }
+            }
+            let score = scoreEventAgainstScoreCard(eventId: eventId, scoreCard: card)
+            let keepsExactDate = card.targetTagCategory.localizedCaseInsensitiveCompare("holiday") == .orderedSame
+                || card.targetEventType.localizedCaseInsensitiveCompare("Birthday") == .orderedSame
+            if !card.meetsAIThreshold(totalScore: score.totalScore), !keepsExactDate {
+                container.eventTags.deleteAIAttributeTag(
+                    eventId: eventId,
+                    category: card.targetTagCategory,
+                    tagValue: card.targetEventType
+                )
+            }
+        }
     }
 
     func getEventIdForPhoto(photoId: String) -> Int? {
