@@ -1800,28 +1800,68 @@ final class EventDetailViewModel: ObservableObject {
         return PhotoMoveWindow.evaluate(dates: dates, windowStart: start, windowEnd: end)
     }
 
-    /// True when moving the current selection to Everyday would empty this event
-    /// and `cleanupEmptyEvents` would soft-delete it (non-trip events only).
+    /// Non-hidden photo ids currently belonging to this event.
+    private var nonHiddenPhotoIdsInEvent: Set<String> {
+        Set(
+            database.getPhotosForEvent(
+                eventId: event.eventId,
+                includeHidden: false
+            ).map(\.id)
+        )
+    }
+
+    /// All photo ids currently belonging to this event, including hidden.
+    private var allPhotoIdsInEvent: Set<String> {
+        Set(
+            database.getPhotosForEvent(
+                eventId: event.eventId,
+                includeHidden: true
+            ).map(\.id)
+        )
+    }
+
+    /// Hidden photos that would remain if only the current selection moved to Everyday.
+    var remainingHiddenPhotoCountIfMovingSelectionToEveryday: Int {
+        let remaining = allPhotoIdsInEvent.subtracting(selectedPhotoIds)
+        guard !remaining.isEmpty else { return 0 }
+        let nonHidden = nonHiddenPhotoIdsInEvent
+        return remaining.filter { !nonHidden.contains($0) }.count
+    }
+
+    /// True when the selection covers every non-hidden photo, so confirming an Everyday
+    /// move should empty the event (including any leftover hidden photos) and soft-delete it.
     var willSoftDeleteEventIfMovingSelectedToEveryday: Bool {
         guard !event.isTripEvent else { return false }
         guard !selectedPhotoIds.isEmpty else { return false }
 
-        let loadedIds = Set(photos.map(\.id))
-        guard !loadedIds.isEmpty else { return false }
-
-        // Hidden photos not currently loaded would keep the event alive.
-        if !showHiddenPhotos, event.photoCount > loadedIds.count {
-            return false
+        let nonHiddenIds = nonHiddenPhotoIdsInEvent
+        if nonHiddenIds.isEmpty {
+            // Only hidden photos remain — deleting them all empties the event.
+            let allIds = allPhotoIdsInEvent
+            return !allIds.isEmpty && allIds.isSubset(of: selectedPhotoIds)
         }
 
-        return loadedIds.isSubset(of: selectedPhotoIds)
+        return nonHiddenIds.isSubset(of: selectedPhotoIds)
     }
 
-    /// Moves the selection into Everyday Photos months.
+    /// Moves photos into Everyday Photos months.
+    /// When `emptyingEvent` is true, also moves any remaining photos (including hidden)
+    /// so `cleanupEmptyEvents` can soft-delete the source.
     /// Returns `true` when the source event was soft-deleted because it became empty.
     @discardableResult
-    func moveSelectedPhotosToEveryday() async -> Bool {
-        let dates = selectedPhotoDateMap()
+    func moveSelectedPhotosToEveryday(emptyingEvent: Bool = false) async -> Bool {
+        var dates = selectedPhotoDateMap()
+
+        if emptyingEvent {
+            let fallbackDate = EventDateParser.parseDate(event.startDate) ?? Date()
+            for photo in database.getPhotosForEvent(
+                eventId: event.eventId,
+                includeHidden: true
+            ) where dates[photo.id] == nil {
+                dates[photo.id] = EventDateParser.parseDate(photo.creationDate) ?? fallbackDate
+            }
+        }
+
         guard !dates.isEmpty else { return false }
         isMovingPhotos = true
         defer { isMovingPhotos = false }

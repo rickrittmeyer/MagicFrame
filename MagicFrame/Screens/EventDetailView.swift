@@ -422,13 +422,11 @@ struct EventDetailView: View {
             titleVisibility: .visible
         ) {
             Button("Yes", role: .destructive) {
-                Task { await performEverydayMove() }
+                Task { await performEverydayMove(emptyingEvent: true) }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text(
-                "Are you sure you want all photos moved to everyday photos? Event will be deleted"
-            )
+            Text(everydayMoveDeleteConfirmationMessage)
         }
         .sheet(isPresented: $isShowingAdjustDateSheet) {
             if let originalDate = vm.adjustDateAnchorDate {
@@ -926,7 +924,7 @@ struct EventDetailView: View {
                 if vm.willSoftDeleteEventIfMovingSelectedToEveryday {
                     isConfirmingEverydayMoveDeletesEvent = true
                 } else {
-                    Task { await performEverydayMove() }
+                    Task { await performEverydayMove(emptyingEvent: false) }
                 }
             },
             onMoveToEvent: {
@@ -950,8 +948,17 @@ struct EventDetailView: View {
         return "Updating dates…"
     }
 
-    private func performEverydayMove() async {
-        let sourceDeleted = await vm.moveSelectedPhotosToEveryday()
+    private var everydayMoveDeleteConfirmationMessage: String {
+        let hiddenCount = vm.remainingHiddenPhotoCountIfMovingSelectionToEveryday
+        if hiddenCount > 0 {
+            let photoWord = hiddenCount == 1 ? "photo" : "photos"
+            return "Are you sure you want all photos moved to everyday photos? \(hiddenCount) hidden \(photoWord) will also be moved. Event will be deleted"
+        }
+        return "Are you sure you want all photos moved to everyday photos? Event will be deleted"
+    }
+
+    private func performEverydayMove(emptyingEvent: Bool) async {
+        let sourceDeleted = await vm.moveSelectedPhotosToEveryday(emptyingEvent: emptyingEvent)
         if sourceDeleted {
             dismiss()
         }
