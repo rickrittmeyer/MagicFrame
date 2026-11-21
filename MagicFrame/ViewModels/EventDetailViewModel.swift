@@ -1800,9 +1800,29 @@ final class EventDetailViewModel: ObservableObject {
         return PhotoMoveWindow.evaluate(dates: dates, windowStart: start, windowEnd: end)
     }
 
-    func moveSelectedPhotosToEveryday() async {
+    /// True when moving the current selection to Everyday would empty this event
+    /// and `cleanupEmptyEvents` would soft-delete it (non-trip events only).
+    var willSoftDeleteEventIfMovingSelectedToEveryday: Bool {
+        guard !event.isTripEvent else { return false }
+        guard !selectedPhotoIds.isEmpty else { return false }
+
+        let loadedIds = Set(photos.map(\.id))
+        guard !loadedIds.isEmpty else { return false }
+
+        // Hidden photos not currently loaded would keep the event alive.
+        if !showHiddenPhotos, event.photoCount > loadedIds.count {
+            return false
+        }
+
+        return loadedIds.isSubset(of: selectedPhotoIds)
+    }
+
+    /// Moves the selection into Everyday Photos months.
+    /// Returns `true` when the source event was soft-deleted because it became empty.
+    @discardableResult
+    func moveSelectedPhotosToEveryday() async -> Bool {
         let dates = selectedPhotoDateMap()
-        guard !dates.isEmpty else { return }
+        guard !dates.isEmpty else { return false }
         isMovingPhotos = true
         defer { isMovingPhotos = false }
 
@@ -1820,6 +1840,7 @@ final class EventDetailViewModel: ObservableObject {
         }.value
 
         finishPhotoMove()
+        return database.getEvent(eventId: fromEventId) == nil
     }
 
     func moveSelectedPhotos(

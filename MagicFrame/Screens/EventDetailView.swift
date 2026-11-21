@@ -12,6 +12,7 @@ struct EventDetailView: View {
     @StateObject private var vm: EventDetailViewModel
     @State private var selectedPhotoIndex: Int?
     @State private var isConfirmingHideEvent = false
+    @State private var isConfirmingEverydayMoveDeletesEvent = false
     @State private var isShowingAttributePicker = false
     @State private var attributePickerField: EventAttributeField?
     @State private var activeMilestonePersonPicker: MilestonePersonPickerKind?
@@ -413,6 +414,20 @@ struct EventDetailView: View {
         } message: {
             Text(
                 "This event will now be hidden. You can find this Event again by selecting Show Hidden Events."
+            )
+        }
+        .confirmationDialog(
+            "Move all photos to Everyday Photos?",
+            isPresented: $isConfirmingEverydayMoveDeletesEvent,
+            titleVisibility: .visible
+        ) {
+            Button("Yes", role: .destructive) {
+                Task { await performEverydayMove() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "Are you sure you want all photos moved to everyday photos? Event will be deleted"
             )
         }
         .sheet(isPresented: $isShowingAdjustDateSheet) {
@@ -908,7 +923,11 @@ struct EventDetailView: View {
             },
             onMoveToEveryday: {
                 guard vm.selectedPhotoCount > 0 else { return }
-                Task { await vm.moveSelectedPhotosToEveryday() }
+                if vm.willSoftDeleteEventIfMovingSelectedToEveryday {
+                    isConfirmingEverydayMoveDeletesEvent = true
+                } else {
+                    Task { await performEverydayMove() }
+                }
             },
             onMoveToEvent: {
                 guard vm.selectedPhotoCount > 0 else { return }
@@ -929,6 +948,13 @@ struct EventDetailView: View {
             return "Moving photos…"
         }
         return "Updating dates…"
+    }
+
+    private func performEverydayMove() async {
+        let sourceDeleted = await vm.moveSelectedPhotosToEveryday()
+        if sourceDeleted {
+            dismiss()
+        }
     }
 
     private func handleDateAdjust(adjustedAnchor: Date) {
