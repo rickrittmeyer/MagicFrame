@@ -908,7 +908,7 @@ struct EventDetailView: View {
             },
             onMoveToEveryday: {
                 guard vm.selectedPhotoCount > 0 else { return }
-                Task { await MainActor.run { vm.moveSelectedPhotosToEveryday() } }
+                Task { await vm.moveSelectedPhotosToEveryday() }
             },
             onMoveToEvent: {
                 guard vm.selectedPhotoCount > 0 else { return }

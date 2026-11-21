@@ -649,7 +649,7 @@ final class PictureBrowserViewModel: ObservableObject {
         .filter { !$0.isEverydayPhotos }
     }
 
-    func moveSelectedPhotosToEveryday() {
+    func moveSelectedPhotosToEveryday() async {
         let records = selectedPhotoRecords
         guard !records.isEmpty else { return }
         var byEvent: [Int: [String: Date]] = [:]
@@ -662,20 +662,28 @@ final class PictureBrowserViewModel: ObservableObject {
                 unassigned[record.id] = date
             }
         }
-        for (eventId, dates) in byEvent {
-            database.movePhotosIntoEveryday(
-                photoIds: Array(dates.keys),
-                fromEventId: eventId,
-                photoDates: dates
-            )
-        }
-        if !unassigned.isEmpty {
-            database.movePhotosIntoEveryday(
-                photoIds: Array(unassigned.keys),
-                fromEventId: nil,
-                photoDates: unassigned
-            )
-        }
+
+        await Task.yield()
+
+        let eventBatches = byEvent
+        let unassignedDates = unassigned
+        await Task.detached(priority: .userInitiated) {
+            for (eventId, dates) in eventBatches {
+                AppDependencies.database.movePhotosIntoEveryday(
+                    photoIds: Array(dates.keys),
+                    fromEventId: eventId,
+                    photoDates: dates
+                )
+            }
+            if !unassignedDates.isEmpty {
+                AppDependencies.database.movePhotosIntoEveryday(
+                    photoIds: Array(unassignedDates.keys),
+                    fromEventId: nil,
+                    photoDates: unassignedDates
+                )
+            }
+        }.value
+
         cancelSelection()
     }
 

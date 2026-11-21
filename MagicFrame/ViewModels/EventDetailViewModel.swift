@@ -1800,16 +1800,25 @@ final class EventDetailViewModel: ObservableObject {
         return PhotoMoveWindow.evaluate(dates: dates, windowStart: start, windowEnd: end)
     }
 
-    func moveSelectedPhotosToEveryday() {
+    func moveSelectedPhotosToEveryday() async {
         let dates = selectedPhotoDateMap()
         guard !dates.isEmpty else { return }
         isMovingPhotos = true
         defer { isMovingPhotos = false }
-        database.movePhotosIntoEveryday(
-            photoIds: Array(dates.keys),
-            fromEventId: event.eventId,
-            photoDates: dates
-        )
+
+        // Let the "Moving photos…" overlay paint before the DB queue blocks.
+        await Task.yield()
+
+        let photoIds = Array(dates.keys)
+        let fromEventId = event.eventId
+        await Task.detached(priority: .userInitiated) {
+            AppDependencies.database.movePhotosIntoEveryday(
+                photoIds: photoIds,
+                fromEventId: fromEventId,
+                photoDates: dates
+            )
+        }.value
+
         finishPhotoMove()
     }
 

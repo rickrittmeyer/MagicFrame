@@ -3103,31 +3103,49 @@ final class PhotoDatabase: @unchecked Sendable {
             let date = photoDates[photoId] ?? Date()
             return EverydayPhotos.monthBounds(containing: date).start
         }
-        var destinationIds: [Int] = []
+
         for (monthStart, ids) in grouped {
             let eventId = eventRepository.findOrCreateEverydayEvent(containing: monthStart)
             guard eventId != fromEventId else { continue }
-            updateEventAttribute(
-                eventId: eventId,
-                field: .eventType,
-                value: EverydayPhotos.tagValue
-            )
+
+            // Tag once; existing Everyday months already carry this attribute.
+            if getEvent(eventId: eventId)?.eventType?
+                .localizedCaseInsensitiveCompare(EverydayPhotos.tagValue) != .orderedSame
+            {
+                updateEventAttribute(
+                    eventId: eventId,
+                    field: .eventType,
+                    value: EverydayPhotos.tagValue
+                )
+            }
+
+            // Skip destination summary/cover — restoreEverydayMonthShell resets them —
+            // and defer empty-event cleanup until all months finish.
             eventRepository.movePhotosToEvent(
                 photoIds: ids,
                 fromEventId: fromEventId,
                 toEventId: eventId,
                 photoDates: photoDates,
-                expandDestinationDates: false
+                expandDestinationDates: false,
+                refreshDestination: false,
+                cleanupEmpty: false
             )
             eventRepository.restoreEverydayMonthShell(eventId: eventId, containing: monthStart)
-            destinationIds.append(eventId)
         }
-        var touched = destinationIds
+
+        eventRepository.performCleanupEmptyEvents()
+
+        // Everyday destinations skip place assignment by name; only re-cluster the source.
         if let fromEventId {
-            touched.append(fromEventId)
+            refreshPlacesAfterMembershipChange(eventIds: [fromEventId])
+
+            // Score-card rescoring walks every remaining photo × every vision tag and
+            // can take minutes on large events. Do it off the move critical path.
+            let sourceEventId = fromEventId
+            Task.detached(priority: .utility) { [weak self] in
+                self?.rescoreTagsAfterMembershipChange(eventIds: [sourceEventId])
+            }
         }
-        refreshPlacesAfterMembershipChange(eventIds: touched)
-        rescoreTagsAfterMembershipChange(eventIds: touched)
     }
 
     func movePhotosOntoEvent(

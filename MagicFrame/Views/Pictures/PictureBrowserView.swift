@@ -754,7 +754,7 @@ struct PictureBrowserView: View {
             },
             onMoveToEveryday: {
                 guard vm.selectedCount > 0 else { return }
-                vm.moveSelectedPhotosToEveryday()
+                Task { await vm.moveSelectedPhotosToEveryday() }
             }
         )
     }

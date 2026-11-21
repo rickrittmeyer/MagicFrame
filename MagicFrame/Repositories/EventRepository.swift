@@ -3692,7 +3692,9 @@ final class EventRepository {
         fromEventId: Int?,
         toEventId: Int,
         photoDates: [String: Date],
-        expandDestinationDates: Bool = true
+        expandDestinationDates: Bool = true,
+        refreshDestination: Bool = true,
+        cleanupEmpty: Bool = true
     ) {
         sync {
             movePhotosToEventUnsafe(
@@ -3700,8 +3702,16 @@ final class EventRepository {
                 fromEventId: fromEventId,
                 toEventId: toEventId,
                 photoDates: photoDates,
-                expandDestinationDates: expandDestinationDates
+                expandDestinationDates: expandDestinationDates,
+                refreshDestination: refreshDestination,
+                cleanupEmpty: cleanupEmpty
             )
+        }
+    }
+
+    func performCleanupEmptyEvents() {
+        sync {
+            cleanupEmptyEvents()
         }
     }
 
@@ -3781,43 +3791,118 @@ final class EventRepository {
         fromEventId: Int?,
         toEventId: Int,
         photoDates: [String: Date],
-        expandDestinationDates: Bool = true
+        expandDestinationDates: Bool = true,
+        refreshDestination: Bool = true,
+        cleanupEmpty: Bool = true
     ) {
-        for photoId in photoIds {
-            if let fromEventId {
-                // Inline remove without cleanupEmptyEvents until the end.
-                let deleteSQL = """
+        guard !photoIds.isEmpty else { return }
+
+        sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil)
+
+        let now = Self.iso8601Formatter.string(from: Date())
+        let assignmentMethod = PhotoEventAssignmentMethod.manualDateAdjust.rawValue
+
+        var deleteStatement: OpaquePointer?
+        var attachStatement: OpaquePointer?
+        var markStatement: OpaquePointer?
+
+        if fromEventId != nil {
+            sqlite3_prepare_v2(
+                db,
+                """
                 DELETE FROM photo_events
                 WHERE photoId = ?
                   AND eventId = ?;
-                """
-                var deleteStatement: OpaquePointer?
-                if sqlite3_prepare_v2(db, deleteSQL, -1, &deleteStatement, nil) == SQLITE_OK {
-                    sqlite3_bind_text(deleteStatement, 1, (photoId as NSString).utf8String, -1, nil)
-                    sqlite3_bind_int(deleteStatement, 2, Int32(fromEventId))
-                    sqlite3_step(deleteStatement)
-                }
-                sqlite3_finalize(deleteStatement)
+                """,
+                -1,
+                &deleteStatement,
+                nil
+            )
+        }
+
+        sqlite3_prepare_v2(
+            db,
+            """
+            INSERT INTO photo_events (
+                photoId, eventId, assignmentConfidence, assignmentMethod, assignedAt, needsReview
+            )
+            VALUES (?, ?, NULL, ?, ?, 0)
+            ON CONFLICT(photoId, eventId) DO UPDATE SET
+                assignmentConfidence = excluded.assignmentConfidence,
+                assignmentMethod = excluded.assignmentMethod,
+                assignedAt = excluded.assignedAt,
+                needsReview = excluded.needsReview;
+            """,
+            -1,
+            &attachStatement,
+            nil
+        )
+
+        sqlite3_prepare_v2(
+            db,
+            """
+            UPDATE photos
+            SET eventAssignedAt = ?,
+                eventNeedsReview = 0
+            WHERE id = ?;
+            """,
+            -1,
+            &markStatement,
+            nil
+        )
+
+        for photoId in photoIds {
+            if let fromEventId, let deleteStatement {
+                sqlite3_reset(deleteStatement)
+                sqlite3_clear_bindings(deleteStatement)
+                sqlite3_bind_text(deleteStatement, 1, (photoId as NSString).utf8String, -1, nil)
+                sqlite3_bind_int(deleteStatement, 2, Int32(fromEventId))
+                sqlite3_step(deleteStatement)
             }
 
-            attachPhotoToEvent(
-                photoId: photoId,
-                eventId: toEventId,
-                assignmentMethod: .manualDateAdjust
-            )
-            markPhotoEventAssigned(photoId: photoId)
+            if let attachStatement {
+                sqlite3_reset(attachStatement)
+                sqlite3_clear_bindings(attachStatement)
+                sqlite3_bind_text(attachStatement, 1, (photoId as NSString).utf8String, -1, nil)
+                sqlite3_bind_int(attachStatement, 2, Int32(toEventId))
+                sqlite3_bind_text(attachStatement, 3, (assignmentMethod as NSString).utf8String, -1, nil)
+                sqlite3_bind_text(attachStatement, 4, (now as NSString).utf8String, -1, nil)
+                sqlite3_step(attachStatement)
+            }
+
+            if let markStatement {
+                sqlite3_reset(markStatement)
+                sqlite3_clear_bindings(markStatement)
+                sqlite3_bind_text(markStatement, 1, (now as NSString).utf8String, -1, nil)
+                sqlite3_bind_text(markStatement, 2, (photoId as NSString).utf8String, -1, nil)
+                sqlite3_step(markStatement)
+            }
 
             if expandDestinationDates, let photoDate = photoDates[photoId] {
                 expandEventDatesAfterAttach(eventId: toEventId, photoDate: photoDate)
             }
         }
 
-        var touched = Set<Int>([toEventId])
+        if let deleteStatement { sqlite3_finalize(deleteStatement) }
+        if let attachStatement { sqlite3_finalize(attachStatement) }
+        if let markStatement { sqlite3_finalize(markStatement) }
+
+        sqlite3_exec(db, "COMMIT;", nil, nil, nil)
+
+        var touched = Set<Int>()
         if let fromEventId {
             touched.insert(fromEventId)
         }
-        refreshSummariesAndCovers(for: touched)
-        cleanupEmptyEvents()
+        if refreshDestination {
+            touched.insert(toEventId)
+        }
+        if !touched.isEmpty {
+            refreshSummariesAndCovers(for: touched)
+        }
+
+        if cleanupEmpty {
+            cleanupEmptyEvents()
+        }
     }
 
 
