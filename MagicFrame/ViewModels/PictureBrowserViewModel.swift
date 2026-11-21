@@ -672,14 +672,16 @@ final class PictureBrowserViewModel: ObservableObject {
                 AppDependencies.database.movePhotosIntoEveryday(
                     photoIds: Array(dates.keys),
                     fromEventId: eventId,
-                    photoDates: dates
+                    photoDates: dates,
+                    emptyingSource: false
                 )
             }
             if !unassignedDates.isEmpty {
                 AppDependencies.database.movePhotosIntoEveryday(
                     photoIds: Array(unassignedDates.keys),
                     fromEventId: nil,
-                    photoDates: unassignedDates
+                    photoDates: unassignedDates,
+                    emptyingSource: false
                 )
             }
         }.value

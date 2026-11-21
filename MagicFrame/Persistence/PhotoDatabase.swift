@@ -3094,10 +3094,13 @@ final class PhotoDatabase: @unchecked Sendable {
     }
 
     /// Sends each photo to the Everyday Photos month for its own date. Creates that month when needed.
+    /// When `emptyingSource` is true, skips source summary/place/rescore work and soft-deletes the
+    /// known source event after membership moves instead of a full-table empty scan.
     func movePhotosIntoEveryday(
         photoIds: [String],
         fromEventId: Int?,
-        photoDates: [String: Date]
+        photoDates: [String: Date],
+        emptyingSource: Bool = false
     ) {
         let grouped = Dictionary(grouping: photoIds) { photoId -> Date in
             let date = photoDates[photoId] ?? Date()
@@ -3108,19 +3111,15 @@ final class PhotoDatabase: @unchecked Sendable {
             let eventId = eventRepository.findOrCreateEverydayEvent(containing: monthStart)
             guard eventId != fromEventId else { continue }
 
-            // Tag once; existing Everyday months already carry this attribute.
-            if getEvent(eventId: eventId)?.eventType?
-                .localizedCaseInsensitiveCompare(EverydayPhotos.tagValue) != .orderedSame
-            {
-                updateEventAttribute(
-                    eventId: eventId,
-                    field: .eventType,
-                    value: EverydayPhotos.tagValue
-                )
-            }
+            // Idempotent tag write — cheaper than getEvent + attribute join just to check.
+            updateEventAttribute(
+                eventId: eventId,
+                field: .eventType,
+                value: EverydayPhotos.tagValue
+            )
 
-            // Skip destination summary/cover — restoreEverydayMonthShell resets them —
-            // and defer empty-event cleanup until all months finish.
+            // Skip destination summary/cover — restoreEverydayMonthShell resets them.
+            // When emptying the source, also skip per-month source summary/cover refreshes.
             eventRepository.movePhotosToEvent(
                 photoIds: ids,
                 fromEventId: fromEventId,
@@ -3128,9 +3127,15 @@ final class PhotoDatabase: @unchecked Sendable {
                 photoDates: photoDates,
                 expandDestinationDates: false,
                 refreshDestination: false,
+                refreshSource: !emptyingSource,
                 cleanupEmpty: false
             )
             eventRepository.restoreEverydayMonthShell(eventId: eventId, containing: monthStart)
+        }
+
+        if emptyingSource, let fromEventId {
+            eventRepository.softDeleteEventIfEmpty(eventId: fromEventId)
+            return
         }
 
         eventRepository.performCleanupEmptyEvents()

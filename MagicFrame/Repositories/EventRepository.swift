@@ -3694,6 +3694,7 @@ final class EventRepository {
         photoDates: [String: Date],
         expandDestinationDates: Bool = true,
         refreshDestination: Bool = true,
+        refreshSource: Bool = true,
         cleanupEmpty: Bool = true
     ) {
         sync {
@@ -3704,6 +3705,7 @@ final class EventRepository {
                 photoDates: photoDates,
                 expandDestinationDates: expandDestinationDates,
                 refreshDestination: refreshDestination,
+                refreshSource: refreshSource,
                 cleanupEmpty: cleanupEmpty
             )
         }
@@ -3713,6 +3715,49 @@ final class EventRepository {
         sync {
             cleanupEmptyEvents()
         }
+    }
+
+    /// Soft-deletes a single known event when it has no remaining photos.
+    func softDeleteEventIfEmpty(eventId: Int) {
+        sync {
+            softDeleteEventIfEmptyUnsafe(eventId: eventId)
+        }
+    }
+
+    private func softDeleteEventIfEmptyUnsafe(eventId: Int) {
+        let now = Self.iso8601Formatter.string(from: Date())
+        let sql = """
+        UPDATE events
+        SET isDeleted = 1,
+            deletedAt = ?,
+            updatedAt = ?
+        WHERE eventId = ?
+          AND isDeleted = 0
+          AND COALESCE(isTripEvent, 0) = 0
+          AND NOT EXISTS (
+                SELECT 1
+                FROM photo_events pe
+                JOIN photos p ON p.id = pe.photoId
+                WHERE p.isDeleted = 0
+                  AND (
+                        pe.eventId = events.eventId
+                        OR pe.eventId IN (
+                            SELECT child.eventId
+                            FROM events child
+                            WHERE child.parentEventId = events.eventId
+                              AND child.isDeleted = 0
+                        )
+                  )
+          );
+        """
+        var statement: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            sqlite3_bind_text(statement, 1, (now as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, 2, (now as NSString).utf8String, -1, nil)
+            sqlite3_bind_int(statement, 3, Int32(eventId))
+            sqlite3_step(statement)
+        }
+        sqlite3_finalize(statement)
     }
 
     /// One Everyday Photos event per calendar month. Creates it the first time a photo needs that month.
@@ -3793,6 +3838,7 @@ final class EventRepository {
         photoDates: [String: Date],
         expandDestinationDates: Bool = true,
         refreshDestination: Bool = true,
+        refreshSource: Bool = true,
         cleanupEmpty: Bool = true
     ) {
         guard !photoIds.isEmpty else { return }
@@ -3890,7 +3936,7 @@ final class EventRepository {
         sqlite3_exec(db, "COMMIT;", nil, nil, nil)
 
         var touched = Set<Int>()
-        if let fromEventId {
+        if refreshSource, let fromEventId {
             touched.insert(fromEventId)
         }
         if refreshDestination {

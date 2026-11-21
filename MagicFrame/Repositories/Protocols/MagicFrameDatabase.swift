@@ -325,7 +325,8 @@ protocol MagicFrameDatabase: AnyObject {
     func movePhotosIntoEveryday(
         photoIds: [String],
         fromEventId: Int?,
-        photoDates: [String: Date]
+        photoDates: [String: Date],
+        emptyingSource: Bool
     )
     func movePhotosOntoEvent(
         photoIds: [String],

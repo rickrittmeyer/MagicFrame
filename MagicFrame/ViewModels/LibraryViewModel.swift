@@ -2637,7 +2637,18 @@ final class LibraryViewModel: ObservableObject {
 
     private func removeEventFromList(eventId: Int) {
         events.removeAll { $0.eventId == eventId }
-        rebuildEventSections()
+        onFrameEventIdsCache?.remove(eventId)
+        // Filter in memory — avoid getSlideshowPhotoIds / game-result re-query on MainActor.
+        eventSections = eventSections.compactMap { section in
+            let items = section.items.filter { $0.event.eventId != eventId }
+            guard !items.isEmpty else { return nil }
+            return EventYearSection(
+                year: section.year,
+                items: items,
+                presentation: section.presentation,
+                headerTitle: section.headerTitle
+            )
+        }
         let title = activeEventListFilter.navigationTitle
         setBaseStatus("\(events.count.formatted()) \(title.lowercased())")
     }
