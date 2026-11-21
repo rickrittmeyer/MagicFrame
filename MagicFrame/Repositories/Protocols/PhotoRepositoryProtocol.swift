@@ -18,7 +18,8 @@ protocol PhotoRepositoryProtocol: AnyObject {
         orientation: String,
         qualityScore: Int
     )
-    func markPhotosDeletedIfMissing(currentIds: Set<String>)
+    @discardableResult
+    func markPhotosDeletedIfMissing(currentIds: Set<String>) -> Int
     func getRecentPhotos(limit: Int) -> [IndexedPhoto]
     func updateFaceMetrics(photoId: String, eyesOpenScore: Double, smileScore: Double)
     func clearFaceMetrics(forPhotoIds photoIds: [String])

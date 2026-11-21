@@ -28,6 +28,10 @@ protocol MagicFrameDatabase: AnyObject {
         orientation: String,
         qualityScore: Int
     )
+    /// Soft-deletes indexed photos whose `localIdentifier` is not in `currentIds`, then
+    /// refreshes covers and soft-deletes empty events. Returns how many photos were marked deleted.
+    @discardableResult
+    func reconcileDeletedLibraryPhotos(currentIds: Set<String>) -> Int
     func getRecentPhotos(limit: Int) -> [IndexedPhoto]
     func countPhotosMissingLocation() -> Int
     func countActivePhotos() -> Int

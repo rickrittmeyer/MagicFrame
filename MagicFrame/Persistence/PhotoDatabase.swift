@@ -126,8 +126,22 @@ final class PhotoDatabase: @unchecked Sendable {
         )
     }
 
-    func markPhotosDeletedIfMissing(currentIds: Set<String>) {
+    @discardableResult
+    func markPhotosDeletedIfMissing(currentIds: Set<String>) -> Int {
         photoRepository.markPhotosDeletedIfMissing(currentIds: currentIds)
+    }
+
+    @discardableResult
+    func reconcileDeletedLibraryPhotos(currentIds: Set<String>) -> Int {
+        let deletedCount = photoRepository.markPhotosDeletedIfMissing(currentIds: currentIds)
+        guard deletedCount > 0 else { return 0 }
+
+        eventRepository.updateAllEventCoverPhotos()
+        dbQueue.sync {
+            eventRepository.cleanupEmptyEvents()
+            eventRepository.rebuildEventPeople()
+        }
+        return deletedCount
     }
 
     

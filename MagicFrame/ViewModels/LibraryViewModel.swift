@@ -49,12 +49,13 @@ final class LibraryViewModel: ObservableObject {
     @Published var isLoadingRecentPhotos: Bool = false
     @Published var isIndexingPhotos: Bool = false
     @Published var isMaintainingEvents: Bool = false
+    @Published var isReconcilingPhotos: Bool = false
     @Published var indexedPhotoCount: Int = 0
     @Published var showHomeOnboarding = false
     @Published var showHiddenEvents = false
 
     var isLibraryBusy: Bool {
-        isIndexingPhotos || isSyncingEvents
+        isIndexingPhotos || isSyncingEvents || isReconcilingPhotos
     }
 
     /// Photo import replaces the events list; sync/rebuild keeps it visible and refreshes in place.
@@ -69,6 +70,9 @@ final class LibraryViewModel: ObservableObject {
     var showsBackgroundWorkBanner: Bool {
         isLibraryBusy || isMaintainingEvents || isShowingGeocodeProgress
     }
+
+    private static let lastPhotoReconcileDefaultsKey = "lastPhotoLibraryReconcileAt"
+    private static let photoReconcileThrottleInterval: TimeInterval = 6 * 60 * 60
 
     var eventsEmptyHint: String {
         if showHomeOnboarding {
@@ -156,6 +160,7 @@ final class LibraryViewModel: ObservableObject {
             isSyncingEvents = false
             isMaintainingEvents = false
             isIndexingPhotos = false
+            isReconcilingPhotos = false
             isShowingGeocodeProgress = false
         }
 
@@ -181,6 +186,7 @@ final class LibraryViewModel: ObservableObject {
 
             if eventCount > 0 {
                 await reloadEventsAsync()
+                await reconcileDeletedPhotosIfNeeded(force: false)
                 await MainActor.run {
                     pipelineTask = nil
                 }
@@ -189,8 +195,21 @@ final class LibraryViewModel: ObservableObject {
         }
 
         await continueLibraryBootstrap()
+        await reconcileDeletedPhotosIfNeeded(force: false)
         await MainActor.run {
             pipelineTask = nil
+        }
+    }
+
+    func handleScenePhaseActive() {
+        guard pipelineTask == nil else { return }
+        guard !isLibraryBusy else { return }
+
+        pipelineTask = Task.detached(priority: .utility) { [weak self] in
+            await self?.reconcileDeletedPhotosIfNeeded(force: false)
+            await MainActor.run {
+                self?.pipelineTask = nil
+            }
         }
     }
 
@@ -199,6 +218,7 @@ final class LibraryViewModel: ObservableObject {
         pipelineTask?.cancel()
         pipelineTask = Task.detached(priority: .utility) { [weak self] in
             await self?.continueLibraryBootstrap(reindexAfterHomeSetup: true)
+            await self?.reconcileDeletedPhotosIfNeeded(force: false)
             await MainActor.run {
                 self?.pipelineTask = nil
             }
@@ -297,6 +317,7 @@ final class LibraryViewModel: ObservableObject {
         isSyncingEvents = false
         isMaintainingEvents = false
         isIndexingPhotos = false
+        isReconcilingPhotos = false
         isShowingGeocodeProgress = false
         publishStatusThrottled("Background work stopped", force: true)
     }
@@ -340,7 +361,7 @@ final class LibraryViewModel: ObservableObject {
         statusText = "Indexing photos…"
 
         let db = database
-        let indexedCount = await Task.detached(priority: .utility) { [weak self] in
+        let indexResult = await Task.detached(priority: .utility) { [weak self] in
             Self.enumeratePhotoLibrary(database: db) { count in
                 guard count == 1 || count % 1000 == 0 else { return }
                 Task { @MainActor in
@@ -349,18 +370,76 @@ final class LibraryViewModel: ObservableObject {
             }
         }.value
 
+        var deletedCount = 0
+        if status == .authorized {
+            publishStatusThrottled("Removing deleted photos…", force: true)
+            deletedCount = await Task.detached(priority: .utility) {
+                db.reconcileDeletedLibraryPhotos(currentIds: indexResult.ids)
+            }.value
+            Self.markPhotoReconcileCompleted()
+        }
+
         await Task.detached(priority: .utility) {
             db.importPeopleFromAlbums()
             db.rebuildEventPeople()
         }.value
 
-        setBaseStatus("Indexed \(indexedCount.formatted()) photos — building events…")
+        if deletedCount > 0 {
+            setBaseStatus(
+                "Indexed \(indexResult.count.formatted()) photos, removed \(deletedCount.formatted()) deleted — building events…"
+            )
+        } else {
+            setBaseStatus("Indexed \(indexResult.count.formatted()) photos — building events…")
+        }
     }
 
-    private nonisolated static func enumeratePhotoLibrary(
-        database: any MagicFrameDatabase,
-        onProgress: @escaping @Sendable (Int) -> Void
-    ) -> Int {
+    /// Soft-deletes SQLite photos that no longer exist in the Photos library, then refreshes covers/events.
+    /// Skips Limited Library access (unseen assets would look "deleted"). Throttled unless `force`.
+    func reconcileDeletedPhotosIfNeeded(force: Bool = false) async {
+        guard !isIndexingPhotos, !isSyncingEvents, !isReconcilingPhotos else { return }
+        if !force, !Self.shouldReconcilePhotosNow() { return }
+
+        let authStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard authStatus == .authorized else { return }
+        guard indexedPhotoCount > 0 else { return }
+
+        isReconcilingPhotos = true
+        publishStatusThrottled("Checking for deleted photos…", force: true)
+        defer { isReconcilingPhotos = false }
+
+        if Task.isCancelled { return }
+
+        let db = database
+        let deletedCount = await Task.detached(priority: .utility) {
+            let currentIds = Self.fetchCurrentPhotoLibraryIds()
+            return db.reconcileDeletedLibraryPhotos(currentIds: currentIds)
+        }.value
+
+        Self.markPhotoReconcileCompleted()
+
+        if Task.isCancelled { return }
+
+        if deletedCount > 0 {
+            await reloadEventsAsync()
+            refreshLibraryCounts()
+            setBaseStatus("Removed \(deletedCount.formatted()) deleted photo(s)")
+        } else if !isShowingGeocodeProgress {
+            statusText = baseStatusText
+        }
+    }
+
+    private nonisolated static func shouldReconcilePhotosNow() -> Bool {
+        guard let last = UserDefaults.standard.object(forKey: lastPhotoReconcileDefaultsKey) as? Date else {
+            return true
+        }
+        return Date().timeIntervalSince(last) >= photoReconcileThrottleInterval
+    }
+
+    private nonisolated static func markPhotoReconcileCompleted() {
+        UserDefaults.standard.set(Date(), forKey: lastPhotoReconcileDefaultsKey)
+    }
+
+    private nonisolated static func photoLibraryFetchOptions() -> PHFetchOptions {
         let startDate = Calendar.current.date(byAdding: .year, value: -100, to: Date())
             ?? Date.distantPast
         let options = PHFetchOptions()
@@ -369,9 +448,27 @@ final class LibraryViewModel: ObservableObject {
             startDate as NSDate,
             PHAssetMediaType.image.rawValue
         )
+        return options
+    }
 
-        let assets = PHAsset.fetchAssets(with: options)
+    private nonisolated static func fetchCurrentPhotoLibraryIds() -> Set<String> {
+        let assets = PHAsset.fetchAssets(with: photoLibraryFetchOptions())
+        var ids = Set<String>()
+        ids.reserveCapacity(assets.count)
+        assets.enumerateObjects { asset, _, _ in
+            ids.insert(asset.localIdentifier)
+        }
+        return ids
+    }
+
+    private nonisolated static func enumeratePhotoLibrary(
+        database: any MagicFrameDatabase,
+        onProgress: @escaping @Sendable (Int) -> Void
+    ) -> (count: Int, ids: Set<String>) {
+        let assets = PHAsset.fetchAssets(with: photoLibraryFetchOptions())
         var count = 0
+        var ids = Set<String>()
+        ids.reserveCapacity(assets.count)
         let dateFormatter = ISO8601DateFormatter()
 
         assets.enumerateObjects { asset, _, _ in
@@ -404,8 +501,11 @@ final class LibraryViewModel: ObservableObject {
             }
             qualityScore = max(0, min(100, qualityScore))
 
+            let id = asset.localIdentifier
+            ids.insert(id)
+
             database.upsertPhoto(
-                id: asset.localIdentifier,
+                id: id,
                 creationDate: dateFormatter.string(from: asset.creationDate ?? Date()),
                 modificationDate: dateFormatter.string(from: asset.modificationDate ?? Date()),
                 mediaType: asset.mediaType.rawValue,
@@ -429,7 +529,7 @@ final class LibraryViewModel: ObservableObject {
         }
 
         onProgress(count)
-        return count
+        return (count, ids)
     }
 
     func cancelEventSync() {

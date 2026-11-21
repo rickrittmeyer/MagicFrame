@@ -75,15 +75,21 @@ final class PhotoRepository {
         }
     }
 
-    func markPhotosDeletedIfMissing(currentIds: Set<String>) {
-        let existingIds = fetchAllActivePhotoIds()
-        let now = ISO8601DateFormatter().string(from: Date())
+    @discardableResult
+    func markPhotosDeletedIfMissing(currentIds: Set<String>) -> Int {
+        queue.sync {
+            let existingIds = fetchAllActivePhotoIds()
+            let now = ISO8601DateFormatter().string(from: Date())
+            var deletedCount = 0
 
-        for id in existingIds where !currentIds.contains(id) {
-            markPhotoDeleted(photoId: id, deletedAt: now)
+            for id in existingIds where !currentIds.contains(id) {
+                markPhotoDeleted(photoId: id, deletedAt: now)
+                deletedCount += 1
+            }
+
+            print("Soft delete check complete — marked \(deletedCount) missing photo(s)")
+            return deletedCount
         }
-
-        print("Soft delete check complete")
     }
 
     func getRecentPhotos(limit: Int = 100) -> [IndexedPhoto] {

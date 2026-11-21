@@ -146,6 +146,8 @@ struct ContentView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
+            case .active:
+                vm.handleScenePhaseActive()
             case .background:
                 vm.cancelEventSync()
             default:
