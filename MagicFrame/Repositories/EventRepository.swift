@@ -1286,14 +1286,19 @@ final class EventRepository {
 
 
     func setPhotosShowOnFrame(photoIds: [String], show: Bool) {
-    guard !photoIds.isEmpty else { return }
+        guard !photoIds.isEmpty else { return }
+        setPhotosShowOnFrame(
+            updates: Dictionary(uniqueKeysWithValues: photoIds.map { ($0, show) })
+        )
+    }
 
-    sync {
-        var touchedEventIds = Set<Int>()
+    func setPhotosShowOnFrame(updates: [String: Bool]) {
+        guard !updates.isEmpty else { return }
 
-        for photoId in photoIds {
-            guard let eventId = getEventIdForPhotoUnsafe(photoId: photoId) else { continue }
+        sync {
+            sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil)
 
+            var touchedEventIds = Set<Int>()
             let sql = """
             UPDATE photo_events
             SET includeInSlideshow = ?
@@ -1301,21 +1306,27 @@ final class EventRepository {
               AND eventId = ?;
             """
 
-            var statement: OpaquePointer?
+            for (photoId, show) in updates {
+                guard let eventId = getEventIdForPhotoUnsafe(photoId: photoId) else { continue }
 
-            if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
-                sqlite3_bind_int(statement, 1, show ? 1 : 0)
-                sqlite3_bind_text(statement, 2, (photoId as NSString).utf8String, -1, nil)
-                sqlite3_bind_int(statement, 3, Int32(eventId))
-                sqlite3_step(statement)
+                var statement: OpaquePointer?
+
+                if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+                    sqlite3_bind_int(statement, 1, show ? 1 : 0)
+                    sqlite3_bind_text(statement, 2, (photoId as NSString).utf8String, -1, nil)
+                    sqlite3_bind_int(statement, 3, Int32(eventId))
+                    sqlite3_step(statement)
+                }
+
+                sqlite3_finalize(statement)
+                touchedEventIds.insert(eventId)
             }
 
-            sqlite3_finalize(statement)
-            touchedEventIds.insert(eventId)
-        }
+            sqlite3_exec(db, "COMMIT;", nil, nil, nil)
 
-        refreshSummariesAndCovers(for: touchedEventIds)
-    }
+            // Frame membership does not change people links; skip full event_people rebuild.
+            refreshSummariesAndCovers(for: touchedEventIds, rebuildPeople: false)
+        }
     }
 
 
@@ -1380,7 +1391,10 @@ final class EventRepository {
     }
 
 
-    func refreshSummariesAndCovers(for eventIds: Set<Int>) {
+    func refreshSummariesAndCovers(
+        for eventIds: Set<Int>,
+        rebuildPeople: Bool = true
+    ) {
     var refreshed = Set<Int>()
 
     for eventId in eventIds {
@@ -1395,7 +1409,9 @@ final class EventRepository {
         }
     }
 
-    rebuildEventPeople()
+    if rebuildPeople {
+        rebuildEventPeople()
+    }
     }
 
 

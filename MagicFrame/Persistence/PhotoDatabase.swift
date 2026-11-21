@@ -526,6 +526,10 @@ final class PhotoDatabase: @unchecked Sendable {
         photoRepository.clearCropFocus(photoId: photoId)
     }
 
+    func clearCropFocuses(photoIds: [String]) {
+        photoRepository.clearCropFocuses(photoIds: photoIds)
+    }
+
 
     // MARK: - Event repository forwards
 
@@ -613,6 +617,10 @@ final class PhotoDatabase: @unchecked Sendable {
 
     func setPhotosShowOnFrame(photoIds: [String], show: Bool) {
         eventRepository.setPhotosShowOnFrame(photoIds: photoIds, show: show)
+    }
+
+    func setPhotosShowOnFrame(updates: [String: Bool]) {
+        eventRepository.setPhotosShowOnFrame(updates: updates)
     }
 
     func setPhotosHiddenInEvent(photoIds: [String], hidden: Bool) {

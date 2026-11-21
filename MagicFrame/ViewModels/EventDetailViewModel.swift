@@ -503,20 +503,48 @@ final class EventDetailViewModel: ObservableObject {
         guard !selectedPhotoIds.isEmpty else { return }
 
         if show {
+            var frameUpdates: [String: Bool] = [:]
+            // Last selected member of a stack wins exclusivity / pick, matching prior per-photo behavior.
+            var stackPickUpdates: [String: (groupPhotoIds: [String], pickedPhotoIds: Set<String>)] = [:]
+
             for photoId in selectedPhotoIds {
-                let group = similarGroup(containingPhotoId: photoId)
-                setPhotoOnFrame(photoId: photoId, show: true, in: group)
+                frameUpdates[photoId] = true
+
+                guard let group = similarGroup(containingPhotoId: photoId), group.isStack else {
+                    continue
+                }
+
+                for sibling in group.photos where sibling.id != photoId {
+                    frameUpdates[sibling.id] = false
+                }
+
+                stackPickUpdates[group.id] = (
+                    groupPhotoIds: group.photos.map(\.id),
+                    pickedPhotoIds: [photoId]
+                )
             }
+
+            for update in stackPickUpdates.values {
+                database.setSimilarGroupPicks(
+                    groupPhotoIds: update.groupPhotoIds,
+                    pickedPhotoIds: update.pickedPhotoIds
+                )
+            }
+
+            database.setPhotosShowOnFrame(updates: frameUpdates)
+            database.clearCropFocuses(
+                photoIds: frameUpdates.compactMap { $0.value ? $0.key : nil }
+            )
         } else {
             database.setPhotosShowOnFrame(
                 photoIds: Array(selectedPhotoIds),
                 show: false
             )
-            loadPhotos()
-            refreshEvent()
         }
 
         cancelPhotoSelection()
+        loadPhotos()
+        refreshEvent()
     }
 
     @discardableResult
@@ -643,17 +671,16 @@ final class EventDetailViewModel: ObservableObject {
     func setPhotoOnFrame(photoId: String, show: Bool, in group: SimilarPhotoGroup? = nil) {
         guard photos.contains(where: { $0.id == photoId }) else { return }
 
-        let owningEventId = database.getEventIdForPhoto(photoId: photoId) ?? event.eventId
+        var frameUpdates: [String: Bool] = [photoId: show]
+        var pickUpdates: [String: Bool] = [:]
 
         if show, let group, group.isStack {
             for sibling in group.photos where sibling.id != photoId {
-                let siblingEventId = database.getEventIdForPhoto(photoId: sibling.id) ?? owningEventId
-                database.setPhotoShowOnFrame(
-                    photoId: sibling.id,
-                    eventId: siblingEventId,
-                    show: false
-                )
+                frameUpdates[sibling.id] = false
+                pickUpdates[sibling.id] = false
             }
+
+            pickUpdates[photoId] = true
 
             database.setSimilarGroupPicks(
                 groupPhotoIds: group.photos.map(\.id),
@@ -661,19 +688,43 @@ final class EventDetailViewModel: ObservableObject {
             )
         }
 
-        database.setPhotoShowOnFrame(
-            photoId: photoId,
-            eventId: owningEventId,
-            show: show
-        )
-
+        database.setPhotosShowOnFrame(updates: frameUpdates)
         database.clearCropFocus(photoId: photoId)
 
-        loadPhotos()
+        applyLocalFrameUpdates(frameUpdates: frameUpdates, pickUpdates: pickUpdates)
         notifyEventUpdated()
     }
 
-    private func applyLocalPhotoUpdate(_ updated: IndexedPhoto) {
+    private func applyLocalFrameUpdates(
+        frameUpdates: [String: Bool],
+        pickUpdates: [String: Bool]
+    ) {
+        guard !frameUpdates.isEmpty || !pickUpdates.isEmpty else { return }
+
+        let photoIds = Set(frameUpdates.keys).union(pickUpdates.keys)
+        var didChange = false
+
+        for photoId in photoIds {
+            guard let existing = photos.first(where: { $0.id == photoId }) else { continue }
+            applyLocalPhotoUpdate(
+                existing.updating(
+                    showOnFrame: frameUpdates[photoId],
+                    isSimilarGroupPick: pickUpdates[photoId]
+                ),
+                rebuildDisplays: false
+            )
+            didChange = true
+        }
+
+        if didChange {
+            rebuildDisplayItems()
+        }
+    }
+
+    private func applyLocalPhotoUpdate(
+        _ updated: IndexedPhoto,
+        rebuildDisplays: Bool = true
+    ) {
         if let index = photos.firstIndex(where: { $0.id == updated.id }) {
             photos[index] = updated
         }
@@ -695,6 +746,8 @@ final class EventDetailViewModel: ObservableObject {
             }
         }
 
-        rebuildDisplayItems()
+        if rebuildDisplays {
+            rebuildDisplayItems()
+        }
     }
 }

@@ -24,6 +24,7 @@ protocol EventRepositoryProtocol: AnyObject {
     func getPhotosForEvent(eventId: Int, includeHidden: Bool) -> [IndexedPhoto]
     func setSimilarGroupPicks(groupPhotoIds: [String], pickedPhotoIds: Set<String>)
     func setPhotosShowOnFrame(photoIds: [String], show: Bool)
+    func setPhotosShowOnFrame(updates: [String: Bool])
     func setPhotosHiddenInEvent(photoIds: [String], hidden: Bool)
     func getEventIdForPhoto(photoId: String) -> Int?
     func getSubEvents(parentEventId: Int) -> [IndexedEvent]

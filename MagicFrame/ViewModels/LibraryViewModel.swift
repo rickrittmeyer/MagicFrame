@@ -811,7 +811,20 @@ final class LibraryViewModel: ObservableObject {
             events[index] = updated
         }
 
-        rebuildEventSections()
+        let slideshowIds = database.getSlideshowPhotoIds(for: [updated])[updated.eventId] ?? []
+
+        eventSections = eventSections.map { section in
+            guard let itemIndex = section.items.firstIndex(where: { $0.event.eventId == eventId }) else {
+                return section
+            }
+
+            var items = section.items
+            items[itemIndex] = EventListDisplayItem(
+                event: updated,
+                slideshowPhotoIds: slideshowIds
+            )
+            return EventYearSection(year: section.year, items: items)
+        }
     }
 
     func reloadEvents() {

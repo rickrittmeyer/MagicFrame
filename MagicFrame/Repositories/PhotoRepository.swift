@@ -257,6 +257,36 @@ final class PhotoRepository {
         updateCropFocuses(photoId: photoId, list: nil, frame: nil)
     }
 
+    func clearCropFocuses(photoIds: [String]) {
+        guard !photoIds.isEmpty else { return }
+
+        queue.sync {
+            let sql = """
+            UPDATE photos
+            SET listCropFocusX = NULL, listCropFocusY = NULL,
+                frameCropFocusX = NULL, frameCropFocusY = NULL
+            WHERE id = ?;
+            """
+
+            sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil)
+
+            for photoId in photoIds {
+                var statement: OpaquePointer?
+
+                if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+                    sqlite3_bind_text(statement, 1, (photoId as NSString).utf8String, -1, nil)
+                    if sqlite3_step(statement) != SQLITE_DONE {
+                        print("Failed to clear crop focus: \(String(cString: sqlite3_errmsg(db)))")
+                    }
+                }
+
+                sqlite3_finalize(statement)
+            }
+
+            sqlite3_exec(db, "COMMIT;", nil, nil, nil)
+        }
+    }
+
     func faceMetricsAlgorithmVersion() -> Int {
         Int(metadata.get(key: Self.faceMetricsAlgorithmVersionKey) ?? "") ?? 0
     }

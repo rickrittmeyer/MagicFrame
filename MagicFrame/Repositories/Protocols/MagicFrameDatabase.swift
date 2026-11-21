@@ -41,6 +41,7 @@ protocol MagicFrameDatabase: AnyObject {
     func setCropAlgorithmVersion(_ version: Int)
     func clearAllCropFocuses()
     func clearCropFocus(photoId: String)
+    func clearCropFocuses(photoIds: [String])
 
     // MARK: - People
 
@@ -65,6 +66,7 @@ protocol MagicFrameDatabase: AnyObject {
     func setSimilarGroupPicks(groupPhotoIds: [String], pickedPhotoIds: Set<String>)
     func setPhotosHiddenInEvent(photoIds: [String], hidden: Bool)
     func setPhotosShowOnFrame(photoIds: [String], show: Bool)
+    func setPhotosShowOnFrame(updates: [String: Bool])
     func setPhotoShowOnFrame(photoId: String, eventId: Int, show: Bool)
     func getEventIdForPhoto(photoId: String) -> Int?
     func getEventAttributeOptions(for field: EventAttributeField) -> [String]

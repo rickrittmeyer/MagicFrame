@@ -26,6 +26,7 @@ protocol PhotoRepositoryProtocol: AnyObject {
     func updateCropFocuses(photoId: String, list: PhotoCropFocus?, frame: PhotoCropFocus?)
     func clearAllCropFocuses()
     func clearCropFocus(photoId: String)
+    func clearCropFocuses(photoIds: [String])
 }
 
 extension PhotoRepository: PhotoRepositoryProtocol {}
