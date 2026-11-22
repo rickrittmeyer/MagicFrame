@@ -763,9 +763,72 @@ final class LibraryViewModel: ObservableObject {
             tripType: event.tripType,
             childEventName: event.childEventName,
             userEditedChildEventName: event.userEditedChildEventName,
-            isUserHidden: event.isUserHidden
+            isUserHidden: event.isUserHidden,
+            isFavorite: event.isFavorite
         )
         rebuildEventSections()
+    }
+
+    func setEventsOnFrame(eventIds: Set<Int>, show: Bool) {
+        guard !eventIds.isEmpty else { return }
+        for eventId in eventIds {
+            database.setEventShowOnFrame(eventId: eventId, show: show)
+        }
+        events = events.map { event in
+            guard eventIds.contains(event.eventId) else { return event }
+            return event.replacing(showOnFrame: show)
+        }
+        rebuildEventSections()
+    }
+
+    func setEventsFavorite(eventIds: Set<Int>, isFavorite: Bool) {
+        guard !eventIds.isEmpty else { return }
+        for eventId in eventIds {
+            database.setEventFavorite(eventId: eventId, isFavorite: isFavorite)
+        }
+        events = events.map { event in
+            guard eventIds.contains(event.eventId) else { return event }
+            return event.replacing(isFavorite: isFavorite)
+        }
+        rebuildEventSections()
+    }
+
+    func setEventsHidden(eventIds: Set<Int>, hidden: Bool) {
+        guard !eventIds.isEmpty else { return }
+        for eventId in eventIds {
+            database.setEventUserHidden(eventId: eventId, hidden: hidden)
+        }
+        if hidden, !showHiddenEvents {
+            events.removeAll { eventIds.contains($0.eventId) }
+        } else {
+            events = events.map { event in
+                guard eventIds.contains(event.eventId) else { return event }
+                return event.replacing(isUserHidden: hidden)
+            }
+        }
+        rebuildEventSections()
+    }
+
+    func photoIdsInEvents(_ eventIds: Set<Int>, includeHidden: Bool) -> [String] {
+        var ids: [String] = []
+        for eventId in eventIds {
+            ids.append(contentsOf: database.getPhotosForEvent(
+                eventId: eventId,
+                includeHidden: includeHidden
+            ).map(\.id))
+        }
+        return Array(Set(ids))
+    }
+
+    func deleteEvents(eventIds: Set<Int>) -> [String] {
+        let photoIds = photoIdsInEvents(eventIds, includeHidden: true)
+        database.softDeletePhotos(photoIds: photoIds)
+        for eventId in eventIds {
+            database.softDeleteEvent(eventId: eventId)
+        }
+        events.removeAll { eventIds.contains($0.eventId) }
+        rebuildEventSections()
+        return photoIds
     }
 
     func hideEvent(eventId: Int) {

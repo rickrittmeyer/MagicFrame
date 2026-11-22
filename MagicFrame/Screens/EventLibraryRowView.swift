@@ -5,6 +5,7 @@ struct EventLibraryRowView: View {
     let event: IndexedEvent
     var slideshowPhotoIds: [String] = []
     var showsHiddenBadge: Bool = false
+    var isSelected: Bool = false
     var onHide: (() -> Void)? = nil
     var onUnhide: (() -> Void)? = nil
 
@@ -39,6 +40,19 @@ struct EventLibraryRowView: View {
                 aspectRatio: photoAspectRatio,
                 cornerRadius: cornerRadius
             )
+            .contextMenu {
+                Button("Move to Everyday Photos") {}
+                Button("Delete Event") {}
+            }
+            .overlay(alignment: .topTrailing) {
+                if isSelected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.title2)
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, Color.accentColor)
+                        .padding(8)
+                }
+            }
 
             locationLine
 

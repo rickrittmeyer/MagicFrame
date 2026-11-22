@@ -11,6 +11,10 @@ struct EventPhotoFullscreenView: View {
     @State private var currentDisplayIndex: Int
     @State private var similarPhotoIndexByGroupID: [String: Int] = [:]
     @State private var zoomStateByGroupID: [String: PhotoZoomState] = [:]
+    @State private var isAskingPhotoLibraryDelete = false
+    @State private var pendingDeletePhotoId: String?
+    @State private var pendingDeleteRemovesEvent = false
+    @State private var photoLibraryError: String?
 
     init(
         viewModel: EventDetailViewModel,
@@ -90,6 +94,31 @@ struct EventPhotoFullscreenView: View {
             }
         }
         .ignoresSafeArea(edges: .bottom)
+        .confirmationDialog(
+            "Delete from Photos?",
+            isPresented: $isAskingPhotoLibraryDelete,
+            titleVisibility: .visible
+        ) {
+            Button("Delete from Photos", role: .destructive) {
+                finishPhotoDelete(alsoDeleteFromPhotos: true)
+            }
+            Button("Keep in Photos", role: .cancel) {
+                finishPhotoDelete(alsoDeleteFromPhotos: false)
+            }
+        } message: {
+            Text("Also delete this photo from the Photos app?")
+        }
+        .alert(
+            "Couldn’t Delete from Photos",
+            isPresented: Binding(
+                get: { photoLibraryError != nil },
+                set: { if !$0 { photoLibraryError = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(photoLibraryError ?? "")
+        }
         .onChange(of: displayItems.count) { _, newCount in
             if newCount == 0 {
                 onDismiss()
@@ -128,73 +157,82 @@ struct EventPhotoFullscreenView: View {
 
                     similarPhotoNavigation(for: item.group)
 
-                    HStack(spacing: 28) {
-                        frameActionButtons(for: photo, in: item)
-                    }
-                    .padding(.top, 12)
-                    .padding(.bottom, 20)
+                    photoActionBar(for: photo)
                 }
             } else {
                 VStack(spacing: 12) {
                     Spacer(minLength: 0)
 
-                    HStack(spacing: 28) {
-                        frameActionButtons(for: photo, in: item)
-                    }
-
                     bottomStatusText
-                        .padding(.bottom, 28)
+
+                    photoActionBar(for: photo)
                 }
             }
         }
     }
 
-    private func bottomOverlayHeight(for item: EventPhotoDisplayItem?) -> CGFloat {
-        guard let item else { return 0 }
-        return item.isStack ? 252 : 120
+    private func photoActionBar(for photo: IndexedPhoto) -> some View {
+        SelectionFooterBar(
+            isEnabled: true,
+            isFrameOn: photo.showOnFrame,
+            favoriteIcon: photo.isFavorite ? "heart.fill" : "heart",
+            favoriteCaption: "Fav",
+            hideIcon: "eye.slash",
+            hideCaption: "Hide",
+            onFrame: {
+                viewModel.togglePhotoOnFrame(
+                    photoId: photo.id,
+                    in: currentItem?.isStack == true ? currentItem?.group : nil
+                )
+            },
+            onFavorite: {
+                viewModel.flagPhotoAsFavorite(photoId: photo.id)
+            },
+            onHide: {
+                let shouldDismiss = viewModel.hidePhoto(photoId: photo.id)
+                if shouldDismiss {
+                    onDismiss()
+                }
+            },
+            onDelete: {
+                pendingDeletePhotoId = photo.id
+                pendingDeleteRemovesEvent = viewModel.isOnlyPhotoInEvent(photo.id)
+                isAskingPhotoLibraryDelete = true
+            }
+        ) {
+            Button("Coming Soon") {}
+        }
     }
 
-    @ViewBuilder
-    private func frameActionButtons(for photo: IndexedPhoto, in item: EventPhotoDisplayItem) -> some View {
-        Button {
-            viewModel.togglePhotoOnFrame(
-                photoId: photo.id,
-                in: item.isStack ? item.group : nil
-            )
-        } label: {
-            VStack(spacing: 4) {
-                Image(
-                    systemName: photo.showOnFrame
-                        ? "rectangle.inset.filled.and.play.fill"
-                        : "rectangle.on.rectangle"
-                )
-                .font(.title2)
-                Text(photo.showOnFrame ? "On Frame" : "Add to Frame")
-                    .font(.caption2)
+    private func finishPhotoDelete(alsoDeleteFromPhotos: Bool) {
+        guard let photoId = pendingDeletePhotoId else { return }
+        let removesEvent = pendingDeleteRemovesEvent
+        pendingDeletePhotoId = nil
+        pendingDeleteRemovesEvent = false
+        let shouldLeave = viewModel.softDeletePhoto(photoId, deletingEventIfEmpty: removesEvent)
+        if alsoDeleteFromPhotos {
+            Task {
+                if let error = await PhotoLibraryDeletion.deleteAssets(localIdentifiers: [photoId]) {
+                    photoLibraryError = error
+                }
             }
-            .foregroundStyle(photo.showOnFrame ? .green : .white)
         }
+        if shouldLeave {
+            onDismiss()
+        }
+    }
 
-        Button {
-            let shouldDismiss = viewModel.hidePhoto(photoId: photo.id)
-            if shouldDismiss {
-                onDismiss()
-            }
-        } label: {
-            VStack(spacing: 4) {
-                Image(systemName: "eye.slash")
-                    .font(.title2)
-                Text("Hide")
-                    .font(.caption2)
-            }
-            .foregroundStyle(.white)
-        }
+    private func bottomOverlayHeight(for item: EventPhotoDisplayItem?) -> CGFloat {
+        guard let item else { return 0 }
+        return item.isStack ? 300 : 148
     }
 
     @ViewBuilder
     private var bottomStatusText: some View {
         if currentItem?.isStack != true {
             Text("\(min(currentDisplayIndex + 1, max(displayItems.count, 1))) of \(displayItems.count)")
+                .font(.subheadline)
+                .foregroundStyle(.white)
         }
     }
 

@@ -6,6 +6,11 @@ struct EventDetailView: View {
     @StateObject private var vm: EventDetailViewModel
     @State private var selectedPhotoIndex: Int?
     @State private var isConfirmingHideEvent = false
+    @State private var isConfirmingSelectionDeletesEvent = false
+    @State private var isAskingSelectionPhotoLibraryDelete = false
+    @State private var pendingSelectionPhotoIds: [String] = []
+    @State private var pendingSelectionDeletesEvent = false
+    @State private var photoLibraryError: String?
     @State private var isShowingAttributePicker = false
     @State private var attributePickerField: EventAttributeField?
     @FocusState private var isNameFieldFocused: Bool
@@ -126,6 +131,46 @@ struct EventDetailView: View {
             Text(
                 "This event will now be hidden. You can find this Event again by selecting Show Hidden Events."
             )
+        }
+        .confirmationDialog(
+            "Delete Photos",
+            isPresented: $isConfirmingSelectionDeletesEvent,
+            titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) {
+                isAskingSelectionPhotoLibraryDelete = true
+            }
+            Button("Cancel", role: .cancel) {
+                pendingSelectionPhotoIds = []
+                pendingSelectionDeletesEvent = false
+            }
+        } message: {
+            Text("This event will also be deleted.")
+        }
+        .confirmationDialog(
+            "Delete from Photos?",
+            isPresented: $isAskingSelectionPhotoLibraryDelete,
+            titleVisibility: .visible
+        ) {
+            Button("Delete from Photos", role: .destructive) {
+                finishSelectionDelete(alsoDeleteFromPhotos: true)
+            }
+            Button("Keep in Photos", role: .cancel) {
+                finishSelectionDelete(alsoDeleteFromPhotos: false)
+            }
+        } message: {
+            Text("Also delete these photos from the Photos library?")
+        }
+        .alert(
+            "Couldn’t Delete from Photos",
+            isPresented: Binding(
+                get: { photoLibraryError != nil },
+                set: { if !$0 { photoLibraryError = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(photoLibraryError ?? "")
         }
         .alert(
             customOptionAlertTitle,
@@ -371,32 +416,58 @@ struct EventDetailView: View {
     }
 
     private var photoSelectionBar: some View {
-        HStack(spacing: 12) {
-            Button("Add to Frame") {
-                vm.setSelectedPhotosOnFrame(true)
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(vm.selectedPhotoCount == 0)
-
-            Button("Remove from Frame") {
-                vm.setSelectedPhotosOnFrame(false)
-            }
-            .buttonStyle(.bordered)
-            .disabled(vm.selectedPhotoCount == 0)
-
-            Button("Hide", role: .destructive) {
-                if vm.hideSelectedPhotos() {
+        let favoriteOn = vm.selectedAllFavorite
+        let hiddenOn = vm.selectedAllHidden
+        return SelectionFooterBar(
+            isEnabled: !vm.selectedPhotoIds.isEmpty,
+            isFrameOn: vm.selectedAllOnFrame,
+            favoriteIcon: favoriteOn ? "heart.fill" : "heart",
+            favoriteCaption: favoriteOn ? "Unfav" : "Fav",
+            hideIcon: hiddenOn ? "eye.slash" : "eye",
+            hideCaption: hiddenOn ? "Unhide" : "Hide",
+            onFrame: { vm.toggleSelectedOnFrame() },
+            onFavorite: { vm.toggleSelectedFavorite() },
+            onHide: {
+                if vm.toggleSelectedHidden() {
                     dismiss()
                 }
-            }
-            .buttonStyle(.bordered)
-            .disabled(vm.selectedPhotoCount == 0)
+            },
+            onDelete: { beginSelectionDelete() }
+        ) {
+            Button("Adjust Date & Time") {}
+            Button("Adjust Location") {}
+            Button("Adjust Date and Location") {}
+            Button("Move to Everyday Photos") {}
+            Button("Move to an Event") {}
         }
-        .font(.subheadline)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-        .frame(maxWidth: .infinity)
-        .background(.bar)
+    }
+
+    private func beginSelectionDelete() {
+        pendingSelectionPhotoIds = Array(vm.selectedPhotoIds)
+        pendingSelectionDeletesEvent = vm.selectionCoversEntireEvent()
+        if pendingSelectionDeletesEvent {
+            isConfirmingSelectionDeletesEvent = true
+        } else {
+            isAskingSelectionPhotoLibraryDelete = true
+        }
+    }
+
+    private func finishSelectionDelete(alsoDeleteFromPhotos: Bool) {
+        let photoIds = pendingSelectionPhotoIds
+        let deleteEvent = pendingSelectionDeletesEvent
+        pendingSelectionPhotoIds = []
+        pendingSelectionDeletesEvent = false
+        let shouldLeave = vm.deleteSelectedPhotos(deleteEvent: deleteEvent)
+        if alsoDeleteFromPhotos {
+            Task {
+                if let error = await PhotoLibraryDeletion.deleteAssets(localIdentifiers: photoIds) {
+                    photoLibraryError = error
+                }
+            }
+        }
+        if shouldLeave {
+            dismiss()
+        }
     }
 
     private func tripSectionHeader(_ section: TripPhotoDisplaySection) -> some View {

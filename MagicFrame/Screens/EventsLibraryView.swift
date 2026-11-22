@@ -11,6 +11,9 @@ struct EventsLibraryView: View {
     let onEventUnhidden: (Int) -> Void
     var scrollTarget: EventListScrollTarget? = nil
     var onScrollTargetHandled: (() -> Void)? = nil
+    var isSelecting: Bool = false
+    var selectedEventIds: Set<Int> = []
+    var onToggleSelection: ((Int) -> Void)? = nil
 
     @State private var collapsedYears: Set<Int> = []
     @State private var handledScrollRequestID: UUID?
@@ -39,27 +42,28 @@ struct EventsLibraryView: View {
                                 Section {
                                     if !collapsedYears.contains(section.year) {
                                         ForEach(section.items) { item in
-                                            NavigationLink {
-                                                EventDetailView(
-                                                    event: item.event,
-                                                    onEventUpdated: onEventUpdated,
-                                                    onEventHidden: onEventHidden,
-                                                    onEventUnhidden: onEventUnhidden
-                                                )
-                                            } label: {
-                                                EventLibraryRowView(
-                                                    event: item.event,
-                                                    slideshowPhotoIds: item.slideshowPhotoIds,
-                                                    showsHiddenBadge: showsHiddenEvents,
-                                                    onHide: showsHiddenEvents
-                                                        ? nil
-                                                        : { onEventHidden(item.event.eventId) },
-                                                    onUnhide: showsHiddenEvents
-                                                        ? { onEventUnhidden(item.event.eventId) }
-                                                        : nil
-                                                )
+                                            Group {
+                                                if isSelecting {
+                                                    Button {
+                                                        onToggleSelection?(item.event.eventId)
+                                                    } label: {
+                                                        eventRow(item)
+                                                    }
+                                                    .buttonStyle(.plain)
+                                                } else {
+                                                    NavigationLink {
+                                                        EventDetailView(
+                                                            event: item.event,
+                                                            onEventUpdated: onEventUpdated,
+                                                            onEventHidden: onEventHidden,
+                                                            onEventUnhidden: onEventUnhidden
+                                                        )
+                                                    } label: {
+                                                        eventRow(item)
+                                                    }
+                                                    .buttonStyle(.plain)
+                                                }
                                             }
-                                            .buttonStyle(.plain)
                                             .padding(.horizontal, 16)
                                             .id(item.id)
                                         }
@@ -84,6 +88,21 @@ struct EventsLibraryView: View {
                 }
             }
         }
+    }
+
+    private func eventRow(_ item: EventListDisplayItem) -> some View {
+        EventLibraryRowView(
+            event: item.event,
+            slideshowPhotoIds: item.slideshowPhotoIds,
+            showsHiddenBadge: showsHiddenEvents,
+            isSelected: selectedEventIds.contains(item.event.eventId),
+            onHide: showsHiddenEvents
+                ? nil
+                : { onEventHidden(item.event.eventId) },
+            onUnhide: showsHiddenEvents
+                ? { onEventUnhidden(item.event.eventId) }
+                : nil
+        )
     }
 
     private func scrollToTargetEvent(using proxy: ScrollViewProxy) {

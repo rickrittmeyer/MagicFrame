@@ -28,6 +28,44 @@ struct IndexedEvent {
     let childEventName: String?
     let userEditedChildEventName: Bool
     let isUserHidden: Bool
+    let isFavorite: Bool
+
+    func replacing(
+        showOnFrame: Bool? = nil,
+        isFavorite: Bool? = nil,
+        isUserHidden: Bool? = nil
+    ) -> IndexedEvent {
+        IndexedEvent(
+            eventId: eventId,
+            name: name,
+            startDate: startDate,
+            endDate: endDate,
+            photoCount: photoCount,
+            latitude: latitude,
+            longitude: longitude,
+            city: city,
+            state: state,
+            placeName: placeName,
+            people: people,
+            coverPhotoId: coverPhotoId,
+            showOnFrame: showOnFrame ?? self.showOnFrame,
+            userEditedName: userEditedName,
+            locationNickname: locationNickname,
+            locationId: locationId,
+            parentEventId: parentEventId,
+            isTripEvent: isTripEvent,
+            eventType: eventType,
+            activityType: activityType,
+            milestoneType: milestoneType,
+            holidayType: holidayType,
+            eventMainPerson: eventMainPerson,
+            tripType: tripType,
+            childEventName: childEventName,
+            userEditedChildEventName: userEditedChildEventName,
+            isUserHidden: isUserHidden ?? self.isUserHidden,
+            isFavorite: isFavorite ?? self.isFavorite
+        )
+    }
 
     var isTripSubEvent: Bool {
         parentEventId != nil

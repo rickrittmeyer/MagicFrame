@@ -619,6 +619,26 @@ final class PhotoDatabase: @unchecked Sendable {
         eventRepository.setPhotosHiddenInEvent(photoIds: photoIds, hidden: hidden)
     }
 
+    func setPhotoFavorite(photoId: String, isFavorite: Bool) {
+        dbQueue.sync {
+            photoRepository.setPhotoFavorite(photoId: photoId, isFavorite: isFavorite)
+        }
+    }
+
+    func softDeletePhotos(photoIds: [String]) {
+        dbQueue.sync {
+            photoRepository.softDeletePhotos(photoIds: photoIds)
+        }
+    }
+
+    func setEventFavorite(eventId: Int, isFavorite: Bool) {
+        eventRepository.setEventFavorite(eventId: eventId, isFavorite: isFavorite)
+    }
+
+    func softDeleteEvent(eventId: Int) {
+        eventRepository.softDeleteEvent(eventId: eventId)
+    }
+
     func getEventIdForPhoto(photoId: String) -> Int? {
         eventRepository.getEventIdForPhoto(photoId: photoId)
     }
