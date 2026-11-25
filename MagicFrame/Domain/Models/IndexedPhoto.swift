@@ -56,4 +56,26 @@ struct IndexedPhoto {
         self.isHiddenInEvent = isHiddenInEvent
         self.isSimilarGroupPick = isSimilarGroupPick
     }
+
+    func with(isFavorite: Bool) -> IndexedPhoto {
+        IndexedPhoto(
+            id: id,
+            creationDate: creationDate,
+            isFavorite: isFavorite,
+            width: width,
+            height: height,
+            mediaSubtype: mediaSubtype,
+            latitude: latitude,
+            longitude: longitude,
+            isScreenshot: isScreenshot,
+            aspectRatio: aspectRatio,
+            orientation: orientation,
+            qualityScore: qualityScore,
+            faceEyesOpenScore: faceEyesOpenScore,
+            faceSmileScore: faceSmileScore,
+            showOnFrame: showOnFrame,
+            isHiddenInEvent: isHiddenInEvent,
+            isSimilarGroupPick: isSimilarGroupPick
+        )
+    }
 }

@@ -66,6 +66,10 @@ protocol MagicFrameDatabase: AnyObject {
     func setPhotosHiddenInEvent(photoIds: [String], hidden: Bool)
     func setPhotosShowOnFrame(photoIds: [String], show: Bool)
     func setPhotoShowOnFrame(photoId: String, eventId: Int, show: Bool)
+    func setPhotoFavorite(photoId: String, isFavorite: Bool)
+    func softDeletePhotos(photoIds: [String])
+    func setEventFavorite(eventId: Int, isFavorite: Bool)
+    func softDeleteEvent(eventId: Int)
     func getEventIdForPhoto(photoId: String) -> Int?
     func getEventAttributeOptions(for field: EventAttributeField) -> [String]
     func addCustomEventAttributeOption(_ value: String, for field: EventAttributeField)

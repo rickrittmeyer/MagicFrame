@@ -499,27 +499,6 @@ final class EventDetailViewModel: ObservableObject {
         }
     }
 
-    func setSelectedPhotosOnFrame(_ show: Bool) {
-        guard !selectedPhotoIds.isEmpty else { return }
-
-        if show {
-            for photoId in selectedPhotoIds {
-                let group = similarGroup(containingPhotoId: photoId)
-                setPhotoOnFrame(photoId: photoId, show: true, in: group)
-            }
-        } else {
-            database.setPhotosShowOnFrame(
-                photoIds: Array(selectedPhotoIds),
-                show: false
-            )
-            loadPhotos()
-            refreshEvent()
-        }
-
-        cancelPhotoSelection()
-    }
-
-    @discardableResult
     func hidePhoto(photoId: String) -> Bool {
         if let item = displayItem(forRepresentativeId: photoId) {
             return hideDisplayItem(item)
@@ -533,6 +512,113 @@ final class EventDetailViewModel: ObservableObject {
             return false
         }
 
+        return photos.isEmpty
+    }
+
+    private var selectedPhotos: [IndexedPhoto] {
+        photos.filter { selectedPhotoIds.contains($0.id) }
+    }
+
+    var selectedAllOnFrame: Bool {
+        let selected = selectedPhotos
+        return !selected.isEmpty && selected.allSatisfy(\.showOnFrame)
+    }
+
+    var selectedAllFavorite: Bool {
+        let selected = selectedPhotos
+        return !selected.isEmpty && selected.allSatisfy(\.isFavorite)
+    }
+
+    var selectedAllHidden: Bool {
+        let selected = selectedPhotos
+        return !selected.isEmpty && selected.allSatisfy(\.isHiddenInEvent)
+    }
+
+    func toggleSelectedOnFrame() {
+        guard !selectedPhotoIds.isEmpty else { return }
+        let show = !selectedAllOnFrame
+        if show {
+            for photoId in selectedPhotoIds {
+                let group = similarGroup(containingPhotoId: photoId)
+                setPhotoOnFrame(photoId: photoId, show: true, in: group)
+            }
+        } else {
+            database.setPhotosShowOnFrame(photoIds: Array(selectedPhotoIds), show: false)
+            loadPhotos()
+            refreshEvent()
+        }
+    }
+
+    func toggleSelectedFavorite() {
+        guard !selectedPhotoIds.isEmpty else { return }
+        let isFavorite = !selectedAllFavorite
+        for photoId in selectedPhotoIds {
+            database.setPhotoFavorite(photoId: photoId, isFavorite: isFavorite)
+        }
+        loadPhotos()
+    }
+
+    @discardableResult
+    func toggleSelectedHidden() -> Bool {
+        guard !selectedPhotoIds.isEmpty else { return false }
+        database.setPhotosHiddenInEvent(
+            photoIds: Array(selectedPhotoIds),
+            hidden: !selectedAllHidden
+        )
+        loadPhotos()
+        refreshEvent()
+        if showHiddenPhotos {
+            return false
+        }
+        return photos.isEmpty
+    }
+
+    func selectionCoversEntireEvent() -> Bool {
+        let allIds = Set(
+            database.getPhotosForEvent(eventId: event.eventId, includeHidden: true).map(\.id)
+        )
+        return !allIds.isEmpty && allIds.isSubset(of: selectedPhotoIds)
+    }
+
+    /// Soft-deletes the selected photos. When `deleteEvent` is true, also soft-deletes the event.
+    func deleteSelectedPhotos(deleteEvent: Bool) -> Bool {
+        let ids = Array(selectedPhotoIds)
+        guard !ids.isEmpty else { return false }
+        database.softDeletePhotos(photoIds: ids)
+        cancelPhotoSelection()
+        if deleteEvent {
+            database.softDeleteEvent(eventId: event.eventId)
+            onEventHidden?(event.eventId)
+            return true
+        }
+        loadPhotos()
+        refreshEvent()
+        return photos.isEmpty
+    }
+
+    func flagPhotoAsFavorite(photoId: String) {
+        database.setPhotoFavorite(photoId: photoId, isFavorite: true)
+        if let photo = photos.first(where: { $0.id == photoId }) {
+            applyLocalPhotoUpdate(photo.with(isFavorite: true))
+        }
+    }
+
+    func isOnlyPhotoInEvent(_ photoId: String) -> Bool {
+        let all = database.getPhotosForEvent(eventId: event.eventId, includeHidden: true)
+        return all.count == 1 && all.first?.id == photoId
+    }
+
+    /// Soft-deletes one photo. Returns true when the event was also deleted.
+    func softDeletePhoto(_ photoId: String, deletingEventIfEmpty: Bool) -> Bool {
+        database.softDeletePhotos(photoIds: [photoId])
+        let remaining = database.getPhotosForEvent(eventId: event.eventId, includeHidden: true)
+        if deletingEventIfEmpty, remaining.isEmpty {
+            database.softDeleteEvent(eventId: event.eventId)
+            onEventHidden?(event.eventId)
+            return true
+        }
+        loadPhotos()
+        refreshEvent()
         return photos.isEmpty
     }
 

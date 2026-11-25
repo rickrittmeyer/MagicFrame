@@ -392,6 +392,46 @@ final class EventRepository {
     sqlite3_finalize(statement)
     }
 
+    func setEventFavorite(eventId: Int, isFavorite: Bool) {
+        sync {
+            let now = ISO8601DateFormatter().string(from: Date())
+            let sql = """
+            UPDATE events
+            SET isFavorite = ?,
+                updatedAt = ?
+            WHERE eventId = ?;
+            """
+            var statement: OpaquePointer?
+            if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+                sqlite3_bind_int(statement, 1, isFavorite ? 1 : 0)
+                sqlite3_bind_text(statement, 2, (now as NSString).utf8String, -1, nil)
+                sqlite3_bind_int(statement, 3, Int32(eventId))
+                sqlite3_step(statement)
+            }
+            sqlite3_finalize(statement)
+        }
+    }
+
+    func softDeleteEvent(eventId: Int) {
+        sync {
+            let now = ISO8601DateFormatter().string(from: Date())
+            let sql = """
+            UPDATE events
+            SET isDeleted = 1,
+                deletedAt = ?,
+                updatedAt = ?
+            WHERE eventId = ?;
+            """
+            var statement: OpaquePointer?
+            if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+                sqlite3_bind_text(statement, 1, (now as NSString).utf8String, -1, nil)
+                sqlite3_bind_text(statement, 2, (now as NSString).utf8String, -1, nil)
+                sqlite3_bind_int(statement, 3, Int32(eventId))
+                sqlite3_step(statement)
+            }
+            sqlite3_finalize(statement)
+        }
+    }
 
     func getEventAttributeOptions(for field: EventAttributeField) -> [String] {
     var options = Set(field.builtInOptions)
@@ -569,7 +609,8 @@ final class EventRepository {
         e.tripType,
         e.childEventName,
         COALESCE(e.userEditedChildEventName, 0) as userEditedChildEventName,
-        COALESCE(e.isUserHidden, 0) as isUserHidden
+        COALESCE(e.isUserHidden, 0) as isUserHidden,
+        COALESCE(e.isFavorite, 0) as isFavorite
     FROM events e
     LEFT JOIN locations l
         ON e.locationId = l.locationId
@@ -610,7 +651,8 @@ final class EventRepository {
         e.tripType,
         e.childEventName,
         e.userEditedChildEventName,
-        e.isUserHidden
+        e.isUserHidden,
+        e.isFavorite
     ORDER BY e.startDate DESC;
     """
 
@@ -785,7 +827,8 @@ final class EventRepository {
         e.tripType,
         e.childEventName,
         COALESCE(e.userEditedChildEventName, 0) as userEditedChildEventName,
-        COALESCE(e.isUserHidden, 0) as isUserHidden
+        COALESCE(e.isUserHidden, 0) as isUserHidden,
+        COALESCE(e.isFavorite, 0) as isFavorite
     FROM events e
     LEFT JOIN locations l
         ON e.locationId = l.locationId
@@ -831,7 +874,8 @@ final class EventRepository {
         e.tripType,
         e.childEventName,
         e.userEditedChildEventName,
-        e.isUserHidden
+        e.isUserHidden,
+        e.isFavorite
     HAVING COUNT(DISTINCT CASE WHEN ph.isDeleted = 0 THEN pe.photoId END) > 0
     ORDER BY e.startDate DESC;
     """
@@ -881,7 +925,8 @@ final class EventRepository {
         e.tripType,
         e.childEventName,
         COALESCE(e.userEditedChildEventName, 0) as userEditedChildEventName,
-        COALESCE(e.isUserHidden, 0) as isUserHidden
+        COALESCE(e.isUserHidden, 0) as isUserHidden,
+        COALESCE(e.isFavorite, 0) as isFavorite
     FROM events e
     LEFT JOIN locations l
         ON e.locationId = l.locationId
@@ -926,7 +971,8 @@ final class EventRepository {
         e.tripType,
         e.childEventName,
         e.userEditedChildEventName,
-        e.isUserHidden;
+        e.isUserHidden,
+        e.isFavorite;
     """
 
     var statement: OpaquePointer?
@@ -1015,6 +1061,7 @@ final class EventRepository {
     let childEventName = sqliteOptionalText(statement, column: 24)
     let userEditedChildEventName = sqlite3_column_int(statement, 25) == 1
     let isUserHidden = sqlite3_column_int(statement, 26) == 1
+    let isFavorite = sqlite3_column_int(statement, 27) == 1
 
     return IndexedEvent(
         eventId: eventId,
@@ -1043,7 +1090,8 @@ final class EventRepository {
         tripType: tripType,
         childEventName: childEventName,
         userEditedChildEventName: userEditedChildEventName,
-        isUserHidden: isUserHidden
+        isUserHidden: isUserHidden,
+        isFavorite: isFavorite
     )
     }
 
@@ -1507,7 +1555,8 @@ final class EventRepository {
         e.tripType,
         e.childEventName,
         COALESCE(e.userEditedChildEventName, 0) as userEditedChildEventName,
-        COALESCE(e.isUserHidden, 0) as isUserHidden
+        COALESCE(e.isUserHidden, 0) as isUserHidden,
+        COALESCE(e.isFavorite, 0) as isFavorite
     FROM events e
     LEFT JOIN locations l
         ON e.locationId = l.locationId
@@ -1546,7 +1595,8 @@ final class EventRepository {
         e.tripType,
         e.childEventName,
         e.userEditedChildEventName,
-        e.isUserHidden
+        e.isUserHidden,
+        e.isFavorite
     ORDER BY e.startDate ASC;
     """
 

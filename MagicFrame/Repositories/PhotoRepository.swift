@@ -86,6 +86,29 @@ final class PhotoRepository {
         print("Soft delete check complete")
     }
 
+    func setPhotoFavorite(photoId: String, isFavorite: Bool) {
+        let sql = """
+        UPDATE photos
+        SET isFavorite = ?
+        WHERE id = ?;
+        """
+        var statement: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
+            sqlite3_bind_int(statement, 1, isFavorite ? 1 : 0)
+            sqlite3_bind_text(statement, 2, (photoId as NSString).utf8String, -1, nil)
+            sqlite3_step(statement)
+        }
+        sqlite3_finalize(statement)
+    }
+
+    func softDeletePhotos(photoIds: [String]) {
+        guard !photoIds.isEmpty else { return }
+        let now = ISO8601DateFormatter().string(from: Date())
+        for photoId in photoIds {
+            markPhotoDeleted(photoId: photoId, deletedAt: now)
+        }
+    }
+
     func getRecentPhotos(limit: Int = 100) -> [IndexedPhoto] {
         let sql = """
         SELECT id, creationDate, isFavorite, width, height, mediaSubtype,
